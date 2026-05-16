@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Coding Agent — Code Flow Analysis</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-tertiary: #334155;
+            --bg-code: #0d1117;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --accent-blue: #38bdf8;
+            --accent-purple: #a78bfa;
+            --accent-green: #4ade80;
+            --accent-orange: #fb923c;
+            --accent-red: #f87171;
+            --accent-yellow: #fbbf24;
+            --accent-cyan: #22d3ee;
+            --accent-teal: #2dd4bf;
+            --border-color: #475569;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.7;
+            padding: 2rem;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .hero {
+            text-align: center;
+            padding: 2rem 0 3rem;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 2rem;
+        }
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple), var(--accent-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.75rem;
+        }
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            max-width: 700px;
+            margin: 0 auto;
+        }
+        .badges { display: flex; gap: 0.5rem; justify-content: center; margin-top: 1rem; flex-wrap: wrap; }
+        .badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-teal { background: rgba(45, 212, 191, 0.2); color: var(--accent-teal); }
+        .badge-purple { background: rgba(167, 139, 250, 0.2); color: var(--accent-purple); }
+        .badge-orange { background: rgba(251, 146, 60, 0.2); color: var(--accent-orange); }
+        .badge-blue { background: rgba(56, 189, 248, 0.2); color: var(--accent-blue); }
+        .tabs {
+            display: flex;
+            gap: 0.25rem;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+        .tab-btn {
+            padding: 0.75rem 1.25rem;
+            border-radius: 8px 8px 0 0;
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s;
+            border: none;
+            background: transparent;
+        }
+        .tab-btn:hover { color: var(--text-primary); background: var(--bg-secondary); }
+        .tab-btn.active {
+            color: var(--accent-cyan);
+            border-bottom: 2px solid var(--accent-cyan);
+            background: var(--bg-secondary);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .section {
+            background: var(--bg-secondary);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            border: 1px solid var(--border-color);
+        }
+        h2 {
+            color: var(--accent-blue);
+            font-size: 1.5rem;
+            margin: 0 0 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        h2 .icon { font-size: 1.25rem; }
+        h3 {
+            color: var(--accent-purple);
+            font-size: 1.2rem;
+            margin: 2rem 0 1rem;
+        }
+        h4 {
+            color: var(--accent-cyan);
+            font-size: 1rem;
+            margin: 1.5rem 0 0.75rem;
+        }
+        p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 1rem; }
+        .concept-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+        .concept-card {
+            background: var(--bg-tertiary);
+            border-radius: 12px;
+            padding: 1.25rem;
+            border: 1px solid var(--border-color);
+            transition: all 0.25s ease;
+        }
+        .concept-card:hover {
+            transform: translateY(-3px);
+            border-color: var(--accent-blue);
+            box-shadow: 0 8px 25px rgba(56, 189, 248, 0.1);
+        }
+        .concept-name { font-weight: 600; font-size: 1.05rem; margin-bottom: 0.35rem; }
+        .concept-detail { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6; }
+        .code-block {
+            background: var(--bg-code);
+            border-radius: 12px;
+            padding: 1.25rem;
+            margin: 1.25rem 0;
+            overflow-x: auto;
+            border: 1px solid var(--border-color);
+        }
+        .code-header {
+            font-size: 0.75rem;
+            color: var(--accent-yellow);
+            font-family: 'Cascadia Code', monospace;
+            margin-bottom: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .code-block pre {
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            margin: 0;
+            white-space: pre;
+        }
+        .code-line { display: block; }
+        .code-line:hover { background: rgba(255,255,255,0.03); }
+        .ln { display: inline-block; width: 2.5rem; text-align: right; padding-right: 1rem; color: var(--text-secondary); opacity: 0.4; user-select: none; }
+        .cm { color: #6a737d; font-style: italic; }
+        .kw { color: #ff7b72; font-weight: 500; }
+        .fn { color: #d2a8ff; }
+        .str { color: #a5d6ff; }
+        .var { color: #79c0ff; }
+        .num { color: #79c0ff; }
+        .code-flow { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; padding: 0.5rem; background: var(--bg-tertiary); border-radius: 8px; }
+        .flow-label { font-weight: 600; color: var(--accent-cyan); min-width: 80px; }
+        .flow-content { color: var(--text-secondary); }
+        .code-explanation {
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+            border-left: 3px solid var(--accent-cyan);
+        }
+        .code-explanation-title {
+            font-weight: 600;
+            color: var(--accent-cyan);
+            margin-bottom: 0.75rem;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .code-explanation p { margin-bottom: 0.5rem; font-size: 0.95rem; }
+        .code-explanation p:last-child { margin-bottom: 0; }
+        .code-explanation strong { color: var(--accent-orange); }
+        .note {
+            background: rgba(34, 211, 238, 0.1);
+            border: 1px solid var(--accent-cyan);
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+        }
+        .note-title { font-weight: 600; color: var(--accent-cyan); margin-bottom: 0.35rem; font-size: 0.9rem; }
+        .note p { margin: 0; font-size: 0.95rem; color: var(--text-secondary); }
+        .component-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+        .component-card {
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            padding: 1rem;
+            border: 1px solid var(--border-color);
+        }
+        .component-name {
+            font-family: 'Cascadia Code', monospace;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            margin-bottom: 0.35rem;
+        }
+        .component-desc { font-size: 0.9rem; color: var(--text-secondary); }
+        .inline-code {
+            background: var(--bg-tertiary);
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Cascadia Code', monospace;
+            font-size: 0.85em;
+            color: var(--accent-cyan);
+        }
+        .flowchart-container {
+            background: var(--bg-tertiary);
+            border-radius: 16px;
+            padding: 2rem;
+            margin: 1.5rem 0;
+            border: 1px solid var(--border-color);
+            overflow-x: auto;
+        }
+        .flowchart { display: flex; flex-direction: column; align-items: center; min-width: fit-content; gap: 0; }
+        .flow-row { display: flex; align-items: center; gap: 1.5rem; }
+        .flow-node {
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 500;
+            text-align: center;
+            font-size: 0.9rem;
+            min-width: 120px;
+        }
+        .flow-node-start { background: var(--accent-green); color: #052e16; border-radius: 50px; font-weight: 700; padding: 0.75rem 2rem; }
+        .flow-node-end { background: var(--accent-red); color: white; border-radius: 50px; font-weight: 700; padding: 0.75rem 2rem; }
+        .flow-node-process { background: var(--accent-blue); color: white; }
+        .flow-node-decision {
+            background: var(--accent-orange);
+            color: #451a03;
+            clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+            padding: 1.5rem 2rem;
+            font-weight: 600;
+        }
+        .flow-node-io { background: var(--accent-purple); color: white; }
+        .flow-arrow { color: var(--text-secondary); font-size: 1.5rem; letter-spacing: 0.25rem; }
+        .flow-label {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.2rem 0.5rem;
+            border-radius: 20px;
+            text-transform: uppercase;
+        }
+        .label-yes { background: var(--accent-green); color: #052e16; }
+        .label-no { background: var(--accent-red); color: white; }
+        .directory-tree {
+            background: var(--bg-code);
+            border-radius: 10px;
+            padding: 1rem 1.5rem;
+            font-family: 'Cascadia Code', monospace;
+            font-size: 0.85rem;
+            line-height: 1.8;
+            margin: 1rem 0;
+            border: 1px solid var(--border-color);
+        }
+        .dir-level-0 { color: var(--accent-cyan); }
+        .dir-level-1 { color: var(--accent-blue); padding-left: 1.5rem; }
+        .dir-level-2 { color: var(--text-secondary); padding-left: 3rem; }
+        .dir-file { color: var(--accent-green); }
+        .policy-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.75rem;
+            margin: 1rem 0;
+        }
+        .policy-card {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            border: 1px solid var(--border-color);
+        }
+        .policy-name { font-weight: 600; margin-bottom: 0.25rem; font-size: 0.95rem; }
+        .policy-desc { font-size: 0.8rem; color: var(--text-secondary); }
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+        }
+        .comparison-table th, .comparison-table td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border: 1px solid var(--border-color);
+        }
+        .comparison-table th { background: var(--bg-tertiary); color: var(--accent-cyan); font-weight: 600; }
+        .comparison-table tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+        .comparison-table td:first-child { font-weight: 500; color: var(--accent-purple); }
+        .step { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
+        .step-number {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: var(--accent-teal);
+            color: var(--bg-primary);
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+        .step-content { flex: 1; }
+        .step-title { font-weight: 600; margin-bottom: 0.35rem; color: var(--accent-teal); }
+        .step-desc { color: var(--text-secondary); font-size: 0.95rem; }
+        .keyword-card {
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            padding: 1.25rem;
+            margin-bottom: 1rem;
+            border-left: 3px solid var(--accent-purple);
+        }
+        .keyword-name {
+            font-family: 'Cascadia Code', monospace;
+            font-weight: 600;
+            color: var(--accent-purple);
+            font-size: 1.05rem;
+            margin-bottom: 0.35rem;
+        }
+        .keyword-desc { color: var(--text-secondary); font-size: 0.95rem; }
+        @media (max-width: 768px) {
+            body { padding: 1rem; }
+            .tabs { flex-wrap: wrap; }
+            .tab-btn { padding: 0.5rem 1rem; font-size: 0.85rem; }
+            h1 { font-size: 1.75rem; }
+            .section { padding: 1.25rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="hero">
+            <h1>AI Coding Agent</h1>
+            <p class="subtitle">A detailed walkthrough of how the AI coding agent processes messages, manages context, executes tools, and orchestrates an agentic loop</p>
+            <div class="badges">
+                <span class="badge badge-teal">Agentic Flow</span>
+                <span class="badge badge-purple">Security</span>
+                <span class="badge badge-orange">Non-Streaming</span>
+                <span class="badge badge-blue">Context Management</span>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab-btn active" onclick="showTab('overview')">Overview</button>
+            <button class="tab-btn" onclick="showTab('agent-flow')">Agent Flow</button>
+            <button class="tab-btn" onclick="showTab('security')">Security</button>
+            <button class="tab-btn" onclick="showTab('non-streaming')">Non-Streaming</button>
+            <button class="tab-btn" onclick="showTab('context')">Context Mgmt</button>
+            <button class="tab-btn" onclick="showTab('flowchart')">Flowchart</button>
+        </nav>
+
+        <!-- Tab: Overview -->
+        <div id="tab-overview" class="tab-content active">
+            <div class="section">
+                <h2><span class="icon">📦</span> Project Overview</h2>
+                <p><strong>ai_coding_agent</strong> is an AI-powered coding assistant that uses a reactive agentic loop to process user messages and execute tools. It leverages an LLM to understand user intent, decide which tools to use, and generate responses.</p>
+
+                <h3>Core Components</h3>
+                <div class="concept-grid">
+                    <div class="concept-card">
+                        <div class="concept-name">1. Agent Orchestrator</div>
+                        <div class="concept-detail">The Agent class (agent.py) is the core orchestrator. Its run() method is the entry point that handles a single user message.</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">2. Session Manager</div>
+                        <div class="concept-detail">The Session class maintains all state: LLM client, tool registry, context manager, hook system, and configuration.</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">3. LLM Client</div>
+                        <div class="concept-detail">Handles communication with the language model API, supports both streaming and non-streaming responses.</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">4. Tool Registry</div>
+                        <div class="concept-detail">Stores available tools with their schemas, allowing dynamic discovery and invocation.</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">5. Context Manager</div>
+                        <div class="concept-detail">Maintains conversation history, handles message additions, and tracks token usage.</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">6. Hook System</div>
+                        <div class="concept-detail">Triggers callbacks before and after agent runs, enabling extensibility.</div>
+                    </div>
+                </div>
+
+                <h3>Project Structure</h3>
+                <div class="directory-tree">
+<span class="dir-level-0">ai_coding_agent/</span><br>
+<span class="dir-level-1">├── agent/</span><br>
+<span class="dir-file">│   ├── agent.py</span>        <span class="dir-level-2">Core Agent — run() and _agentic_loop()</span><br>
+<span class="dir-file">│   ├── session.py</span>      <span class="dir-level-2">Session state management</span><br>
+<span class="dir-file">│   ├── events.py</span>      <span class="dir-level-2">Event types for agent lifecycle</span><br>
+<span class="dir-file">│   └── memory_store.py</span> <span class="dir-level-2">Persistent memory for sessions</span><br>
+<span class="dir-level-1">├── client/</span><br>
+<span class="dir-file">│   └── llm_client.py</span>   <span class="dir-level-2">LLM API communication</span><br>
+<span class="dir-level-1">├── context/</span><br>
+<span class="dir-file">│   ├── manager.py</span>     <span class="dir-level-2">Message history and context window</span><br>
+<span class="dir-file">│   ├── compaction.py</span>   <span class="dir-level-2">Context compression</span><br>
+<span class="dir-file">│   └── loop_detector.py</span> <span class="dir-level-2">Detect repeated patterns</span><br>
+<span class="dir-level-1">├── safety/</span><br>
+<span class="dir-file">│   └── approval.py</span>     <span class="dir-level-2">Security policies</span><br>
+<span class="dir-level-1">└── tools/</span><br>
+<span class="dir-file">    └── registry.py</span>     <span class="dir-level-2">Tool discovery and invocation</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Agent Flow -->
+        <div id="tab-agent-flow" class="tab-content">
+            <div class="section">
+                <h2><span class="icon">🔄</span> The Agentic Loop</h2>
+
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <div class="step-title">Agent.run() Entry Point</div>
+                        <div class="step-desc">Called when a user sends a message. Triggers before_agent hooks, adds message to context, yields agent_start event.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div class="step-content">
+                        <div class="step-title">Context Compression Check</div>
+                        <div class="step-desc">If tokens exceed 80% of context window, the ChatCompactor summarizes older messages to preserve context space.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div class="step-content">
+                        <div class="step-title">Get Tool Schemas</div>
+                        <div class="step-desc">Retrieves available tools from the ToolRegistry to send to the LLM.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div class="step-content">
+                        <div class="step-title">LLM Chat Completion</div>
+                        <div class="step-desc">Sends conversation history and tool schemas to LLM. Collects TEXT_DELTA, TOOL_CALL_COMPLETE, MESSAGE_COMPLETE events.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">5</div>
+                    <div class="step-content">
+                        <div class="step-title">Store Response + Tool Calls</div>
+                        <div class="step-desc">Adds assistant message with response text and tool calls to context.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">6</div>
+                    <div class="step-content">
+                        <div class="step-title">Execute Tools</div>
+                        <div class="step-desc">Non-mutating tools run in parallel, mutating tools run sequentially. Results are added to context.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">7</div>
+                    <div class="step-content">
+                        <div class="step-title">Loop Detection</div>
+                        <div class="step-desc">Checks for repeating patterns. If loop detected, injects a loop-breaker prompt.</div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">8</div>
+                    <div class="step-content">
+                        <div class="step-title">Prune Tool Outputs</div>
+                        <div class="step-desc">When context exceeds 60% capacity, older tool results are cleared to preserve space.</div>
+                    </div>
+                </div>
+
+                <h3>Key Code: agent.py:run()</h3>
+                <div class="code-block">
+                    <div class="code-header">agent/agent.py:24-38</div>
+<pre><span class="code-line"><span class="ln">24</span><span class="kw">async def</span> <span class="fn">run</span>(<span class="var">self</span>, <span class="var">message</span>: <span class="var">str</span>):</span>
+<span class="code-line"><span class="ln">25</span>  <span class="kw">await</span> <span class="var">self</span>.<span class="var">session</span>.<span class="var">hook_system</span>.<span class="fn">trigger_before_agent</span>(<span class="var">message</span>)</span>
+<span class="code-line"><span class="ln">26</span>  <span class="fn">yield</span> <span class="var">AgentEvent</span>.<span class="fn">agent_start</span>(<span class="var">message</span>)</span>
+<span class="code-line"><span class="ln">27</span>  <span class="var">self</span>.<span class="var">session</span>.<span class="var">context_manager</span>.<span class="fn">add_user_message</span>(<span class="var">message</span>)</span>
+<span class="code-line"><span class="ln">28</span></span>
+<span class="code-line"><span class="ln">29</span>  <span class="var">final_response</span>: <span class="var">str</span> | <span class="kw">None</span> = <span class="kw">None</span></span>
+<span class="code-line"><span class="ln">30</span></span>
+<span class="code-line"><span class="ln">31</span>  <span class="kw">async for</span> <span class="var">event</span> <span class="kw">in</span> <span class="var">self</span>.<span class="fn">_agentic_loop</span>():</span>
+<span class="code-line"><span class="ln">32</span>    <span class="fn">yield</span> <span class="var">event</span></span>
+<span class="code-line"><span class="ln">33</span></span>
+<span class="code-line"><span class="ln">34</span>    <span class="kw">if</span> <span class="var">event</span>.<span class="var">type</span> == <span class="var">AgentEventType</span>.<span class="var">TEXT_COMPLETE</span>:</span>
+<span class="code-line"><span class="ln">35</span>      <span class="var">final_response</span> = <span class="var">event</span>.<span class="var">data</span>.<span class="fn">get</span>(<span class="str">"content"</span>)</span>
+<span class="code-line"><span class="ln">36</span></span>
+<span class="code-line"><span class="ln">37</span>  <span class="kw">await</span> <span class="var">self</span>.<span class="var">session</span>.<span class="var">hook_system</span>.<span class="fn">trigger_after_agent</span>(<span class="var">message</span>, <span class="var">final_response</span>)</span>
+<span class="code-line"><span class="ln">38</span>  <span class="fn">yield</span> <span class="var">AgentEvent</span>.<span class="fn">agent_end</span>(<span class="var">final_response</span>)</span></pre>
+                </div>
+
+                <h3>Tool Execution: Parallel vs Sequential</h3>
+                <div class="code-block">
+                    <div class="code-header">agent/agent.py:132-156 — Parallel/sequential decision + execution</div>
+<pre><span class="code-line"><span class="ln">132</span>  <span class="cm"># Run non-mutating tools in parallel; fall back to sequential</span></span>
+<span class="code-line"><span class="ln">133</span>  <span class="cm"># if any call is mutating (write/shell/network) to preserve ordering</span></span>
+<span class="code-line"><span class="ln">134</span>  <span class="var">all_non_mutating</span> = <span class="kw">all</span>(</span>
+<span class="code-line"><span class="ln">135</span>    <span class="kw">not</span> (<span class="var">t</span> := <span class="var">self</span>.<span class="var">session</span>.<span class="var">tool_registry</span>.<span class="fn">get</span>(<span class="var">tc</span>.<span class="var">name</span>)) <span class="kw">or</span></span>
+<span class="code-line"><span class="ln">136</span>    <span class="kw">not</span> <span class="var">t</span>.<span class="fn">is_mutating</span>(<span class="var">tc</span>.<span class="var">arguments</span>)</span>
+<span class="code-line"><span class="ln">137</span>    <span class="kw">for</span> <span class="var">tc</span> <span class="kw">in</span> <span class="var">tool_calls</span></span>
+<span class="code-line"><span class="ln">138</span>  )</span>
+<span class="code-line"><span class="ln">139</span></span>
+<span class="code-line"><span class="ln">140</span>  <span class="kw">if</span> <span class="var">all_non_mutating</span> <span class="kw">and</span> <span class="fn">len</span>(<span class="var">tool_calls</span>) > <span class="num">1</span>:</span>
+<span class="code-line"><span class="ln">141</span>    <span class="cm"># Emit all start events first so the UI shows them immediately</span></span>
+<span class="code-line"><span class="ln">142</span>    <span class="kw">for</span> <span class="var">tool_call</span> <span class="kw">in</span> <span class="var">tool_calls</span>:</span>
+<span class="code-line"><span class="ln">143</span>      <span class="fn">yield</span> <span class="var">AgentEvent</span>.<span class="fn">tool_call_start</span>(<span class="var">tool_call</span>.<span class="var">call_id</span>, <span class="var">tool_call</span>.<span class="var">name</span>, <span class="var">tool_call</span>.<span class="var">arguments</span>)</span>
+<span class="code-line"><span class="ln">144</span></span>
+<span class="code-line"><span class="ln">145</span>    <span class="cm"># Execute all concurrently</span></span>
+<span class="code-line"><span class="ln">146</span>    <span class="var">results</span> = <span class="kw">await</span> <span class="var">asyncio</span>.<span class="fn">gather</span>(*[</span>
+<span class="code-line"><span class="ln">147</span>      <span class="var">self</span>.<span class="var">session</span>.<span class="var">tool_registry</span>.<span class="fn">invoke</span>(</span>
+<span class="code-line"><span class="ln">148</span>        <span class="var">tc</span>.<span class="var">name</span>, <span class="var">tc</span>.<span class="var">arguments</span>, <span class="var">self</span>.<span class="var">config</span>.<span class="var">cwd</span>,</span>
+<span class="code-line"><span class="ln">149</span>        <span class="var">self</span>.<span class="var">session</span>.<span class="var">hook_system</span>, <span class="var">self</span>.<span class="var">session</span>.<span class="var">approval_manager</span>,</span>
+<span class="code-line"><span class="ln">150</span>      )</span>
+<span class="code-line"><span class="ln">151</span>      <span class="kw">for</span> <span class="var">tc</span> <span class="kw">in</span> <span class="var">tool_calls</span></span>
+<span class="code-line"><span class="ln">152</span>    ])</span>
+<span class="code-line"><span class="ln">153</span></span>
+<span class="code-line"><span class="ln">154</span>  <span class="kw">else</span>:</span>
+<span class="code-line"><span class="ln">155</span>    <span class="cm"># Sequential execution for mutating tools</span></span>
+<span class="code-line"><span class="ln">156</span>    <span class="kw">for</span> <span class="var">tool_call</span> <span class="kw">in</span> <span class="var">tool_calls</span>:</span></pre>
+                </div>
+
+                <div class="code-flow">
+                    <span class="flow-label">Line 134-138:</span>
+                    <span class="flow-content">Check if ALL tools are non-mutating (read-only like grep, ls, cat)</span>
+                </div>
+                <div class="code-flow">
+                    <span class="flow-label">Line 140:</span>
+                    <span class="flow-content">If all non-mutating AND multiple tools → parallel execution</span>
+                </div>
+                <div class="code-flow">
+                    <span class="flow-label">Line 154:</span>
+                    <span class="flow-content">If any tool is mutating (write, shell, network) → sequential execution</span>
+                </div>
+
+                <div class="code-explanation">
+                    <div class="code-explanation-title">Key Points</div>
+                    <p>• <strong>Lines 134-138:</strong> Uses walrus operator (`:=`) to get tool and check mutating status in one expression</p>
+                    <p>• <strong>Lines 142-143:</strong> All tool_call_start events are emitted BEFORE awaiting any tool (UI feedback)</p>
+                    <p>• <strong>Line 146:</strong> `asyncio.gather(*[...])` runs all non-mutating tools concurrently</p>
+                    <p>• <strong>Line 154-156:</strong> Sequential loop: yield start → await invoke → yield complete</p>
+                </div>
+
+                <div class="note">
+                    <div class="note-title">Async Generator Pattern</div>
+                    <p>The <code class="inline-code">run()</code> method is an async generator — it yields events as they occur, allowing the caller to stream responses in real-time rather than waiting for complete processing.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Security -->
+        <div id="tab-security" class="tab-content">
+            <div class="section">
+                <h2><span class="icon">🔒</span> Security Features</h2>
+                <p>The ai_coding_agent implements multiple layers of security to protect users from dangerous operations.</p>
+
+                <h3>Approval Policies</h3>
+                <p>Six configurable approval levels control how mutating operations are handled:</p>
+                <div class="policy-grid">
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--accent-green)">on-request</div>
+                        <div class="policy-desc">Ask for confirmation on mutating operations</div>
+                    </div>
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--accent-blue)">auto</div>
+                        <div class="policy-desc">Auto-approve if path is within cwd</div>
+                    </div>
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--accent-purple)">auto-edit</div>
+                        <div class="policy-desc">Auto-approve safe, ask for others</div>
+                    </div>
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--accent-orange)">never</div>
+                        <div class="policy-desc">Only auto-approve known-safe commands</div>
+                    </div>
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--accent-red)">on-failure</div>
+                        <div class="policy-desc">Auto-approve, ask on failure</div>
+                    </div>
+                    <div class="policy-card">
+                        <div class="policy-name" style="color: var(--text-secondary)">yolo</div>
+                        <div class="policy-desc">No approval checks</div>
+                    </div>
+                </div>
+
+                <h3>Dangerous Command Blocking</h3>
+                <div class="code-block">
+                    <div class="code-header">safety/approval.py:27-54 — DANGEROUS_PATTERNS regex list</div>
+<pre><span class="code-line"><span class="ln">27</span><span class="var">DANGEROUS_PATTERNS</span> = [</span>
+<span class="code-line"><span class="ln">28</span>  <span class="cm"># File system destruction</span></span>
+<span class="code-line"><span class="ln">29</span>  <span class="var">r</span><span class="str">"rm\s+(-rf?|--recursive)\s+[/~]"</span>,</span>
+<span class="code-line"><span class="ln">30</span>  <span class="var">r</span><span class="str">"rm\s+-rf?\s+\*"</span>,</span>
+<span class="code-line"><span class="ln">31</span>  <span class="var">r</span><span class="str">"rmdir\s+[/~]"</span>,</span>
+<span class="code-line"><span class="ln">32</span>  <span class="cm"># Disk operations</span></span>
+<span class="code-line"><span class="ln">33</span>  <span class="var">r</span><span class="str">"dd\s+if="</span>,</span>
+<span class="code-line"><span class="ln">34</span>  <span class="var">r</span><span class="str">"mkfs"</span>,</span>
+<span class="code-line"><span class="ln">35</span>  <span class="var">r</span><span class="str">"fdisk"</span>,</span>
+<span class="code-line"><span class="ln">36</span>  <span class="var">r</span><span class="str">"parted"</span>,</span>
+<span class="code-line"><span class="ln">37</span>  <span class="cm"># System control</span></span>
+<span class="code-line"><span class="ln">38</span>  <span class="var">r</span><span class="str">"shutdown"</span>,</span>
+<span class="code-line"><span class="ln">39</span>  <span class="var">r</span><span class="str">"reboot"</span>,</span>
+<span class="code-line"><span class="ln">40</span>  <span class="var">r</span><span class="str">"halt"</span>,</span>
+<span class="code-line"><span class="ln">41</span>  <span class="var">r</span><span class="str">"poweroff"</span>,</span>
+<span class="code-line"><span class="ln">42</span>  <span class="var">r</span><span class="str">"init\s+[06]"</span>,</span>
+<span class="code-line"><span class="ln">43</span>  <span class="cm"># Permission changes</span></span>
+<span class="code-line"><span class="ln">44</span>  <span class="var">r</span><span class="str">"chmod\s+(-R\s+)?777\s+[/~]"</span>,</span>
+<span class="code-line"><span class="ln">45</span>  <span class="var">r</span><span class="str">"chown\s+-R\s+.*\s+[/~]"</span>,</span>
+<span class="code-line"><span class="ln">46</span>  <span class="cm"># Network exposure</span></span>
+<span class="code-line"><span class="ln">47</span>  <span class="var">r</span><span class="str">"nc\s+-l"</span>,</span>
+<span class="code-line"><span class="ln">48</span>  <span class="var">r</span><span class="str">"netcat\s+-l"</span>,</span>
+<span class="code-line"><span class="ln">49</span>  <span class="cm"># Code execution from network</span></span>
+<span class="code-line"><span class="ln">50</span>  <span class="var">r</span><span class="str">"curl\s+.*\|\s*(bash|sh)"</span>,</span>
+<span class="code-line"><span class="ln">51</span>  <span class="var">r</span><span class="str">"wget\s+.*\|\s*(bash|sh)"</span>,</span>
+<span class="code-line"><span class="ln">52</span>  <span class="cm"># Fork bomb</span></span>
+<span class="code-line"><span class="ln">53</span>  <span class="var">r</span><span class="str">":\(\)\s*\{\s*:\|:&\s*\}\s*;"</span>,</span>
+<span class="code-line"><span class="ln">54</span>]</span></pre>
+                </div>
+
+                <h3>Safe Auto-Approved Commands</h3>
+                <div class="code-block">
+                    <div class="code-header">safety/approval.py:56-73 — SAFE_PATTERNS regex list</div>
+<pre><span class="code-line"><span class="ln">56</span><span class="var">SAFE_PATTERNS</span> = [</span>
+<span class="code-line"><span class="ln">57</span>  <span class="cm"># Information commands</span></span>
+<span class="code-line"><span class="ln">58</span>  <span class="var">r</span><span class="str">"^(ls|dir|pwd|cd|echo|cat|head|tail|less|more|wc)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">59</span>  <span class="var">r</span><span class="str">"^(find|locate|which|whereis|file|stat)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">60</span>  <span class="cm"># Git read-only</span></span>
+<span class="code-line"><span class="ln">61</span>  <span class="var">r</span><span class="str">"^git\s+(status|log|diff|show|branch|remote|tag)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">62</span>  <span class="cm"># Dev tools</span></span>
+<span class="code-line"><span class="ln">63</span>  <span class="var">r</span><span class="str">"^(npm|yarn|pnpm)\s+(list|ls|outdated)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">64</span>  <span class="var">r</span><span class="str">"^pip\s+(list|show|freeze)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">65</span>  <span class="cm"># Text processing</span></span>
+<span class="code-line"><span class="ln">66</span>  <span class="var">r</span><span class="str">"^(grep|awk|sed|cut|sort|uniq|tr|diff|comm)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">67</span>  <span class="cm"># System info</span></span>
+<span class="code-line"><span class="ln">68</span>  <span class="var">r</span><span class="str">"^(date|cal|uptime|whoami|id|groups|hostname|uname)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">69</span>  <span class="var">r</span><span class="str">"^(env|printenv|set)$"</span>,</span>
+<span class="code-line"><span class="ln">70</span>  <span class="cm"># Process info</span></span>
+<span class="code-line"><span class="ln">71</span>  <span class="var">r</span><span class="str">"^(ps|top|htop|pgrep)(\s|$)"</span>,</span>
+<span class="code-line"><span class="ln">72</span>]</span></pre>
+                </div>
+
+                <h3>Approval Decision Flow</h3>
+                <div class="code-block">
+                    <div class="code-header">safety/approval.py:129-150 — check_approval() method</div>
+<pre><span class="code-line"><span class="ln">129</span><span class="kw">async def</span> <span class="fn">check_approval</span>(<span class="var">self</span>, <span class="var">context</span>: <span class="var">ApprovalContext</span>) -> <span class="var">ApprovalDecision</span>:</span>
+<span class="code-line"><span class="ln">130</span>  <span class="kw">if not</span> <span class="var">context</span>.<span class="var">is_mutating</span>:</span>
+<span class="code-line"><span class="ln">131</span>    <span class="kw">return</span> <span class="var">ApprovalDecision</span>.<span class="fn">APPROVED</span></span>
+<span class="code-line"><span class="ln">132</span></span>
+<span class="code-line"><span class="ln">133</span>  <span class="kw">if</span> <span class="var">context</span>.<span class="var">command</span>:</span>
+<span class="code-line"><span class="ln">134</span>    <span class="var">decision</span> = <span class="var">self</span>.<span class="fn">_assess_command_safety</span>(<span class="var">context</span>.<span class="var">command</span>)</span>
+<span class="code-line"><span class="ln">135</span>    <span class="kw">if</span> <span class="var">decision</span> != <span class="var">ApprovalDecision</span>.<span class="var">NEEDS_CONFIRMATION</span>:</span>
+<span class="code-line"><span class="ln">136</span>      <span class="kw">return</span> <span class="var">decision</span></span>
+<span class="code-line"><span class="ln">137</span></span>
+<span class="code-line"><span class="ln">138</span>  <span class="kw">for</span> <span class="var">path</span> <span class="kw">in</span> <span class="var">context</span>.<span class="var">affected_paths</span>:</span>
+<span class="code-line"><span class="ln">139</span>    <span class="var">path_decision</span> = <span class="var">ApprovalDecision</span>.<span class="var">NEEDS_CONFIRMATION</span></span>
+<span class="code-line"><span class="ln">140</span>    <span class="kw">if</span> <span class="var">path</span>.<span class="fn">is_relative_to</span>(<span class="var">self</span>.<span class="var">cwd</span>):</span>
+<span class="code-line"><span class="ln">141</span>      <span class="var">path_decision</span> = <span class="var">ApprovalDecision</span>.<span class="fn">APPROVED</span></span>
+<span class="code-line"><span class="ln">142</span>    <span class="kw">else</span>:</span>
+<span class="code-line"><span class="ln">143</span>      <span class="kw">return</span> <span class="var">path_decision</span></span>
+<span class="code-line"><span class="ln">144</span></span>
+<span class="code-line"><span class="ln">145</span>  <span class="kw">if</span> <span class="var">context</span>.<span class="var">is_dangerous</span>:</span>
+<span class="code-line"><span class="ln">146</span>    <span class="kw">if</span> <span class="var">self</span>.<span class="var">approval_policy</span> == <span class="var">ApprovalPolicy</span>.<span class="var">YOLO</span>:</span>
+<span class="code-line"><span class="ln">147</span>      <span class="kw">return</span> <span class="var">ApprovalDecision</span>.<span class="fn">APPROVED</span></span>
+<span class="code-line"><span class="ln">148</span>    <span class="kw">return</span> <span class="var">ApprovalDecision</span>.<span class="fn">NEEDS_CONFIRMATION</span></span>
+<span class="code-line"><span class="ln">149</span></span>
+<span class="code-line"><span class="ln">150</span>  <span class="kw">return</span> <span class="var">ApprovalDecision</span>.<span class="fn">APPROVED</span></span></pre>
+                </div>
+
+                <div class="code-flow">
+                    <span class="flow-label">Line 130-131:</span>
+                    <span class="flow-content">Non-mutating operations are always approved (no changes to system)</span>
+                </div>
+                <div class="code-flow">
+                    <span class="flow-label">Line 133-136:</span>
+                    <span class="flow-content">Check command against dangerous/safe patterns; return early if decision made</span>
+                </div>
+                <div class="code-flow">
+                    <span class="flow-label">Line 138-143:</span>
+                    <span class="flow-content">Check if all affected paths are within cwd; reject if any path escapes</span>
+                </div>
+                <div class="code-flow">
+                    <span class="flow-label">Line 145-149:</span>
+                    <span class="flow-content">If command is dangerous and policy is not YOLO, request confirmation</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Non-Streaming -->
+        <div id="tab-non-streaming" class="tab-content">
+            <div class="section">
+                <h2><span class="icon">📡</span> Non-Streaming Response Handling</h2>
+                <p>The LLM client supports both streaming and non-streaming modes. Both paths converge to the same event types for unified processing.</p>
+
+                <h3>Streaming vs Non-Streaming Comparison</h3>
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>Aspect</th>
+                            <th>Streaming (_stream_response)</th>
+                            <th>Non-Streaming (_non_stream_response)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>TEXT_DELTA events</td>
+                            <td>One per content fragment (token-by-token)</td>
+                            <td>Single event with full content</td>
+                        </tr>
+                        <tr>
+                            <td>TOOL_CALL events</td>
+                            <td>TOOL_CALL_START, multiple DELTA, then COMPLETE</td>
+                            <td>Single TOOL_CALL_COMPLETE per tool</td>
+                        </tr>
+                        <tr>
+                            <td>Response pattern</td>
+                            <td>Real-time incremental display</td>
+                            <td>Waits for complete LLM response</td>
+                        </tr>
+                        <tr>
+                            <td>Use case</td>
+                            <td>Interactive UI with live updates</td>
+                            <td>Batch processing, simpler integration</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>Non-Streaming Code Flow</h3>
+                <div class="code-block">
+                    <div class="code-header">client/llm_client.py:219-264 — _non_stream_response()</div>
+<pre><span class="code-line"><span class="ln">219</span><span class="kw">async def</span> <span class="fn">_non_stream_response</span>(</span>
+<span class="code-line"><span class="ln">220</span>  <span class="var">self</span>,</span>
+<span class="code-line"><span class="ln">221</span>  <span class="var">client</span>: <span class="var">AsyncOpenAI</span>,</span>
+<span class="code-line"><span class="ln">222</span>  <span class="var">kwargs</span>: <span class="var">dict</span>[<span class="var">str</span>, <span class="var">Any</span>],</span>
+<span class="code-line"><span class="ln">223</span>) -> <span class="var">AsyncGenerator</span>[<span class="var">StreamEvent</span>, <span class="kw">None</span>]:</span>
+<span class="code-line"><span class="ln">224</span>  <span class="var">response</span> = <span class="kw">await</span> <span class="var">self</span>.<span class="fn">_call_with_retry</span>(<span class="var">client</span>, **<span class="var">kwargs</span>)</span>
+<span class="code-line"><span class="ln">225</span>  <span class="var">choice</span> = <span class="var">response</span>.<span class="var">choices</span>[<span class="num">0</span>]</span>
+<span class="code-line"><span class="ln">226</span>  <span class="var">message</span> = <span class="var">choice</span>.<span class="var">message</span></span>
+<span class="code-line"><span class="ln">227</span></span>
+<span class="code-line"><span class="ln">228</span>  <span class="cm"># yield text first if present</span></span>
+<span class="code-line"><span class="ln">229</span>  <span class="kw">if</span> <span class="var">message</span>.<span class="var">content</span>:</span>
+<span class="code-line"><span class="ln">230</span>    <span class="fn">yield</span> <span class="var">StreamEvent</span>(</span>
+<span class="code-line"><span class="ln">231</span>      <span class="var">type</span>=<span class="var">StreamEventType</span>.<span class="var">TEXT_DELTA</span>,</span>
+<span class="code-line"><span class="ln">232</span>      <span class="var">text_delta</span>=<span class="var">TextDelta</span>(<span class="var">content</span>=<span class="var">message</span>.<span class="var">content</span>),</span>
+<span class="code-line"><span class="ln">233</span>    )</span>
+<span class="code-line"><span class="ln">234</span>  )</span>
+<span class="code-line"><span class="ln">235</span></span>
+<span class="code-line"><span class="ln">236</span>  <span class="cm"># yield each tool call as a separate TOOL_CALL_COMPLETE event</span></span>
+<span class="code-line"><span class="ln">236</span>  <span class="kw">if</span> <span class="var">message</span>.<span class="var">tool_calls</span>:</span>
+<span class="code-line"><span class="ln">237</span>    <span class="kw">for</span> <span class="var">tc</span> <span class="kw">in</span> <span class="var">message</span>.<span class="var">tool_calls</span>:</span>
+<span class="code-line"><span class="ln">238</span>      <span class="fn">yield</span> <span class="var">StreamEvent</span>(</span>
+<span class="code-line"><span class="ln">239</span>        <span class="var">type</span>=<span class="var">StreamEventType</span>.<span class="var">TOOL_CALL_COMPLETE</span>,</span>
+<span class="code-line"><span class="ln">240</span>        <span class="var">tool_call</span>=<span class="var">ToolCall</span>(</span>
+<span class="code-line"><span class="ln">241</span>          <span class="var">call_id</span>=<span class="var">tc</span>.<span class="var">id</span>,</span>
+<span class="code-line"><span class="ln">242</span>          <span class="var">name</span>=<span class="var">tc</span>.<span class="var">function</span>.<span class="var">name</span>,</span>
+<span class="code-line"><span class="ln">243</span>          <span class="var">arguments</span>=<span class="fn">parse_tool_call_arguments</span>(<span class="var">tc</span>.<span class="var">function</span>.<span class="var">arguments</span>),</span>
+<span class="code-line"><span class="ln">244</span>        ),</span>
+<span class="code-line"><span class="ln">245</span>      )</span>
+<span class="code-line"><span class="ln">246</span>  )</span>
+<span class="code-line"><span class="ln">247</span></span>
+<span class="code-line"><span class="ln">248</span>  <span class="cm"># Always end with MESSAGE_COMPLETE including usage</span></span>
+<span class="code-line"><span class="ln">249</span>  <span class="fn">yield</span> <span class="var">StreamEvent</span>(</span>
+<span class="code-line"><span class="ln">250</span>    <span class="var">type</span>=<span class="var">StreamEventType</span>.<span class="var">MESSAGE_COMPLETE</span>,</span>
+<span class="code-line"><span class="ln">251</span>    <span class="var">usage</span>=<span class="var">Usage</span>(</span>
+<span class="code-line"><span class="ln">252</span>      <span class="var">prompt_tokens</span>=<span class="var">response</span>.<span class="var">usage</span>.<span class="var">prompt_tokens</span>,</span>
+<span class="code-line"><span class="ln">253</span>      <span class="var">completion_tokens</span>=<span class="var">response</span>.<span class="var">usage</span>.<span class="var">completion_tokens</span>,</span>
+<span class="code-line"><span class="ln">254</span>      <span class="var">total_tokens</span>=<span class="var">response</span>.<span class="var">usage</span>.<span class="var">total_tokens</span>,</span>
+<span class="code-line"><span class="ln">255</span>    )</span>
+<span class="code-line"><span class="ln">256</span>  )</span>
+<span class="code-line"><span class="ln">257</span> )</span>
+<span class="code-line"><span class="ln">258</span> )</span>
+<span class="code-line"><span class="ln">259</span> )</span>
+<span class="code-line"><span class="ln">260</span> )</span>
+<span class="code-line"><span class="ln">261</span> )</span>
+<span class="code-line"><span class="ln">262</span> )</span>
+<span class="code-line"><span class="ln">263</span> )</span>
+<span class="code-line"><span class="ln">264</span> )</span></pre>
+                </div>
+
+                <div class="code-explanation">
+                    <div class="code-explanation-title">Key Points</div>
+                    <p>• <strong>Lines 229-234:</strong> If message has content, yield single TEXT_DELTA with complete response</p>
+                    <p>• <strong>Lines 236-246:</strong> For each tool call, yield single TOOL_CALL_COMPLETE event</p>
+                    <p>• <strong>Lines 249-257:</strong> Always end with MESSAGE_COMPLETE including usage statistics</p>
+                    <p>• <strong>Both paths converge:</strong> Agent processes same event types regardless of streaming mode</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Context Management -->
+        <div id="tab-context" class="tab-content">
+            <div class="section">
+                <h2><span class="icon">🧠</span> Context Management</h2>
+                <p>The context manager maintains conversation history using a tiered retrieval system to optimize token usage.</p>
+
+                <h3>Token Budget Tiers</h3>
+                <div class="concept-grid">
+                    <div class="concept-card">
+                        <div class="concept-name" style="color: var(--accent-teal)">L0 — Always Included</div>
+                        <div class="concept-detail">System prompt + Recent messages within default 20k token budget</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name" style="color: var(--accent-blue)">L1 — Conditionally Included</div>
+                        <div class="concept-detail">Older messages within L0 + L1 budget (+8k tokens), selected by relevance (min score 0.15)</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name" style="color: var(--text-secondary)">L2 — Archived</div>
+                        <div class="concept-detail">Messages beyond L1 budget, never sent to LLM</div>
+                    </div>
+                </div>
+
+                <h3>Context Compression</h3>
+                <p>When context exceeds 80% of the token budget, older messages are summarized:</p>
+                <div class="code-block">
+                    <div class="code-header">agent/agent.py:48-56 — Context compression trigger</div>
+<pre><span class="code-line"><span class="ln">48</span><span class="kw">if</span> <span class="var">self</span>.<span class="var">session</span>.<span class="var">context_manager</span>.<span class="fn">needs_compression</span>():</span>
+<span class="code-line"><span class="ln">49</span>  <span class="var">summary</span>, <span class="var">usage</span> = <span class="kw">await</span> <span class="var">self</span>.<span class="var">session</span>.<span class="var">chat_compactor</span>.<span class="fn">compress</span>(</span>
+<span class="code-line"><span class="ln">50</span>    <span class="var">self</span>.<span class="var">session</span>.<span class="var">context_manager</span>)</span>
+<span class="code-line"><span class="ln">51</span>  <span class="kw">if</span> <span class="var">summary</span>:</span>
+<span class="code-line"><span class="ln">52</span>    <span class="var">self</span>.<span class="var">session</span>.<span class="var">context_manager</span>.<span class="fn">replace_with_summary</span>(<span class="var">summary</span>)</span>
+<span class="code-line"><span class="ln">53</span>    <span class="var">SessionMemoryStore</span>().<span class="fn">save</span>(</span>
+<span class="code-line"><span class="ln">54</span>      <span class="var">self</span>.<span class="var">config</span>.<span class="var">cwd</span>,</span>
+<span class="code-line"><span class="ln">55</span>      <span class="var">self</span>.<span class="var">session</span>.<span class="var">session_id</span>,</span>
+<span class="code-line"><span class="ln">56</span>    )</span></pre>
+                </div>
+
+                <h3>Tool Output Pruning</h3>
+                <div class="concept-grid">
+                    <div class="concept-card">
+                        <div class="concept-name">When</div>
+                        <div class="concept-detail">Triggers when context exceeds 60% capacity</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">Requirements</div>
+                        <div class="concept-detail">At least 2 user messages must exist</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">Protection</div>
+                        <div class="concept-detail">Recent tool outputs (40k tokens) are preserved</div>
+                    </div>
+                    <div class="concept-card">
+                        <div class="concept-name">Action</div>
+                        <div class="concept-detail">Older tool results cleared to "[Old tool result content cleared]"</div>
+                    </div>
+                </div>
+
+                <h3>Key Concepts</h3>
+                <div class="keyword-card">
+                    <div class="keyword-name">AsyncGenerator</div>
+                    <div class="keyword-desc">A function that is both async and a generator. It can yield multiple values over time, enabling streaming responses as events occur.</div>
+                </div>
+                <div class="keyword-card">
+                    <div class="keyword-name">Context Window</div>
+                    <div class="keyword-desc">The maximum number of tokens the LLM can process. When exceeded, context compression summarizes older messages.</div>
+                </div>
+                <div class="keyword-card">
+                    <div class="keyword-name">Agentic Loop</div>
+                    <div class="keyword-desc">A pattern where an AI agent repeatedly calls an LLM, processes tool calls, and feeds results back until a final response is produced.</div>
+                </div>
+                <div class="keyword-card">
+                    <div class="keyword-name">Hook System</div>
+                    <div class="keyword-desc">A plugin-like system that triggers custom code before and after agent runs. Used for logging, metrics, authentication, etc.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Flowchart -->
+        <div id="tab-flowchart" class="tab-content">
+            <div class="section">
+                <h2><span class="icon">📊</span> Execution Flowchart</h2>
+                <p>This flowchart shows the complete execution flow when processing a user message:</p>
+
+                <div class="flowchart-container">
+                    <div class="flowchart">
+                        <div class="flow-node flow-node-start">run() called</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">trigger_before_agent hooks</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-io">Add user message to context</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-decision">needs_compression?</div>
+                        <div class="flow-row">
+                            <div style="text-align: center;">
+                                <span class="flow-label label-yes">Yes</span>
+                                <div class="flow-arrow">→</div>
+                                <div class="flow-node flow-node-process" style="font-size: 0.8rem;">Compress context</div>
+                            </div>
+                            <div style="text-align: center;">
+                                <span class="flow-label label-no">No</span>
+                                <div class="flow-arrow">→</div>
+                                <div style="width: 2rem;"></div>
+                            </div>
+                        </div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">Call LLM chat_completion()</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">Process TEXT_DELTA events</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">Collect TOOL_CALL_COMPLETE</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-decision">tool_calls > 0?</div>
+                        <div class="flow-row">
+                            <div style="text-align: center;">
+                                <span class="flow-label label-yes">Yes</span>
+                                <div class="flow-arrow">→</div>
+                                <div class="flow-node flow-node-process">Execute tools<br>(parallel/sequential)</div>
+                            </div>
+                            <div style="text-align: center;">
+                                <span class="flow-label label-no">No</span>
+                                <div class="flow-arrow">→</div>
+                                <div class="flow-node flow-node-end">Complete</div>
+                            </div>
+                        </div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">Loop Detection check</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-process">Prune Tool Outputs</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-decision">turn < max_turns?</div>
+                        <div class="flow-row">
+                            <div>
+                                <span class="flow-label label-yes">Yes</span>
+                                <div class="flow-arrow">↺ Loop back</div>
+                            </div>
+                            <div>
+                                <span class="flow-label label-no">No</span>
+                                <div class="flow-arrow">→</div>
+                                <div class="flow-node flow-node-end">Error: Max turns</div>
+                            </div>
+                        </div>
+                        <div class="flow-arrow" style="margin-top: 1rem;">↓</div>
+                        <div class="flow-node flow-node-process">trigger_after_agent hooks</div>
+                        <div class="flow-arrow">↓</div>
+                        <div class="flow-node flow-node-end">run() complete</div>
+                    </div>
+                </div>
+
+                <div class="note">
+                    <div class="note-title">Multi-Turn Conversation</div>
+                    <p>The agent can handle complex tasks that require multiple turns. Each turn, the LLM sees the full conversation history and can decide to call more tools or produce a final response.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById('tab-' + tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+    </script>
+</body>
+</html>
