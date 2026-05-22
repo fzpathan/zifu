@@ -351,6 +351,17 @@ The LLM is used only for:
 
 All step execution is deterministic and uses direct Python imports.
 """
+"""
+Workflow Assistant Router
+
+Non-agentic AI assistant where workflows are defined in YAML.
+The LLM is used only for:
+  1. Intent classification — pick the right workflow
+  2. Param extraction — pull required values from the user message
+  3. Step summarization — explain the results in natural language
+
+All step execution is deterministic and uses direct Python imports.
+"""
 import asyncio
 import json
 import logging
@@ -361,11 +372,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+import os
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from .ai_assistant import extract_message_content, get_openai_client
+from .ai_assistant import extract_message_content
 
 logger = logging.getLogger(__name__)
 
@@ -373,6 +386,16 @@ router = APIRouter(prefix="/api/workflow-ai", tags=["Workflow AI Assistant"])
 
 YAML_PATH = Path(__file__).resolve().parent.parent / "workflow_definitions.yaml"
 _API_ROOT = Path(__file__).resolve().parent.parent
+
+_OPENROUTER_API_KEY = os.environ.get(
+    "OPENAI_API_KEY",
+    "",
+)
+_OPENROUTER_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1")
+
+
+def get_openai_client() -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=_OPENROUTER_API_KEY, base_url=_OPENROUTER_BASE_URL)
 
 
 def _ensure_api_root_on_path() -> None:
@@ -387,6 +410,14 @@ def load_workflows() -> dict:
 
 def _sse(event_data: dict) -> str:
     return f"data: {json.dumps(event_data)}\n\n"
+
+
+def _accumulate_usage(acc: Dict[str, int], usage) -> None:
+    if not usage:
+        return
+    acc["prompt_tokens"]     += getattr(usage, "prompt_tokens",     0) or 0
+    acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+    acc["total_tokens"]      += getattr(usage, "total_tokens",      0) or 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,9 +481,9 @@ async def classify_intent(client, model: str, message: str, workflows: list) -> 
     raw = extract_message_content(result.choices[0].message.content)
     try:
         cleaned = re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-        return json.loads(cleaned)
+        return json.loads(cleaned), result.usage
     except Exception:
-        return {"workflow_id": None, "confidence": 0.0}
+        return {"workflow_id": None, "confidence": 0.0}, result.usage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -469,15 +500,6 @@ User message: "{message}"
 Respond with JSON only (no markdown). Return each parameter key with its extracted string value, or null if not found.
 Example: {{"file_path": "/opt/config.xlsx", "control_type": null}}"""
 
-_______________________________________________________________________
-_______________________________________________________________________
-    {
-      title: 'Workflow Assistant',
-      description: 'Non-agentic AI assistant powered by YAML-defined workflows. Describe your task, confirm parameters, and watch deterministic steps execute with live progress tracking.',
-      icon: FaRobot,
-      accessKey: 'ai-assistant',
-      onClick: openWorkflowAssistant
-    },
 
 async def extract_params(client, model: str, message: str, params: list) -> dict:
     if not params:
@@ -503,9 +525,9 @@ async def extract_params(client, model: str, message: str, params: list) -> dict
     raw = extract_message_content(result.choices[0].message.content)
     try:
         cleaned = re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-        return json.loads(cleaned)
+        return json.loads(cleaned), result.usage
     except Exception:
-        return {p["key"]: None for p in params}
+        return {p["key"]: None for p in params}, result.usage
 
 
 def find_missing_params(params: list, extracted: dict) -> list:
@@ -806,14 +828,19 @@ async def _exec_llm_summarize(step: dict, confirmed_params: dict, prior_results:
             temperature=0.3,
             max_tokens=1500,
             stream=True,
+            stream_options={"include_usage": True},
         )
         full = ""
+        last_usage = None
         async for chunk in stream:
-            delta = chunk.choices[0].delta
+            if chunk.usage:
+                last_usage = chunk.usage
+            delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 full += delta.content
                 yield "chunk", delta.content
         yield "done", full
+        yield "usage", last_usage
     except Exception as exc:
         logger.error("LLM summarize error: %s", exc, exc_info=True)
         yield "error", str(exc)
@@ -849,11 +876,13 @@ async def execute_step(step: dict, confirmed_params: dict, prior_results: dict, 
 # Step loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client, model: str):
+async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client, model: str, usage_acc: Dict[str, int] = None):
     steps = workflow.get("steps", [])
     prior_results: Dict[str, Any] = {}
     errors = 0
     final_content = ""
+    if usage_acc is None:
+        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     for idx, step in enumerate(steps):
         yield _sse({
@@ -876,6 +905,8 @@ async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client,
                 elif chunk_type == "done":
                     accumulated = chunk_content
                     final_content = accumulated
+                elif chunk_type == "usage":
+                    _accumulate_usage(usage_acc, chunk_content)
                 elif chunk_type == "error":
                     status = "error"
                     result = chunk_content
@@ -889,7 +920,6 @@ async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client,
             errors += 1
 
         prior_results[step["id"]] = {"status": status, "value": result}
-        # Skipped steps don't block downstream steps — treat as neutral
 
         if isinstance(result, str):
             preview = result[:300]
@@ -913,6 +943,7 @@ async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client,
         "workflow_id": workflow["id"],
         "total_steps_run": len(steps),
         "errors": errors,
+        "usage": usage_acc,
     })
 
 
@@ -926,6 +957,8 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
         data = load_workflows()
         workflows_list = data.get("workflows", [])
         workflows_by_id = {w["id"]: w for w in workflows_list}
+
+        usage_acc: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         # Phase 4 fast-path: confirmed re-send with all params
         if request.workflow_id and request.confirmed_params is not None:
@@ -944,12 +977,13 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
                 "confidence": 1.0,
             })
 
-            async for chunk in execute_workflow_steps(workflow, request.confirmed_params, client, request.model):
+            async for chunk in execute_workflow_steps(workflow, request.confirmed_params, client, request.model, usage_acc):
                 yield chunk
             return
 
         # Phase 1 — intent classification
-        classification = await classify_intent(client, request.model, request.message, workflows_list)
+        classification, classify_usage = await classify_intent(client, request.model, request.message, workflows_list)
+        _accumulate_usage(usage_acc, classify_usage)
         workflow_id = classification.get("workflow_id")
         confidence = float(classification.get("confidence") or 0.0)
 
@@ -964,9 +998,10 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
                 temperature=0.7,
                 max_tokens=1000,
             )
+            _accumulate_usage(usage_acc, result.usage)
             content = extract_message_content(result.choices[0].message.content)
             yield _sse({"event": "content", "content": content})
-            yield _sse({"event": "done", "needs_confirm": False})
+            yield _sse({"event": "done", "needs_confirm": False, "usage": usage_acc})
             return
 
         workflow = workflows_by_id[workflow_id]
@@ -983,7 +1018,8 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
 
         # Phase 2 — param extraction
         params_config = workflow.get("params", [])
-        extracted = await extract_params(client, request.model, request.message, params_config)
+        extracted, extract_usage = await extract_params(client, request.model, request.message, params_config)
+        _accumulate_usage(usage_acc, extract_usage)
 
         yield _sse({"event": "params_extracted", "extracted_params": extracted})
 
@@ -998,7 +1034,7 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
                 "extracted_params": extracted,
                 "all_params": params_config,
             })
-            yield _sse({"event": "done", "needs_confirm": True, "all_params_present": False})
+            yield _sse({"event": "done", "needs_confirm": True, "all_params_present": False, "usage": usage_acc})
         else:
             yield _sse({
                 "event": "done",
@@ -1006,6 +1042,7 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
                 "all_params_present": True,
                 "workflow_id": workflow_id,
                 "extracted_params": extracted,
+                "usage": usage_acc,
             })
 
     except Exception as exc:
@@ -1741,8 +1778,7 @@ export default function WorkflowCard({ workflow, stepStatuses, extractedParams, 
 }
 --------------------------------------------------
 ____________________________________________________
-workflowChatArea.js
-import { useRef, useEffect, useCallback, useState } from 'react';
+workflowChatArea.jsimport { useRef, useEffect, useCallback, useState } from 'react';
 import { Bot, ChevronDown, Zap, Search, Settings, CheckSquare } from 'lucide-react';
 import MessageBubble from '../../config-assistant/components/MessageBubble';
 import WorkflowMessageInput from './WorkflowMessageInput';
@@ -1803,12 +1839,12 @@ export default function WorkflowChatArea() {
 
     const [showScrollBtn, setShowScrollBtn] = useState(false);
     const [isConfirmed, setIsConfirmed] = useState(false);
+    const [lastUsage, setLastUsage] = useState(null);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [currentMessages, streamingLlmContent, pendingConfirmation, activeWorkflow]);
 
-    // Reset confirmation state when a new workflow is classified
     useEffect(() => {
         setIsConfirmed(false);
     }, [activeWorkflow]);
@@ -1898,6 +1934,7 @@ export default function WorkflowChatArea() {
                         accumulatedContent += data.content || '';
                         appendStreamingLlm(data.content || '');
                     } else if (evt === 'done') {
+                        if (data.usage) setLastUsage(data.usage);
                         if (data.needs_confirm) {
                             needsConfirmData = data;
                         }
@@ -1959,6 +1996,7 @@ export default function WorkflowChatArea() {
 
         resetWorkflowState();
         setIsConfirmed(false);
+        setLastUsage(null);
 
         const userMessage = {
             id: `msg-${Date.now()}-user`,
@@ -2033,7 +2071,7 @@ export default function WorkflowChatArea() {
                         <p style={{ margin: '0 0 32px', fontSize: '15px', color: '#475569', maxWidth: '480px', lineHeight: '1.65' }}>
                             Describe your task in plain English — the assistant will match it to the right workflow and guide you through.
                         </p>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px', width: '100%', maxWidth: '900px' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px', width: '100%', maxWidth: '1400px' }}>
                             {PROMPT_SUGGESTIONS.map(({ Icon, text }) => (
                                 <button
                                     key={text}
@@ -2059,7 +2097,7 @@ export default function WorkflowChatArea() {
                         </div>
                     </div>
                 ) : (
-                    <div style={{ padding: '24px 32px', width: '100%', maxWidth: '900px', margin: '0 auto' }}>
+                    <div style={{ padding: '24px 32px', width: '100%', maxWidth: '1400px', margin: '0 auto' }}>
                         {currentMessages.map(msg => <MessageBubble key={msg.id} message={msg} />)}
 
                         {/* Workflow card — shown after classification */}
@@ -2098,6 +2136,15 @@ export default function WorkflowChatArea() {
                                         <span style={{ display: 'inline-block', width: '2px', height: '16px', backgroundColor: '#db0011', marginLeft: '2px', verticalAlign: 'text-bottom', animation: 'blink 0.9s step-end infinite' }} />
                                     </div>
                                 </div>
+                            </div>
+                        )}
+
+                        {/* Token usage */}
+                        {lastUsage && !isLoading && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '4px 6px 10px', fontSize: '11px', color: '#94a3b8', flexWrap: 'wrap' }}>
+                                <span>&#9679; {lastUsage.prompt_tokens.toLocaleString()} prompt</span>
+                                <span>&#9679; {lastUsage.completion_tokens.toLocaleString()} completion</span>
+                                <span style={{ fontWeight: 600, color: '#64748b' }}>{lastUsage.total_tokens.toLocaleString()} tokens total</span>
                             </div>
                         )}
 
@@ -2140,8 +2187,10 @@ export default function WorkflowChatArea() {
         </main>
     );
 }
+
 ---------------------------------------------------------
 _________________________________________________________
+CHATHEADER
 import { useState } from 'react';
 import { Bot, Trash2, Download, Zap, X, Info } from 'lucide-react';
 import Logo from '../../../components/Logo';
