@@ -297,6 +297,47 @@ def _extract_json(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Path security
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_allowed_roots() -> List[Path]:
+    """Return the list of allowed root directories for file I/O.
+
+    Resolution order:
+      1. WORKFLOW_WORKSPACE env var  — explicit workspace for this assistant
+      2. AI_ALLOWED_PATHS env var    — shared allowlist used by ai_assistant / ai_tools
+      3. Empty list                  — no restriction (preserves previous behaviour)
+    """
+    ws_raw = os.environ.get("WORKFLOW_WORKSPACE", "").strip()
+    if ws_raw:
+        return [Path(ws_raw).resolve()]
+    ap_raw = os.environ.get("AI_ALLOWED_PATHS", "").strip()
+    if ap_raw:
+        return [Path(p.strip()).resolve() for p in ap_raw.split(";") if p.strip()]
+    return []
+
+
+def _secure_path(raw: str) -> Path:
+    """Resolve *raw* to an absolute path and verify it is inside an allowed root.
+
+    - Calls Path.resolve() so symlinks and ``../`` traversal attempts are
+      normalised before the check.
+    - Raises ValueError with a clear message if the path escapes every root.
+    - Returns the resolved Path when safe (or when no restriction is configured).
+    """
+    resolved = Path(raw).resolve()
+    roots = _get_allowed_roots()
+    if not roots:
+        return resolved  # no restriction configured
+    if any(resolved == root or root in resolved.parents for root in roots):
+        return resolved
+    roots_str = ", ".join(str(r) for r in roots)
+    raise ValueError(
+        f"Access denied: '{raw}' is outside the allowed workspace(s): {roots_str}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Request model
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -424,7 +465,11 @@ async def _exec_read_file(confirmed_params: dict, prior_results: dict):
     if not file_path:
         return "skipped", []
 
-    path = Path(file_path)
+    try:
+        path = _secure_path(file_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
     if not path.exists():
         return "error", f"File not found: {file_path}"
 
@@ -453,13 +498,18 @@ async def _exec_write_file(confirmed_params: dict, prior_results: dict):
     if not output_path:
         return "skipped", "No output path specified"
 
+    try:
+        secure_out = _secure_path(output_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
     transform_result = prior_results.get("execute_transform", {}).get("value")
     if not transform_result or isinstance(transform_result, str):
         return "error", "No transform results available to write"
 
     try:
         import pandas as pd
-        path = Path(output_path)
+        path = secure_out
         path.parent.mkdir(parents=True, exist_ok=True)
 
         df = pd.DataFrame(transform_result if isinstance(transform_result, list) else [transform_result])
@@ -482,12 +532,17 @@ async def _exec_write_summary(confirmed_params: dict, prior_results: dict):
     if not output_path:
         return "skipped", "No summary output path specified"
 
+    try:
+        secure_out = _secure_path(output_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
     summary = prior_results.get("summarize", {}).get("value", "")
     if not summary:
         return "error", "No summary content to write"
 
     try:
-        path = Path(output_path)
+        path = secure_out
         path.parent.mkdir(parents=True, exist_ok=True)
         suffix = path.suffix.lower()
 
@@ -1242,6 +1297,9 @@ async def health():
         data = load_workflows()
         count = len(data.get("workflows", []))
         return {"status": "ok", "workflow_count": count, "yaml_loaded": True}
+    except Exception as exc:
+        return {"status": "error", "yaml_loaded": False, "error": str(exc)}
+
 
 ?????????????????????????????????????????????????????????????????????
     { Icon: Zap, text: 'Build a formula to extract the year from transaction_date' },
