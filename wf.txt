@@ -1,307 +1,137 @@
-WORK
-version: "1.0"
-
-# ============================================================
-# Workflow Definitions for Workflow Assistant
-#
-# Each workflow is a deterministic pipeline the backend executes
-# after the LLM classifies user intent and extracts parameters.
-# The LLM is used ONLY for: intent classification, param
-# extraction, and step result summarization.
-# ============================================================
-
-workflows:
 
   # ────────────────────────────────────────────────────────
-  - id: transform_validation
-    name: "Transform Validation"
-    description: "Execute a data transform operation on sample rows (or a file) and inspect the results. Can read input from Excel/CSV and write results back to a file."
-    icon: "⚙️"
+  - id: formula_builder
+    name: "Formula Builder & Auto-Test"
+    description: "Describe a transformation in plain English — the LLM generates the correct formula config, creates test data, runs it through the transform engine, and summarises the result."
+    icon: "🔧"
 
     intent_classification:
       examples:
-        - "run a transform on my data"
-        - "test a formula operation on sample rows"
-        - "execute a date extract transform"
-        - "validate a field mapping transform"
-        - "apply concatenate operation to these fields"
-        - "test conditional logic on my data"
-        - "transform my data using SetValue"
-        - "check if my formula works on sample data"
-        - "test a map values transform"
-        - "run a string operation on this column"
-        - "read my excel file and apply a transform"
-        - "transform the data in my csv file"
+        - "create a formula to extract year from transaction_date"
+        - "build a transform to concatenate first_name and last_name"
+        - "I need a formula that maps status codes to labels"
+        - "generate a conditional formula for risk_rating"
+        - "create a transform to calculate age from birthdate"
+        - "build a formula to split account_number on a dash"
+        - "make a formula to round amount to 2 decimal places"
+        - "generate a SetValue formula for the status field"
+        - "create a formula to uppercase the customer_name column"
+        - "build a NumericOperation formula for abs of balance"
       keywords:
-        - transform
-        - formula
-        - concatenate
-        - date extract
-        - conditional
-        - map values
-        - set value
-        - copy field
-        - numeric operation
-        - string operation
-        - split column
-        - replace values
-        - execute transform
-        - test operation
+        - build formula
+        - create formula
+        - generate formula
+        - generate transform
+        - make a formula
+        - formula for
+        - transform for
+        - formula builder
+        - create a transform
+        - write a formula
+        - design a formula
 
     params:
-      - key: operation_type
-        label: "Operation Type"
-        type: select
+      - key: formula_description
+        label: "Formula Description"
+        type: textarea
         required: true
-        options:
-          - DateExtract
-          - Concatenate
-          - Formula
-          - Conditional
-          - MapValues
-          - StringOperation
-          - NumericOperation
-          - SetValue
-          - CopyField
-          - Split
-          - Replace
-        description: "The transform operation to execute"
-        example: "DateExtract"
+        description: "Describe in plain English what transformation you want to achieve"
+        example: "Extract the year from transaction_date and store it in extracted_year"
 
       - key: new_field_name
-        label: "New Field Name"
+        label: "Output Field Name (optional)"
         type: text
-        required: true
-        description: "Output column that will be created or updated by the operation"
+        required: false
+        description: "Name for the output field. Leave blank and the LLM will suggest one."
         example: "extracted_year"
 
-      - key: input_fields
-        label: "Input Fields (comma-separated)"
-        type: text
-        required: true
-        description: "Source column(s) used as input for the operation"
-        example: "transaction_date"
-
-      - key: operation_params
-        label: "Operation Parameters (JSON)"
-        type: textarea
-        required: false
-        description: "Additional operation-specific options as JSON (e.g. component, separator, mapping)"
-        example: '{"component": "year"}'
-
-      - key: input_file_path
-        label: "Input File Path (optional)"
-        type: text
-        required: false
-        description: "Absolute path to an Excel (.xlsx) or CSV (.csv) file to read sample data from. If provided, overrides Sample Data below."
-        example: "/opt/data/transactions.xlsx"
-
-      - key: sheet_name
-        label: "Excel Sheet Name (optional)"
-        type: text
-        required: false
-        description: "Sheet name to read from the Excel file (leave blank for the first sheet)"
-        example: "Sheet1"
-
       - key: sample_data
-        label: "Sample Data (JSON array)"
+        label: "Sample Data (optional JSON array)"
         type: textarea
         required: false
-        description: "Array of row objects to transform. Not needed if Input File Path is provided."
+        description: "Array of row objects to test against. Leave blank and the LLM will generate realistic test data."
         example: '[{"id": 1, "transaction_date": "2024-03-15", "amount": 500}]'
 
-      - key: output_file_path
-        label: "Output File Path (optional)"
-        type: text
-        required: false
-        description: "Absolute path to write the transformed results to (.xlsx or .csv). Leave blank to skip writing."
-        example: "/opt/data/transformed_output.xlsx"
-
     steps:
-      - id: read_input_file
-        name: "Read Input File"
-        function_type: file_read
-        description: "Reads sample data from an Excel or CSV file. Skipped if no input file path is provided."
+      - id: build_formula
+        name: "Generate Formula Config"
+        function_type: llm_build_formula
+        description: "LLM generates operation_type, field names, operation_params, and test data from the description"
 
       - id: execute_transform
-        name: "Execute Transform Operation"
-        function_type: transform_execute
-        description: "Applies the operation to the sample data rows using the transform engine"
-
-      - id: write_output_file
-        name: "Write Results to File"
-        function_type: file_write
-        description: "Writes the transformed rows to an Excel or CSV file. Skipped if no output path is provided."
+        name: "Test the Formula"
+        function_type: transform_execute_from_prior
+        formula_step_id: build_formula
+        description: "Runs the LLM-generated formula through the transform engine"
 
       - id: summarize
-        name: "Summarize Results"
+        name: "Summarise Results"
         function_type: llm_summarize
-        description: "Interprets the transformed data and presents a clear summary"
+        description: "Shows the generated config, before/after values, and confirms correctness"
         prompt_template: >
-          The user ran a {{operation_type}} transform on field(s) "{{input_fields}}".
-          The new output field is "{{new_field_name}}".
-          Operation parameters: {{operation_params}}.
-          Here are the full transformed results (JSON):
+          The user wanted: "{{formula_description}}"
+
+          Generated formula config (from build_formula step):
+          {{build_formula.result}}
+
+          Transform engine results:
           {{execute_transform.result}}
 
-          File output: {{write_output_file.result}}
-
           Please:
-          1. Show the key before/after values in a markdown table
-          2. Confirm whether the operation worked as expected
-          3. Highlight any unexpected nulls, errors, or data type issues
-          4. If results were written to a file, confirm the output path and row count
+          1. Show the generated formula config in a JSON code block
+          2. Show a before/after markdown table of the key field values
+          3. Confirm whether the formula worked as expected
+          4. Highlight any nulls, type issues, or edge cases to watch
 
   # ────────────────────────────────────────────────────────
-  - id: config_validation
-    name: "Config File Validation"
-    description: "Validate an Excel config file (QA or COMP control type) and report errors by sheet. Optionally write the validation summary to a file."
-    icon: "✅"
+  - id: field_mapping_analyser
+    name: "Field Mapping Formula Analyser"
+    description: "Look up a FieldOperations formula row by row number or field name — the LLM reads it, understands it, generates a corrected version, tests it, and summarises."
+    icon: "📋"
 
     intent_classification:
       examples:
-        - "validate my config file"
-        - "check my completeness config for errors"
-        - "run validation on my QA config"
-        - "validate the config at /opt/configs/qa.xlsx"
-        - "check my COMP config file"
-        - "run config validator"
-        - "validate my excel config for QA"
-        - "is my config file correct for completeness"
-        - "run validation on completeness config"
-        - "check for errors in my config excel"
-        - "validate and save the report"
+        - "read row 5 from field operations"
+        - "analyse the formula for extracted_year in field mapping"
+        - "look up the field operations formula for risk_score"
+        - "check the field mapping formula at row 12"
+        - "understand the formula for output_amount in fieldoperations"
+        - "analyse and improve the formula for customer_id"
+        - "find and test the formula for new_field balance_flag"
+        - "read row 3 from fieldoperations and test it"
+        - "what does the formula for status_label do"
+        - "analyse the fieldmapping formula for account_type"
       keywords:
-        - validate config
-        - config validation
-        - config file
-        - validate excel
-        - config validator
-        - check config
-        - completeness config
-        - QA config
-        - COMP config
-        - validate completeness
-        - validate quality
-        - excel config
+        - field mapping
+        - field operations
+        - fieldmapping
+        - fieldoperations
+        - formula row
+        - analyse formula
+        - read formula
+        - lookup formula
+        - row from field
+        - field formula
+        - field operations row
+        - row number formula
 
     params:
-      - key: file_path
-        label: "Config File Path"
-        type: text
-        required: true
-        description: "Absolute path to the Excel config file (.xlsx or .xls) on the server"
-        example: "/opt/configs/completeness_config.xlsx"
-
-      - key: control_type
-        label: "Control Type"
+      - key: lookup_type
+        label: "Look Up By"
         type: select
         required: true
         options:
-          - QA
-          - COMP
-        description: "QA for Quality Assurance checks, COMP for Completeness reconciliation"
-        example: "QA"
+          - new_field_name
+          - row_number
+        description: "Find the row by its output field name, or by its row number in the sheet"
+        example: "new_field_name"
 
-      - key: summary_output_path
-        label: "Save Summary To (optional)"
-        type: text
-        required: false
-        description: "Absolute path to write the validation summary report (.txt, .md, or .xlsx). Leave blank to skip."
-        example: "/opt/reports/qa_validation_report.txt"
-
-    steps:
-      - id: start_validation
-        name: "Start Config Validation"
-        function_type: config_validate_start
-        description: "Triggers the config validation subprocess and returns a task ID"
-
-      - id: poll_status
-        name: "Wait for Validation to Complete"
-        function_type: poll_until
-        description: "Polls the task status until validation finishes or fails"
-        poll_config:
-          interval_seconds: 3
-          max_attempts: 40
-          done_statuses:
-            - completed
-            - failed
-            - error
-            - not_found
-
-      - id: summarize
-        name: "Summarize Validation Report"
-        function_type: llm_summarize
-        description: "Formats the validation output into a clear error report with fix suggestions"
-        prompt_template: >
-          A config file validation was run on "{{file_path}}" (control type: {{control_type}}).
-          Validation result:
-          {{poll_status.result}}
-
-          Please produce a concise markdown report:
-          1. Overall verdict: PASS or FAIL
-          2. List any validation errors grouped by config sheet (if present)
-          3. For each error, suggest the most likely fix
-          4. If validation passed, confirm all sheets are clean
-
-      - id: write_summary
-        name: "Write Summary to File"
-        function_type: file_write_summary
-        description: "Saves the validation summary report to a file. Skipped if no output path is provided."
-
-  # ────────────────────────────────────────────────────────
-  - id: config_search
-    name: "Config Search"
-    description: "Search across config data files (rules, enrichment, field ops, etc.) by keyword or field name."
-    icon: "🔍"
-
-    intent_classification:
-      examples:
-        - "search config for account_id field"
-        - "find rules that use customer_name"
-        - "look up enrichment config for product_code"
-        - "search the config for output rules containing status"
-        - "find field operations for date_of_birth"
-        - "config search for region mapping"
-        - "where is account_number configured"
-        - "find all rules referencing balance"
-        - "search config files for transaction_type"
-        - "look up the field mapping for currency"
-      keywords:
-        - config search
-        - search config
-        - find in config
-        - look up config
-        - field in config
-        - search rules
-        - find rule
-        - enrichment search
-        - output rule search
-        - field operations search
-        - where is configured
-        - find field
-        - find mapping
-
-    params:
-      - key: query
-        label: "Search Query"
+      - key: lookup_value
+        label: "Field Name or Row Number"
         type: text
         required: true
-        description: "Keyword or field name to search for across config files"
-        example: "account_id"
-
-      - key: sheet
-        label: "Config Sheet (optional)"
-        type: select
-        required: false
-        options:
-          - InputFiles
-          - rules
-          - Enrichment
-          - FieldOperations
-          - OutputRule
-        description: "Limit the search to one specific sheet (leave empty to search all)"
-        example: "rules"
+        description: "The NewFieldName value (e.g. extracted_year) or row number (e.g. 5)"
+        example: "extracted_year"
 
       - key: control_type
         label: "Control Type (optional)"
@@ -310,47 +140,59 @@ workflows:
         options:
           - QA
           - COMP
-        description: "Filter by control type — leave empty to search all types"
+        description: "Filter to a specific control type — leave blank to search all"
         example: "QA"
 
+      - key: sample_data
+        label: "Sample Data (optional JSON array)"
+        type: textarea
+        required: false
+        description: "Test rows to run against the formula. Leave blank for LLM-generated test data."
+        example: '[{"trade_date": "2024-01-15", "amount": 200.5}]'
+
     steps:
-      - id: run_search
-        name: "Search Config Files"
-        function_type: config_search
-        description: "Runs a regex search across matching parquet config files"
+      - id: read_field_mapping
+        name: "Read FieldOperations Row"
+        function_type: read_config_row
+        sheet: FieldOperations
+        description: "Fetches the matching row(s) from the FieldOperations config parquet by field name or row number"
+
+      - id: analyse_formula
+        name: "Analyse & Improve Formula"
+        function_type: llm_build_formula_from_row
+        source_step_id: read_field_mapping
+        description: "LLM reads the existing formula config, understands it, and generates a corrected/improved version with test data"
+
+      - id: execute_transform
+        name: "Test the Improved Formula"
+        function_type: transform_execute_from_prior
+        formula_step_id: analyse_formula
+        description: "Runs the LLM-generated improved formula through the transform engine"
 
       - id: summarize
-        name: "Summarize Search Results"
+        name: "Summarise Analysis"
         function_type: llm_summarize
-        description: "Formats the search hits into a readable summary with context"
+        description: "Explains the original formula, improvements made, and test results"
         prompt_template: >
-          The user searched config files for "{{query}}"
-          (sheet filter: {{sheet}}, control_type: {{control_type}}).
-          Search results:
-          {{run_search.result}}
+          A FieldOperations formula row was retrieved and analysed.
+
+          Original row from FieldOperations config:
+          {{read_field_mapping.result}}
+
+          LLM-generated improved formula config:
+          {{analyse_formula.result}}
+
+          Transform test results:
+          {{execute_transform.result}}
 
           Please:
-          1. Show matching rows in a markdown table with the most relevant columns
-          2. Note which config types and sheets contain matches
-          3. Briefly explain the context of each match (what the field/rule is used for)
-          4. If no results found, suggest alternative search terms or spellings
+          1. Show the original formula row as a table
+          2. Explain in plain English what the formula does
+          3. Show the improved formula config in a JSON code block and note any changes made
+          4. Show a before/after table of the test results
+          5. Flag any issues found in the original or edge cases to watch
 
-
-_________________________________________________________
-_________________________________________________________
-workflow_assistant
-
-"""
-Workflow Assistant Router
-
-Non-agentic AI assistant where workflows are defined in YAML.
-The LLM is used only for:
-  1. Intent classification — pick the right workflow
-  2. Param extraction — pull required values from the user message
-  3. Step summarization — explain the results in natural language
-
-All step execution is deterministic and uses direct Python imports.
-"""
+-------------------------------------------------------------------------
 """
 Workflow Assistant Router
 
@@ -379,6 +221,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from .ai_assistant import extract_message_content
+from .rag_service import get_rag_kb
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +261,39 @@ def _accumulate_usage(acc: Dict[str, int], usage) -> None:
     acc["prompt_tokens"]     += getattr(usage, "prompt_tokens",     0) or 0
     acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
     acc["total_tokens"]      += getattr(usage, "total_tokens",      0) or 0
+
+
+def _extract_json(text: str) -> str:
+    """Find and return the first complete JSON object or array from raw LLM text.
+
+    Strips code fences first, then walks character-by-character to find the
+    matching closing bracket — handles preamble text before the JSON object.
+    """
+    text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
+    for opener, closer in [('{', '}'), ('[', ']')]:
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text[start:], start):
+            if esc:
+                esc = False
+                continue
+            if ch == '\\' and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+            if not in_str:
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+    return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,8 +356,7 @@ async def classify_intent(client, model: str, message: str, workflows: list) -> 
     )
     raw = extract_message_content(result.choices[0].message.content)
     try:
-        cleaned = re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-        return json.loads(cleaned), result.usage
+        return json.loads(_extract_json(raw)), result.usage
     except Exception:
         return {"workflow_id": None, "confidence": 0.0}, result.usage
 
@@ -524,8 +399,7 @@ async def extract_params(client, model: str, message: str, params: list) -> dict
     )
     raw = extract_message_content(result.choices[0].message.content)
     try:
-        cleaned = re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-        return json.loads(cleaned), result.usage
+        return json.loads(_extract_json(raw)), result.usage
     except Exception:
         return {p["key"]: None for p in params}, result.usage
 
@@ -797,9 +671,11 @@ async def _exec_llm_summarize(step: dict, confirmed_params: dict, prior_results:
             key = match.group(1).strip()
             if "." in key:
                 step_id, field = key.split(".", 1)
-                val = prior_results.get(step_id, {}).get("value", {})
+                step_entry = prior_results.get(step_id, {})
+                val = step_entry.get("value", {})
                 if isinstance(val, dict):
-                    resolved = val.get(field, "")
+                    # Fall back to the full dict JSON if the specific sub-key is absent
+                    resolved = val.get(field, json.dumps(val, default=str))
                 elif isinstance(val, list):
                     resolved = json.dumps(val[:15], default=str)
                 else:
@@ -813,14 +689,15 @@ async def _exec_llm_summarize(step: dict, confirmed_params: dict, prior_results:
 
         rendered = re.sub(r"\{\{([^}]+)\}\}", _resolve, prompt_template)
 
-        # Append full prior results for richer context
+        # Append full prior results (with statuses) so the LLM knows what actually ran
         extra_parts = []
         for sid, sdata in prior_results.items():
+            status = sdata.get("status", "unknown")
             v = sdata.get("value")
             if v is not None:
-                extra_parts.append(f"[{sid}]: {json.dumps(v, default=str)[:3000]}")
+                extra_parts.append(f"[{sid}] status={status}: {json.dumps(v, default=str)[:3000]}")
         if extra_parts:
-            rendered += "\n\nFull step data:\n" + "\n".join(extra_parts)
+            rendered += "\n\nFull step results:\n" + "\n".join(extra_parts)
 
         stream = await client.chat.completions.create(
             model=model,
@@ -847,11 +724,257 @@ async def _exec_llm_summarize(step: dict, confirmed_params: dict, prior_results:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Formula Builder executors
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FORMULA_SYSTEM_PROMPT = """You are a ControlDash transform formula expert. Generate a valid transform operation config as JSON.
+
+Available operation types and their parameters:
+- DateExtract   : Inputs=<date_col>, operation_params={"component": "year|month|day|hour|minute|second|weekday|quarter|dayofyear"}
+- Concatenate   : Inputs=<col1,col2,...>, operation_params={"separator": " "}
+- Formula       : Inputs=<col1,col2,...>, operation_params={"formulastring": "<pandas eval expr, e.g. col1 * 0.1>"}
+- Conditional   : Inputs=<col>, operation_params={"condition": "<expr>", "true_value": "<val>", "false_value": "<val>"}
+- MapValues     : Inputs=<col>, operation_params={"mapping": {"old": "new", ...}}
+- StringOperation: Inputs=<col>, operation_params={"operation": "upper|lower|strip|title|reverse"}
+- NumericOperation: Inputs=<col1,col2,...>, operation_params={"operation": "abs|round|ceil|floor|sqrt|log|sum|mean|max|min", "decimal_places": 2}
+- SetValue      : Inputs=<any_col>, operation_params={"value": "<fixed_value>"}
+- CopyField     : Inputs=<source_col>
+- Split         : Inputs=<col>, operation_params={"delimiter": "-", "index": 0}
+- Replace       : Inputs=<col>, operation_params={"pattern": "old", "replacement": "new", "use_regex": false}
+
+Respond with valid JSON only — no markdown, no text outside the JSON:
+{
+  "operation_type": "...",
+  "new_field_name": "snake_case_output_name",
+  "input_fields": "col1" or "col1,col2",
+  "operation_params": { ... },
+  "sample_data": [ { "col1": "val1" }, ... ],
+  "explanation": "one-line plain-English description of what this formula does"
+}
+
+Rules:
+- sample_data must have at least 3 rows containing ALL input field(s) with realistic values
+- new_field_name must be snake_case
+- operation_params must only include keys valid for the chosen operation_type
+- If user supplies sample_data, use those rows exactly; otherwise generate realistic test rows"""
+
+
+async def _exec_llm_build_formula(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict):
+    """LLM generates a full transform formula config + test data from a plain-English description."""
+    description = (confirmed_params.get("formula_description") or "").strip()
+    new_field_hint = (confirmed_params.get("new_field_name") or "").strip()
+    sample_data_raw = confirmed_params.get("sample_data", "")
+
+    sample_data = []
+    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
+        try:
+            sample_data = json.loads(sample_data_raw)
+        except Exception:
+            pass
+    elif isinstance(sample_data_raw, list):
+        sample_data = sample_data_raw
+
+    user_msg = f"Build a transform formula for: {description}"
+    if new_field_hint:
+        user_msg += f"\nDesired output field name: {new_field_hint}"
+    if sample_data:
+        user_msg += f"\nUse this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
+
+    # Retrieve relevant RAG context (operation schema + examples) for this description
+    system_prompt = _FORMULA_SYSTEM_PROMPT
+    try:
+        rag_kb = get_rag_kb()
+        chunks = await rag_kb.async_search(description, top_k=2)
+        rag_context = rag_kb.format_context(chunks)
+        if rag_context:
+            system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
+    except Exception as rag_exc:
+        logger.debug("RAG search skipped in build_formula: %s", rag_exc)
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        _accumulate_usage(usage_acc, result.usage)
+        raw = extract_message_content(result.choices[0].message.content)
+        formula_config = json.loads(_extract_json(raw))
+        return "success", formula_config
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for formula config: {exc}"
+    except Exception as exc:
+        logger.error("LLM build formula error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+async def _exec_llm_build_formula_from_row(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict):
+    """LLM reads an existing FieldOperations row and generates an improved formula config."""
+    source_step_id = step.get("source_step_id", "read_field_mapping")
+    prior = prior_results.get(source_step_id, {})
+
+    if prior.get("status") != "success":
+        return "error", f"Source step '{source_step_id}' did not succeed — cannot analyse formula"
+
+    row_data = prior.get("value", {})
+    sample_data_raw = confirmed_params.get("sample_data", "")
+    sample_data = []
+    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
+        try:
+            sample_data = json.loads(sample_data_raw)
+        except Exception:
+            pass
+    elif isinstance(sample_data_raw, list):
+        sample_data = sample_data_raw
+
+    user_msg = (
+        f"Analyse and improve this existing FieldOperations formula row:\n"
+        f"{json.dumps(row_data, default=str)[:2000]}\n\n"
+        "Map the columns to the transform format:\n"
+        "  - NewFieldName → new_field_name\n"
+        "  - Operation    → operation_type\n"
+        "  - Inputs       → input_fields\n"
+        "  - All remaining columns → operation_params\n\n"
+    )
+    if sample_data:
+        user_msg += f"Use this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
+    else:
+        user_msg += "Generate at least 3 realistic test rows that include all input field(s)."
+
+    # Build a focused RAG query from the row's Operation + Inputs columns
+    rows_list = row_data.get("rows", [row_data]) if isinstance(row_data, dict) and "rows" in row_data else [row_data]
+    first_row = rows_list[0] if rows_list else {}
+    op_type = str(first_row.get("Operation") or first_row.get("operation_type") or "transform")
+    rag_query = f"{op_type} transform operation"
+
+    system_prompt = _FORMULA_SYSTEM_PROMPT
+    try:
+        rag_kb = get_rag_kb()
+        chunks = await rag_kb.async_search(rag_query, top_k=2)
+        rag_context = rag_kb.format_context(chunks)
+        if rag_context:
+            system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
+    except Exception as rag_exc:
+        logger.debug("RAG search skipped in build_formula_from_row: %s", rag_exc)
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        _accumulate_usage(usage_acc, result.usage)
+        raw = extract_message_content(result.choices[0].message.content)
+        formula_config = json.loads(_extract_json(raw))
+        return "success", formula_config
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON when analysing formula: {exc}"
+    except Exception as exc:
+        logger.error("LLM analyse formula error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+async def _exec_transform_from_prior(step: dict, confirmed_params: dict, prior_results: dict):
+    """Run the transform engine using formula config stored by a prior llm_build_formula step."""
+    formula_step_id = step.get("formula_step_id", "build_formula")
+    prior = prior_results.get(formula_step_id, {})
+
+    if prior.get("status") != "success":
+        return "error", f"Formula step '{formula_step_id}' did not succeed — cannot run transform"
+
+    formula_config = prior.get("value", {})
+    if not isinstance(formula_config, dict):
+        return "error", f"Formula step result is not a dict: {type(formula_config)}"
+
+    merged = {**confirmed_params}
+    for key in ("operation_type", "new_field_name", "input_fields", "operation_params"):
+        if formula_config.get(key) is not None:
+            merged[key] = formula_config[key]
+
+    # Use sample_data from formula config if none was supplied by the user
+    if formula_config.get("sample_data") and not merged.get("sample_data"):
+        merged["sample_data"] = formula_config["sample_data"]
+
+    return await _exec_transform(merged, prior_results)
+
+
+async def _exec_read_config_row(step: dict, confirmed_params: dict, prior_results: dict):
+    """Read a specific row from a config parquet sheet by row number or NewFieldName."""
+    _ensure_api_root_on_path()
+    try:
+        import pandas as pd
+        from routers.config_search import get_available_types, get_file_path
+
+        lookup_type = (confirmed_params.get("lookup_type") or "new_field_name").strip()
+        lookup_value = (confirmed_params.get("lookup_value") or "").strip()
+        type_filter = (confirmed_params.get("control_type") or "").strip()
+        sheet_name = step.get("sheet", "FieldOperations")
+
+        if not lookup_value:
+            return "error", "lookup_value is required"
+
+        types_to_search = [type_filter] if type_filter else get_available_types()
+        found_rows = []
+
+        for type_name in types_to_search:
+            file_path = get_file_path(type_name, sheet_name)
+            if not file_path.exists():
+                continue
+            try:
+                df = pd.read_parquet(file_path)
+                if lookup_type == "row_number":
+                    try:
+                        row_idx = int(lookup_value) - 1  # convert 1-based to 0-based
+                        if 0 <= row_idx < len(df):
+                            row = df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict()
+                            row["_type"] = type_name
+                            row["_sheet"] = sheet_name
+                            row["_row_number"] = int(lookup_value)
+                            found_rows.append(row)
+                    except (ValueError, IndexError):
+                        pass
+                else:
+                    # Match by NewFieldName (try common column name variants)
+                    field_col = next(
+                        (c for c in df.columns if c.lower() in ("newfieldname", "new_field_name", "fieldname", "field_name", "outputfield", "output_field")),
+                        None,
+                    )
+                    if field_col:
+                        mask = df[field_col].astype(str).str.lower() == lookup_value.lower()
+                        for idx, row_data in df[mask].iterrows():
+                            row = row_data.where(row_data.notna(), other=None).to_dict()
+                            row["_type"] = type_name
+                            row["_sheet"] = sheet_name
+                            row["_row_number"] = idx + 1
+                            found_rows.append(row)
+            except Exception as inner_exc:
+                logger.warning("Could not read %s/%s: %s", type_name, sheet_name, inner_exc)
+                continue
+
+        if not found_rows:
+            return "error", f"No rows found matching {lookup_type}='{lookup_value}' in sheet '{sheet_name}'"
+
+        return "success", {"rows": found_rows, "total": len(found_rows), "sheet": sheet_name, "lookup": {lookup_type: lookup_value}}
+    except Exception as exc:
+        logger.error("Read config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def execute_step(step: dict, confirmed_params: dict, prior_results: dict, client, model: str):
+async def execute_step(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict = None):
     ft = step.get("function_type", "")
+    ua = usage_acc if usage_acc is not None else {}
     if ft == "file_read":
         return await _exec_read_file(confirmed_params, prior_results)
     elif ft == "file_write":
@@ -860,12 +983,20 @@ async def execute_step(step: dict, confirmed_params: dict, prior_results: dict, 
         return await _exec_write_summary(confirmed_params, prior_results)
     elif ft == "transform_execute":
         return await _exec_transform(confirmed_params, prior_results)
+    elif ft == "transform_execute_from_prior":
+        return await _exec_transform_from_prior(step, confirmed_params, prior_results)
     elif ft == "config_validate_start":
         return await _exec_config_validate_start(confirmed_params, prior_results)
     elif ft == "poll_until":
         return await _exec_poll_until(confirmed_params, prior_results, step.get("poll_config", {}))
     elif ft == "config_search":
         return await _exec_config_search(confirmed_params, prior_results)
+    elif ft == "read_config_row":
+        return await _exec_read_config_row(step, confirmed_params, prior_results)
+    elif ft == "llm_build_formula":
+        return await _exec_llm_build_formula(step, confirmed_params, prior_results, client, model, ua)
+    elif ft == "llm_build_formula_from_row":
+        return await _exec_llm_build_formula_from_row(step, confirmed_params, prior_results, client, model, ua)
     elif ft == "llm_summarize":
         return "llm_stream", _exec_llm_summarize(step, confirmed_params, prior_results, client, model)
     else:
@@ -893,7 +1024,7 @@ async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client,
             "total_steps": len(steps),
         })
 
-        status, result = await execute_step(step, confirmed_params, prior_results, client, model)
+        status, result = await execute_step(step, confirmed_params, prior_results, client, model, usage_acc)
 
         if status == "llm_stream":
             gen = result
@@ -988,11 +1119,25 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
         confidence = float(classification.get("confidence") or 0.0)
 
         if not workflow_id or workflow_id not in workflows_by_id or confidence < 0.3:
-            # No match — fallback plain LLM response
+            # No match — fallback plain LLM response enriched with RAG context
+            fallback_system = (
+                "You are a helpful assistant for ControlDash, a data orchestration and ETL "
+                "control platform. Help the user with questions about controls, transforms, "
+                "validations, and configurations."
+            )
+            try:
+                rag_kb = get_rag_kb()
+                chunks = await rag_kb.async_search(request.message, top_k=3)
+                rag_context = rag_kb.format_context(chunks)
+                if rag_context:
+                    fallback_system = rag_context + "\n\n" + fallback_system
+            except Exception as rag_exc:
+                logger.debug("RAG search skipped in fallback: %s", rag_exc)
+
             result = await client.chat.completions.create(
                 model=request.model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant for ControlDash, a data orchestration and ETL control platform. Help the user with questions about controls, transforms, validations, and configurations."},
+                    {"role": "system", "content": fallback_system},
                     {"role": "user", "content": request.message},
                 ],
                 temperature=0.7,
@@ -1097,2240 +1242,9 @@ async def health():
         data = load_workflows()
         count = len(data.get("workflows", []))
         return {"status": "ok", "workflow_count": count, "yaml_loaded": True}
+
+?????????????????????????????????????????????????????????????????????
+    { Icon: Zap, text: 'Build a formula to extract the year from transaction_date' },
+    { Icon: Settings, text: 'Analyse the FieldOperations formula for extracted_year' },
     except Exception as exc:
         return {"status": "error", "yaml_loaded": False, "error": str(exc)}
-
-___________________________________________________________________
-___________________________________________________________________
-
-page.js
-
-import { useEffect, useState } from 'react';
-import { WorkflowChatProvider } from './lib/workflowChatContext';
-import WorkflowChatHeader from './components/WorkflowChatHeader';
-import WorkflowChatSidebar from './components/WorkflowChatSidebar';
-import WorkflowChatArea from './components/WorkflowChatArea';
-
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
-
-export default function WorkflowAssistantPage() {
-    const [backendOnline, setBackendOnline] = useState(null);
-    const [availableWorkflows, setAvailableWorkflows] = useState([]);
-
-    useEffect(() => {
-        const init = async () => {
-            try {
-                const res = await fetch(`${API_BASE_URL}/api/workflow-ai/health`);
-                if (res.ok) {
-                    setBackendOnline(true);
-                    const wRes = await fetch(`${API_BASE_URL}/api/workflow-ai/workflows`);
-                    if (wRes.ok) {
-                        const wData = await wRes.json();
-                        setAvailableWorkflows(wData.workflows || []);
-                    }
-                } else {
-                    setBackendOnline(false);
-                }
-            } catch {
-                setBackendOnline(false);
-            }
-        };
-        init();
-    }, []);
-
-    return (
-        <WorkflowChatProvider>
-            <div style={{
-                minHeight: '100vh',
-                height: '100vh',
-                backgroundColor: '#f8fafc',
-                color: '#0f172a',
-                display: 'flex',
-                flexDirection: 'column',
-                overflow: 'hidden',
-                fontFamily: '"Aptos", "Segoe UI Variable Text", "Segoe UI", Arial, sans-serif'
-            }}>
-                <WorkflowChatHeader backendOnline={backendOnline} availableWorkflows={availableWorkflows} />
-                <div style={{
-                    flex: 1,
-                    minHeight: 0,
-                    display: 'flex',
-                    overflow: 'hidden',
-                    borderTop: '1px solid #e2e8f0'
-                }}>
-                    <WorkflowChatSidebar />
-                    <WorkflowChatArea />
-                </div>
-            </div>
-        </WorkflowChatProvider>
-    );
-}
-++++++++++++++++++++++++++++++++++++++++++++++++++++++
-_______________________________________________________
-import { useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, Play, X } from 'lucide-react';
-
-export default function ParamVerificationCard({ workflowId, workflowName, missingParams, extractedParams, onSubmit, onCancel }) {
-    const [formValues, setFormValues] = useState(() => {
-        const init = {};
-        missingParams.forEach(p => { init[p.key] = extractedParams?.[p.key] || ''; });
-        return init;
-    });
-    const [errors, setErrors] = useState({});
-    const [showPrefilled, setShowPrefilled] = useState(false);
-
-    const prefilledEntries = Object.entries(extractedParams || {}).filter(([k, v]) => {
-        const isMissing = missingParams.some(p => p.key === k);
-        return !isMissing && v !== null && v !== '' && v !== undefined;
-    });
-
-    const handleChange = (key, value) => {
-        setFormValues(prev => ({ ...prev, [key]: value }));
-        if (errors[key]) setErrors(prev => ({ ...prev, [key]: null }));
-    };
-
-    const handleSubmit = () => {
-        const newErrors = {};
-        missingParams.forEach(p => {
-            if (p.required && (!formValues[p.key] || !String(formValues[p.key]).trim())) {
-                newErrors[p.key] = `${p.label} is required`;
-            }
-        });
-        if (Object.keys(newErrors).length > 0) {
-            setErrors(newErrors);
-            return;
-        }
-        const allParams = { ...(extractedParams || {}), ...formValues };
-        onSubmit(workflowId, allParams);
-    };
-
-    return (
-        <div style={{
-            marginBottom: '12px',
-            border: '1px solid #fcd34d',
-            borderLeft: '4px solid #f59e0b',
-            borderRadius: '10px',
-            backgroundColor: 'white',
-            boxShadow: '0 1px 4px rgba(15,23,42,0.06)',
-            overflow: 'hidden'
-        }}>
-            {/* Header */}
-            <div style={{
-                display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '14px 16px',
-                backgroundColor: '#fffbeb',
-                borderBottom: '1px solid #fef3c7'
-            }}>
-                <AlertTriangle size={18} color="#d97706" style={{ flexShrink: 0 }} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: '700', fontSize: '13px', color: '#92400e' }}>
-                        Parameters Required
-                    </div>
-                    <div style={{ fontSize: '11.5px', color: '#b45309', marginTop: '1px' }}>
-                        Fill in the missing details to run this workflow
-                    </div>
-                </div>
-                <span style={{
-                    padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: '700',
-                    backgroundColor: '#fff1f2', color: '#9b0015', border: '1px solid #fecdd3', flexShrink: 0
-                }}>
-                    {workflowName}
-                </span>
-            </div>
-
-            <div style={{ padding: '16px' }}>
-                {/* Pre-filled params (collapsible) */}
-                {prefilledEntries.length > 0 && (
-                    <div style={{ marginBottom: '16px' }}>
-                        <button
-                            onClick={() => setShowPrefilled(v => !v)}
-                            style={{
-                                display: 'flex', alignItems: 'center', gap: '6px',
-                                background: 'none', border: 'none', cursor: 'pointer',
-                                color: '#64748b', fontSize: '12px', fontWeight: '600', padding: 0
-                            }}
-                        >
-                            {showPrefilled ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                            {prefilledEntries.length} param{prefilledEntries.length !== 1 ? 's' : ''} already extracted
-                        </button>
-                        {showPrefilled && (
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
-                                {prefilledEntries.map(([key, val]) => (
-                                    <span key={key} style={{
-                                        padding: '3px 10px', borderRadius: '12px', fontSize: '11.5px',
-                                        backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0',
-                                        color: '#166534', maxWidth: '240px',
-                                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
-                                    }}>
-                                        <span style={{ fontWeight: '700' }}>{key}:</span>{' '}
-                                        {String(val).slice(0, 60)}{String(val).length > 60 ? '…' : ''}
-                                    </span>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )}
-
-                {/* Form for missing params */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                    {missingParams.map(param => (
-                        <div key={param.key}>
-                            <label style={{
-                                display: 'block', fontSize: '12px', fontWeight: '700',
-                                color: '#334155', marginBottom: '4px'
-                            }}>
-                                {param.label}
-                                {param.required && (
-                                    <span style={{ color: '#dc2626', marginLeft: '3px' }}>*</span>
-                                )}
-                            </label>
-                            {param.description && (
-                                <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '6px' }}>
-                                    {param.description}
-                                </div>
-                            )}
-
-                            {param.type === 'select' ? (
-                                <select
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', cursor: 'pointer'
-                                    }}
-                                >
-                                    <option value="">— Select —</option>
-                                    {(param.options || []).map(opt => (
-                                        <option key={opt} value={opt}>{opt}</option>
-                                    ))}
-                                </select>
-                            ) : param.type === 'textarea' ? (
-                                <textarea
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    placeholder={param.example || ''}
-                                    rows={3}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', resize: 'vertical',
-                                        fontFamily: 'inherit', lineHeight: '1.5',
-                                        boxSizing: 'border-box'
-                                    }}
-                                />
-                            ) : (
-                                <input
-                                    type="text"
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    placeholder={param.example || ''}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', boxSizing: 'border-box'
-                                    }}
-                                />
-                            )}
-
-                            {errors[param.key] && (
-                                <div style={{ fontSize: '11px', color: '#dc2626', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                    <AlertTriangle size={11} /> {errors[param.key]}
-                                </div>
-                            )}
-                        </div>
-                    ))}
-                </div>
-
-                {/* Actions */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '20px' }}>
-                    <button
-                        onClick={handleSubmit}
-                        style={{
-                            display: 'flex', alignItems: 'center', gap: '8px',
-                            padding: '10px 20px',
-                            background: 'linear-gradient(135deg, #7b0012, #db0011)',
-                            color: 'white', border: 'none', borderRadius: '8px',
-                            cursor: 'pointer', fontSize: '13px', fontWeight: '700',
-                            boxShadow: '0 2px 8px rgba(123,0,18,0.25)',
-                            transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(123,0,18,0.35)'; }}
-                        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(123,0,18,0.25)'; }}
-                    >
-                        <Play size={13} fill="white" /> Run Workflow
-                    </button>
-                    {onCancel && (
-                        <button
-                            onClick={onCancel}
-                            style={{
-                                display: 'flex', alignItems: 'center', gap: '6px',
-                                padding: '10px 16px',
-                                backgroundColor: 'white', color: '#64748b',
-                                border: '1px solid #dbe1ea', borderRadius: '8px',
-                                cursor: 'pointer', fontSize: '13px', fontWeight: '600',
-                                transition: 'all 0.15s'
-                            }}
-                            onMouseEnter={e => { e.currentTarget.style.borderColor = '#94a3b8'; e.currentTarget.style.color = '#374151'; }}
-                            onMouseLeave={e => { e.currentTarget.style.borderColor = '#dbe1ea'; e.currentTarget.style.color = '#64748b'; }}
-                        >
-                            <X size={13} /> Cancel
-                        </button>
-                    )}
-                </div>
-            </div>
-        </div>
-    );
-}
-__________________________________________________________
-_+_+_+++P+_+P+_+))+)+_____________________________________
-
-ParamVerificationCard
-import { useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, Play, X } from 'lucide-react';
-
-export default function ParamVerificationCard({ workflowId, workflowName, missingParams, extractedParams, onSubmit, onCancel }) {
-    const [formValues, setFormValues] = useState(() => {
-        const init = {};
-        missingParams.forEach(p => { init[p.key] = extractedParams?.[p.key] || ''; });
-        return init;
-    });
-    const [errors, setErrors] = useState({});
-    const [showPrefilled, setShowPrefilled] = useState(false);
-
-    const prefilledEntries = Object.entries(extractedParams || {}).filter(([k, v]) => {
-        const isMissing = missingParams.some(p => p.key === k);
-        return !isMissing && v !== null && v !== '' && v !== undefined;
-    });
-
-    const handleChange = (key, value) => {
-        setFormValues(prev => ({ ...prev, [key]: value }));
-        if (errors[key]) setErrors(prev => ({ ...prev, [key]: null }));
-    };
-
-    const handleSubmit = () => {
-        const newErrors = {};
-        missingParams.forEach(p => {
-            if (p.required && (!formValues[p.key] || !String(formValues[p.key]).trim())) {
-                newErrors[p.key] = `${p.label} is required`;
-            }
-        });
-        if (Object.keys(newErrors).length > 0) {
-            setErrors(newErrors);
-            return;
-        }
-        const allParams = { ...(extractedParams || {}), ...formValues };
-        onSubmit(workflowId, allParams);
-    };
-
-    return (
-        <div style={{
-            marginBottom: '12px',
-            border: '1px solid #fcd34d',
-            borderLeft: '4px solid #f59e0b',
-            borderRadius: '10px',
-            backgroundColor: 'white',
-            boxShadow: '0 1px 4px rgba(15,23,42,0.06)',
-            overflow: 'hidden'
-        }}>
-            {/* Header */}
-            <div style={{
-                display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '14px 16px',
-                backgroundColor: '#fffbeb',
-                borderBottom: '1px solid #fef3c7'
-            }}>
-                <AlertTriangle size={18} color="#d97706" style={{ flexShrink: 0 }} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: '700', fontSize: '13px', color: '#92400e' }}>
-                        Parameters Required
-                    </div>
-                    <div style={{ fontSize: '11.5px', color: '#b45309', marginTop: '1px' }}>
-                        Fill in the missing details to run this workflow
-                    </div>
-                </div>
-                <span style={{
-                    padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: '700',
-                    backgroundColor: '#fff1f2', color: '#9b0015', border: '1px solid #fecdd3', flexShrink: 0
-                }}>
-                    {workflowName}
-                </span>
-            </div>
-
-            <div style={{ padding: '16px' }}>
-                {/* Pre-filled params (collapsible) */}
-                {prefilledEntries.length > 0 && (
-                    <div style={{ marginBottom: '16px' }}>
-                        <button
-                            onClick={() => setShowPrefilled(v => !v)}
-                            style={{
-                                display: 'flex', alignItems: 'center', gap: '6px',
-                                background: 'none', border: 'none', cursor: 'pointer',
-                                color: '#64748b', fontSize: '12px', fontWeight: '600', padding: 0
-                            }}
-                        >
-                            {showPrefilled ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                            {prefilledEntries.length} param{prefilledEntries.length !== 1 ? 's' : ''} already extracted
-                        </button>
-                        {showPrefilled && (
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
-                                {prefilledEntries.map(([key, val]) => (
-                                    <span key={key} style={{
-                                        padding: '3px 10px', borderRadius: '12px', fontSize: '11.5px',
-                                        backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0',
-                                        color: '#166534', maxWidth: '240px',
-                                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
-                                    }}>
-                                        <span style={{ fontWeight: '700' }}>{key}:</span>{' '}
-                                        {String(val).slice(0, 60)}{String(val).length > 60 ? '…' : ''}
-                                    </span>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )}
-
-                {/* Form for missing params */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                    {missingParams.map(param => (
-                        <div key={param.key}>
-                            <label style={{
-                                display: 'block', fontSize: '12px', fontWeight: '700',
-                                color: '#334155', marginBottom: '4px'
-                            }}>
-                                {param.label}
-                                {param.required && (
-                                    <span style={{ color: '#dc2626', marginLeft: '3px' }}>*</span>
-                                )}
-                            </label>
-                            {param.description && (
-                                <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '6px' }}>
-                                    {param.description}
-                                </div>
-                            )}
-
-                            {param.type === 'select' ? (
-                                <select
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', cursor: 'pointer'
-                                    }}
-                                >
-                                    <option value="">— Select —</option>
-                                    {(param.options || []).map(opt => (
-                                        <option key={opt} value={opt}>{opt}</option>
-                                    ))}
-                                </select>
-                            ) : param.type === 'textarea' ? (
-                                <textarea
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    placeholder={param.example || ''}
-                                    rows={3}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', resize: 'vertical',
-                                        fontFamily: 'inherit', lineHeight: '1.5',
-                                        boxSizing: 'border-box'
-                                    }}
-                                />
-                            ) : (
-                                <input
-                                    type="text"
-                                    value={formValues[param.key] || ''}
-                                    onChange={e => handleChange(param.key, e.target.value)}
-                                    placeholder={param.example || ''}
-                                    style={{
-                                        width: '100%', padding: '8px 10px',
-                                        border: `1px solid ${errors[param.key] ? '#ef4444' : '#dbe1ea'}`,
-                                        borderRadius: '6px', fontSize: '13px',
-                                        color: '#1f2937', backgroundColor: 'white',
-                                        outline: 'none', boxSizing: 'border-box'
-                                    }}
-                                />
-                            )}
-
-                            {errors[param.key] && (
-                                <div style={{ fontSize: '11px', color: '#dc2626', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                    <AlertTriangle size={11} /> {errors[param.key]}
-                                </div>
-                            )}
-                        </div>
-                    ))}
-                </div>
-
-                {/* Actions */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '20px' }}>
-                    <button
-                        onClick={handleSubmit}
-                        style={{
-                            display: 'flex', alignItems: 'center', gap: '8px',
-                            padding: '10px 20px',
-                            background: 'linear-gradient(135deg, #7b0012, #db0011)',
-                            color: 'white', border: 'none', borderRadius: '8px',
-                            cursor: 'pointer', fontSize: '13px', fontWeight: '700',
-                            boxShadow: '0 2px 8px rgba(123,0,18,0.25)',
-                            transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(123,0,18,0.35)'; }}
-                        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(123,0,18,0.25)'; }}
-                    >
-                        <Play size={13} fill="white" /> Run Workflow
-                    </button>
-                    {onCancel && (
-                        <button
-                            onClick={onCancel}
-                            style={{
-                                display: 'flex', alignItems: 'center', gap: '6px',
-                                padding: '10px 16px',
-                                backgroundColor: 'white', color: '#64748b',
-                                border: '1px solid #dbe1ea', borderRadius: '8px',
-                                cursor: 'pointer', fontSize: '13px', fontWeight: '600',
-                                transition: 'all 0.15s'
-                            }}
-                            onMouseEnter={e => { e.currentTarget.style.borderColor = '#94a3b8'; e.currentTarget.style.color = '#374151'; }}
-                            onMouseLeave={e => { e.currentTarget.style.borderColor = '#dbe1ea'; e.currentTarget.style.color = '#64748b'; }}
-                        >
-                            <X size={13} /> Cancel
-                        </button>
-                    )}
-                </div>
-            </div>
-        </div>
-    );
-}
------------------------------------------------------------
-___________________________________________________________
-WorkflowCard.js
-import { useState } from 'react';
-import { CheckCircle, XCircle, Loader, Circle, ChevronDown, ChevronUp, Play, Minus } from 'lucide-react';
-
-function StepIcon({ status }) {
-    if (status === 'success') return <CheckCircle size={16} color="#16a34a" />;
-    if (status === 'error') return <XCircle size={16} color="#dc2626" />;
-    if (status === 'skipped') return <Minus size={16} color="#94a3b8" />;
-    if (status === 'running') return (
-        <Loader size={16} color="#d97706" style={{ animation: 'spin 1.2s linear infinite' }} />
-    );
-    return <Circle size={16} color="#cbd5e1" />;
-}
-
-function overallStatus(stepStatuses, steps) {
-    if (!steps || steps.length === 0) return 'pending';
-    const statuses = steps.map(s => stepStatuses[s.id] || 'pending');
-    if (statuses.some(s => s === 'running')) return 'running';
-    if (statuses.some(s => s === 'error')) return 'error';
-    const activeStatuses = statuses.filter(s => s !== 'skipped');
-    if (activeStatuses.length > 0 && activeStatuses.every(s => s === 'success')) return 'success';
-    return 'pending';
-}
-
-const STATUS_CHIP = {
-    pending: { bg: '#f1f5f9', color: '#64748b', label: 'Ready to run' },
-    running: { bg: '#fffbeb', color: '#b45309', label: 'Running…' },
-    success: { bg: '#f0fdf4', color: '#16a34a', label: 'Completed' },
-    error:   { bg: '#fef2f2', color: '#dc2626', label: 'Error' },
-};
-
-const BORDER_COLOR = {
-    pending: '#e2e8f0',
-    running: '#fcd34d',
-    success: '#86efac',
-    error:   '#fca5a5',
-};
-
-export default function WorkflowCard({ workflow, stepStatuses, extractedParams, onConfirm, isConfirmed }) {
-    const [collapsed, setCollapsed] = useState(false);
-
-    if (!workflow) return null;
-
-    const status = overallStatus(stepStatuses, workflow.steps);
-    const chip = STATUS_CHIP[status];
-    const borderColor = BORDER_COLOR[status];
-
-    const paramEntries = Object.entries(extractedParams || {}).filter(([, v]) => v !== null && v !== '' && v !== undefined);
-    const allPending = workflow.steps && workflow.steps.every(s => (stepStatuses[s.id] || 'pending') === 'pending');
-    const showRunButton = onConfirm && allPending && !isConfirmed;
-
-    return (
-        <div style={{
-            marginBottom: '12px',
-            border: `1px solid ${borderColor}`,
-            borderLeft: `4px solid ${borderColor}`,
-            borderRadius: '10px',
-            backgroundColor: 'white',
-            boxShadow: '0 1px 4px rgba(15,23,42,0.06)',
-            overflow: 'hidden',
-            transition: 'border-color 0.3s'
-        }}>
-            {/* Header */}
-            <div style={{
-                display: 'flex', alignItems: 'center', gap: '10px',
-                padding: '14px 16px', cursor: 'pointer'
-            }} onClick={() => setCollapsed(c => !c)}>
-                <span style={{ fontSize: '20px', flexShrink: 0 }}>{workflow.icon}</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: '700', fontSize: '14px', color: '#111827' }}>{workflow.name}</div>
-                    <div style={{ fontSize: '12px', color: '#64748b', marginTop: '1px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {workflow.description}
-                    </div>
-                </div>
-                <span style={{
-                    padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: '700',
-                    backgroundColor: chip.bg, color: chip.color, flexShrink: 0
-                }}>
-                    {chip.label}
-                </span>
-                {collapsed ? <ChevronDown size={16} color="#94a3b8" /> : <ChevronUp size={16} color="#94a3b8" />}
-            </div>
-
-            {!collapsed && (
-                <div style={{ padding: '0 16px 14px' }}>
-                    {/* Extracted params preview */}
-                    {paramEntries.length > 0 && (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '12px' }}>
-                            {paramEntries.map(([key, val]) => (
-                                <span key={key} style={{
-                                    padding: '3px 10px', borderRadius: '12px', fontSize: '11.5px',
-                                    backgroundColor: '#f1f5f9', border: '1px solid #e2e8f0',
-                                    color: '#475569', maxWidth: '240px',
-                                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
-                                }}>
-                                    <span style={{ fontWeight: '700', color: '#334155' }}>{key}:</span>{' '}
-                                    {String(val).slice(0, 60)}{String(val).length > 60 ? '…' : ''}
-                                </span>
-                            ))}
-                        </div>
-                    )}
-
-                    {/* Steps list */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        {workflow.steps.map((step, idx) => {
-                            const s = stepStatuses[step.id] || 'pending';
-                            return (
-                                <div key={step.id} style={{
-                                    display: 'flex', alignItems: 'center', gap: '10px',
-                                    padding: '8px 10px', borderRadius: '7px',
-                                    backgroundColor: s === 'running' ? '#fffbeb' : s === 'success' ? '#f0fdf4' : s === 'error' ? '#fef2f2' : s === 'skipped' ? '#f8fafc' : '#f8fafc',
-                                    transition: 'background-color 0.3s'
-                                }}>
-                                    <span style={{
-                                        width: '22px', height: '22px', borderRadius: '50%',
-                                        backgroundColor: '#e2e8f0', color: '#64748b',
-                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                        fontSize: '11px', fontWeight: '700', flexShrink: 0
-                                    }}>
-                                        {idx + 1}
-                                    </span>
-                                    <span style={{
-                                        flex: 1, fontSize: '13px', fontWeight: '500',
-                                        color: s === 'pending' || s === 'skipped' ? '#94a3b8' : '#111827'
-                                    }}>
-                                        {step.name}
-                                    </span>
-                                    <StepIcon status={s} />
-                                </div>
-                            );
-                        })}
-                    </div>
-
-                    {/* Run button */}
-                    {showRunButton && (
-                        <div style={{ marginTop: '14px' }}>
-                            <button
-                                onClick={onConfirm}
-                                style={{
-                                    display: 'flex', alignItems: 'center', gap: '8px',
-                                    padding: '10px 20px',
-                                    background: 'linear-gradient(135deg, #7b0012, #db0011)',
-                                    color: 'white', border: 'none', borderRadius: '8px',
-                                    cursor: 'pointer', fontSize: '13px', fontWeight: '700',
-                                    boxShadow: '0 2px 8px rgba(123,0,18,0.25)',
-                                    transition: 'all 0.15s'
-                                }}
-                                onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(123,0,18,0.35)'; }}
-                                onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(123,0,18,0.25)'; }}
-                            >
-                                <Play size={14} fill="white" /> Run Workflow
-                            </button>
-                        </div>
-                    )}
-                </div>
-            )}
-
-            <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
-        </div>
-    );
-}
---------------------------------------------------
-____________________________________________________
-workflowChatArea.jsimport { useRef, useEffect, useCallback, useState } from 'react';
-import { Bot, ChevronDown, Zap, Search, Settings, CheckSquare } from 'lucide-react';
-import MessageBubble from '../../config-assistant/components/MessageBubble';
-import WorkflowMessageInput from './WorkflowMessageInput';
-import WorkflowCard from './WorkflowCard';
-import ParamVerificationCard from './ParamVerificationCard';
-import { useWorkflowChat } from '../lib/workflowChatContext';
-
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
-
-const PROMPT_SUGGESTIONS = [
-    { Icon: Settings, text: 'Run a DateExtract transform on my sample data' },
-    { Icon: CheckSquare, text: 'Validate my QA config file at /opt/configs/qa.xlsx' },
-    { Icon: Search, text: 'Search configs for field account_id' },
-    { Icon: Zap, text: 'Test a Concatenate formula on first_name and last_name' },
-];
-
-const assistantAvatarStyle = {
-    width: '38px', height: '38px', borderRadius: '10px', flexShrink: 0,
-    background: 'linear-gradient(135deg, #7b0012, #db0011)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    boxShadow: '0 2px 6px rgba(123,0,18,0.25)'
-};
-
-const assistantCardStyle = {
-    display: 'flex', gap: '14px', padding: '18px 20px', marginBottom: '10px',
-    backgroundColor: 'white', borderRadius: '10px',
-    border: '1px solid #dbe1ea', borderLeft: '3px solid #db0011',
-    boxShadow: '0 1px 2px rgba(15,23,42,0.06), 0 8px 24px rgba(15,23,42,0.05)'
-};
-
-export default function WorkflowChatArea() {
-    const {
-        currentMessages,
-        currentChatId,
-        isLoading,
-        setIsLoading,
-        streamingLlmContent,
-        setStreamingLlmContent,
-        appendStreamingLlm,
-        model,
-        updateCurrentMessages,
-        createNewChat,
-        activeWorkflow,
-        setActiveWorkflow,
-        extractedParams,
-        setExtractedParams,
-        pendingConfirmation,
-        setPendingConfirmation,
-        stepStatuses,
-        updateStepStatus,
-        initStepStatuses,
-        resetWorkflowState,
-    } = useWorkflowChat();
-
-    const messagesEndRef = useRef(null);
-    const scrollContainerRef = useRef(null);
-    const abortControllerRef = useRef(null);
-
-    const [showScrollBtn, setShowScrollBtn] = useState(false);
-    const [isConfirmed, setIsConfirmed] = useState(false);
-    const [lastUsage, setLastUsage] = useState(null);
-
-    useEffect(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [currentMessages, streamingLlmContent, pendingConfirmation, activeWorkflow]);
-
-    useEffect(() => {
-        setIsConfirmed(false);
-    }, [activeWorkflow]);
-
-    const handleScroll = useCallback(() => {
-        const el = scrollContainerRef.current;
-        if (!el) return;
-        setShowScrollBtn(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
-    }, []);
-
-    const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-
-    const streamRequest = useCallback(async (requestBody) => {
-        abortControllerRef.current = new AbortController();
-        setStreamingLlmContent('');
-
-        // Track accumulated LLM content outside the event loop so it's never
-        // affected by React state batching or stale closures.
-        let accumulatedContent = '';
-        let needsConfirmData = null;
-
-        try {
-            const response = await fetch(`${API_BASE_URL}/api/workflow-ai/chat`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody),
-                signal: abortControllerRef.current.signal,
-            });
-
-            if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
-
-                for (const line of lines) {
-                    if (!line.startsWith('data: ')) continue;
-                    let data;
-                    try { data = JSON.parse(line.slice(6)); } catch { continue; }
-
-                    const evt = data.event;
-
-                    if (evt === 'workflow_classified') {
-                        setActiveWorkflow({
-                            id: data.workflow_id,
-                            name: data.workflow_name,
-                            description: data.description,
-                            icon: data.icon,
-                            steps: data.steps || [],
-                        });
-                        initStepStatuses(data.steps || []);
-                    } else if (evt === 'params_extracted') {
-                        setExtractedParams(data.extracted_params || {});
-                    } else if (evt === 'params_required') {
-                        setExtractedParams(data.extracted_params || {});
-                        setPendingConfirmation({
-                            workflow_id: data.workflow_id,
-                            missing_params: data.missing_params || [],
-                            extracted_params: data.extracted_params || {},
-                            all_params: data.all_params || {},
-                        });
-                        setIsLoading(false);
-                        return;
-                    } else if (evt === 'step_start') {
-                        updateStepStatus(data.step_id, 'running');
-                    } else if (evt === 'step_result') {
-                        const s = data.status;
-                        updateStepStatus(data.step_id, s === 'success' ? 'success' : s === 'skipped' ? 'skipped' : 'error');
-                    } else if (evt === 'llm_chunk') {
-                        // Accumulate locally — keep streaming display alive until fully done
-                        accumulatedContent += data.content || '';
-                        appendStreamingLlm(data.content || '');
-                    } else if (evt === 'final') {
-                        // Backend sends the full text here; prefer it over chunk-accumulated version
-                        if (data.content) accumulatedContent = data.content;
-                        // Do NOT clear streamingLlmContent yet — wait until message is persisted below
-                    } else if (evt === 'content') {
-                        // Plain LLM fallback (unclassified intent)
-                        accumulatedContent += data.content || '';
-                        appendStreamingLlm(data.content || '');
-                    } else if (evt === 'done') {
-                        if (data.usage) setLastUsage(data.usage);
-                        if (data.needs_confirm) {
-                            needsConfirmData = data;
-                        }
-                    } else if (evt === 'error') {
-                        throw new Error(data.error);
-                    }
-                }
-            }
-
-            // Persist the message AFTER the stream is fully read, then clear the
-            // streaming display in the same synchronous block so React batches them
-            // into one render — no flicker, no disappearing content.
-            if (accumulatedContent) {
-                updateCurrentMessages(prev => [...prev, {
-                    id: `msg-${Date.now()}-ai`,
-                    role: 'assistant',
-                    content: accumulatedContent,
-                    timestamp: new Date().toISOString(),
-                }]);
-            }
-            setStreamingLlmContent('');
-
-            // Handle needs_confirm after message is persisted
-            if (needsConfirmData && needsConfirmData.all_params_present) {
-                const params = needsConfirmData.extracted_params || {};
-                setPendingConfirmation({
-                    workflow_id: needsConfirmData.workflow_id,
-                    missing_params: [],
-                    extracted_params: params,
-                    all_params: params,
-                });
-            }
-
-        } catch (error) {
-            if (error.name !== 'AbortError') {
-                updateCurrentMessages(prev => [...prev, {
-                    id: `msg-${Date.now()}-error`,
-                    role: 'assistant',
-                    content: `Error: ${error.message}. Please check that the backend is running.`,
-                    timestamp: new Date().toISOString(),
-                }]);
-            }
-        } finally {
-            setIsLoading(false);
-            setStreamingLlmContent('');
-            abortControllerRef.current = null;
-        }
-    }, [
-        updateCurrentMessages, setIsLoading, setStreamingLlmContent, appendStreamingLlm,
-        setActiveWorkflow, setExtractedParams, setPendingConfirmation,
-        initStepStatuses, updateStepStatus,
-    ]);
-
-    const handleSendMessage = useCallback(async (content) => {
-        if (!content.trim() || isLoading) return;
-
-        let chatId = currentChatId;
-        if (!chatId) chatId = createNewChat();
-
-        resetWorkflowState();
-        setIsConfirmed(false);
-        setLastUsage(null);
-
-        const userMessage = {
-            id: `msg-${Date.now()}-user`,
-            role: 'user',
-            content: content.trim(),
-            timestamp: new Date().toISOString(),
-        };
-        updateCurrentMessages(prev => [...prev, userMessage]);
-        setIsLoading(true);
-
-        const allMessages = [...currentMessages, userMessage];
-
-        await streamRequest({
-            model,
-            message: content.trim(),
-            conversation_history: allMessages.map(m => ({ role: m.role, content: m.content })),
-        });
-    }, [currentChatId, currentMessages, isLoading, model, createNewChat, updateCurrentMessages, setIsLoading, resetWorkflowState, streamRequest]);
-
-    const handleConfirmWorkflow = useCallback(async (workflowId, confirmedParams) => {
-        if (!workflowId) return;
-        setPendingConfirmation(null);
-        setIsConfirmed(true);
-        setIsLoading(true);
-        initStepStatuses(activeWorkflow?.steps || []);
-
-        await streamRequest({
-            model,
-            message: '',
-            conversation_history: currentMessages.map(m => ({ role: m.role, content: m.content })),
-            workflow_id: workflowId,
-            confirmed_params: confirmedParams,
-        });
-    }, [model, currentMessages, activeWorkflow, setPendingConfirmation, setIsLoading, initStepStatuses, streamRequest]);
-
-    const handleWorkflowConfirmDirectly = useCallback(() => {
-        if (!pendingConfirmation) return;
-        handleConfirmWorkflow(pendingConfirmation.workflow_id, pendingConfirmation.all_params || pendingConfirmation.extracted_params);
-    }, [pendingConfirmation, handleConfirmWorkflow]);
-
-    const stopGeneration = () => {
-        if (abortControllerRef.current) abortControllerRef.current.abort();
-    };
-
-    const hasContent = currentMessages.length > 0 || streamingLlmContent || activeWorkflow;
-
-    return (
-        <main style={{
-            flex: 1, minWidth: 0, minHeight: 0,
-            display: 'flex', flexDirection: 'column',
-            background: 'linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%)',
-            position: 'relative'
-        }}>
-            <div ref={scrollContainerRef} onScroll={handleScroll} style={{ flex: 1, overflowY: 'auto' }}>
-                {!hasContent ? (
-                    <div style={{
-                        display: 'flex', flexDirection: 'column',
-                        alignItems: 'center', justifyContent: 'center',
-                        height: '100%', padding: '48px 28px', textAlign: 'center'
-                    }}>
-                        <div style={{
-                            width: '64px', height: '64px', borderRadius: '16px',
-                            backgroundColor: '#fff1f2', border: '1px solid #fecdd3',
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            marginBottom: '20px'
-                        }}>
-                            <Zap size={28} color="#db0011" strokeWidth={1.8} />
-                        </div>
-                        <h2 style={{ margin: '0 0 8px', fontSize: '26px', color: '#0f172a', fontWeight: '750' }}>
-                            What would you like to do?
-                        </h2>
-                        <p style={{ margin: '0 0 32px', fontSize: '15px', color: '#475569', maxWidth: '480px', lineHeight: '1.65' }}>
-                            Describe your task in plain English — the assistant will match it to the right workflow and guide you through.
-                        </p>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px', width: '100%', maxWidth: '1400px' }}>
-                            {PROMPT_SUGGESTIONS.map(({ Icon, text }) => (
-                                <button
-                                    key={text}
-                                    onClick={() => handleSendMessage(text)}
-                                    style={{
-                                        padding: '14px 16px', backgroundColor: 'white',
-                                        border: '1px solid #dbe1ea', borderRadius: '8px',
-                                        cursor: 'pointer', textAlign: 'left', fontSize: '13.5px',
-                                        color: '#0f172a', fontWeight: '600', lineHeight: '1.4',
-                                        transition: 'all 0.15s',
-                                        boxShadow: '0 1px 2px rgba(15,23,42,0.05)',
-                                        display: 'flex', alignItems: 'center', gap: '12px'
-                                    }}
-                                    onMouseEnter={e => { e.currentTarget.style.borderColor = '#94a3b8'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
-                                    onMouseLeave={e => { e.currentTarget.style.borderColor = '#dbe1ea'; e.currentTarget.style.transform = 'translateY(0)'; }}
-                                >
-                                    <span style={{ width: '32px', height: '32px', borderRadius: '8px', backgroundColor: '#fff1f2', color: '#9b0015', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                                        <Icon size={16} />
-                                    </span>
-                                    <span>{text}</span>
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-                ) : (
-                    <div style={{ padding: '24px 32px', width: '100%', maxWidth: '1400px', margin: '0 auto' }}>
-                        {currentMessages.map(msg => <MessageBubble key={msg.id} message={msg} />)}
-
-                        {/* Workflow card — shown after classification */}
-                        {activeWorkflow && (
-                            <WorkflowCard
-                                workflow={activeWorkflow}
-                                stepStatuses={stepStatuses}
-                                extractedParams={extractedParams}
-                                onConfirm={pendingConfirmation && pendingConfirmation.missing_params.length === 0 ? handleWorkflowConfirmDirectly : null}
-                                isConfirmed={isConfirmed}
-                            />
-                        )}
-
-                        {/* Param verification form — shown when missing params */}
-                        {pendingConfirmation && pendingConfirmation.missing_params.length > 0 && (
-                            <ParamVerificationCard
-                                workflowId={pendingConfirmation.workflow_id}
-                                workflowName={activeWorkflow?.name || pendingConfirmation.workflow_id}
-                                missingParams={pendingConfirmation.missing_params}
-                                extractedParams={pendingConfirmation.extracted_params}
-                                onSubmit={handleConfirmWorkflow}
-                                onCancel={() => setPendingConfirmation(null)}
-                            />
-                        )}
-
-                        {/* Streaming LLM content (summarize step or plain fallback) */}
-                        {streamingLlmContent && (
-                            <div style={assistantCardStyle}>
-                                <div style={assistantAvatarStyle}><Bot color="white" size={20} /></div>
-                                <div style={{ flex: 1, minWidth: 0 }}>
-                                    <div style={{ fontSize: '12px', fontWeight: '700', color: '#9b0015', marginBottom: '6px' }}>
-                                        Workflow Assistant
-                                    </div>
-                                    <div style={{ color: '#1f2937', fontSize: '14.5px', lineHeight: '1.75', whiteSpace: 'pre-wrap' }}>
-                                        {streamingLlmContent}
-                                        <span style={{ display: 'inline-block', width: '2px', height: '16px', backgroundColor: '#db0011', marginLeft: '2px', verticalAlign: 'text-bottom', animation: 'blink 0.9s step-end infinite' }} />
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Token usage */}
-                        {lastUsage && !isLoading && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '4px 6px 10px', fontSize: '11px', color: '#94a3b8', flexWrap: 'wrap' }}>
-                                <span>&#9679; {lastUsage.prompt_tokens.toLocaleString()} prompt</span>
-                                <span>&#9679; {lastUsage.completion_tokens.toLocaleString()} completion</span>
-                                <span style={{ fontWeight: 600, color: '#64748b' }}>{lastUsage.total_tokens.toLocaleString()} tokens total</span>
-                            </div>
-                        )}
-
-                        {/* Loading dots (pre-stream) */}
-                        {isLoading && !streamingLlmContent && (
-                            <div style={{ ...assistantCardStyle, padding: '16px 20px', alignItems: 'center' }}>
-                                <div style={assistantAvatarStyle}><Bot color="white" size={20} /></div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                    {[0, 1, 2].map(i => (
-                                        <div key={i} style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: '#db0011', animation: `bounce 1.3s ease-in-out ${i * 0.18}s infinite` }} />
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        <div ref={messagesEndRef} />
-                    </div>
-                )}
-            </div>
-
-            {showScrollBtn && (
-                <button onClick={scrollToBottom} title="Scroll to latest" style={{ position: 'absolute', bottom: '90px', right: '24px', width: '36px', height: '36px', borderRadius: '50%', background: 'linear-gradient(135deg, #7b0012, #db0011)', border: 'none', color: 'white', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 12px rgba(123,0,18,0.35)', zIndex: 10, transition: 'transform 0.15s' }}
-                    onMouseEnter={e => (e.currentTarget.style.transform = 'scale(1.1)')}
-                    onMouseLeave={e => (e.currentTarget.style.transform = 'scale(1)')}>
-                    <ChevronDown size={18} />
-                </button>
-            )}
-
-            <WorkflowMessageInput
-                onSendMessage={handleSendMessage}
-                isLoading={isLoading}
-                onStop={stopGeneration}
-                pendingConfirmation={!!(pendingConfirmation && pendingConfirmation.missing_params.length > 0)}
-            />
-
-            <style>{`
-                @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
-                @keyframes bounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
-            `}</style>
-        </main>
-    );
-}
-
----------------------------------------------------------
-_________________________________________________________
-CHATHEADER
-import { useState } from 'react';
-import { Bot, Trash2, Download, Zap, X, Info } from 'lucide-react';
-import Logo from '../../../components/Logo';
-import { useWorkflowChat } from '../lib/workflowChatContext';
-
-const AVAILABLE_MODELS = [
-    { id: 'minimax/minimax-m2.5:free', name: 'Minimax M2.5' },
-    { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
-    { id: 'gpt-4o', name: 'GPT-4o' },
-];
-
-export default function WorkflowChatHeader({ backendOnline = null, availableWorkflows = [] }) {
-    const { model, setModel, clearCurrentChat, exportCurrentChat } = useWorkflowChat();
-    const [showDrawer, setShowDrawer] = useState(false);
-
-    const statusColor = backendOnline === null ? '#94a3b8' : backendOnline ? '#22c55e' : '#ef4444';
-    const statusLabel = backendOnline === null ? 'Connecting…' : backendOnline ? 'Online' : 'Offline';
-
-    return (
-        <>
-            <header style={{
-                backgroundColor: 'white',
-                padding: '0 24px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                height: '88px',
-                gap: '18px',
-                flexShrink: 0,
-                position: 'sticky',
-                top: 0,
-                zIndex: 30,
-                borderBottom: '3px solid #db0011',
-                boxShadow: '0 2px 12px rgba(0,0,0,0.08)'
-            }}>
-                <div style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
-                    <Logo height={58} />
-                </div>
-
-                <div style={{ width: '1px', height: '44px', backgroundColor: '#e5e7eb', flexShrink: 0 }} />
-
-                <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', minWidth: 0 }}>
-                    <div style={{
-                        width: '50px', height: '50px', borderRadius: '12px',
-                        backgroundColor: '#fff1f2', border: '1px solid #fecdd3',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        flexShrink: 0, marginRight: '14px'
-                    }}>
-                        <Zap size={24} color="#db0011" strokeWidth={1.8} />
-                    </div>
-                    <h1 style={{ margin: 0, fontSize: '22px', fontWeight: '700', color: '#111827', whiteSpace: 'nowrap' }}>
-                        Workflow Assistant
-                    </h1>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 10px', backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '20px' }}>
-                        <span style={{
-                            width: '7px', height: '7px', borderRadius: '50%',
-                            backgroundColor: statusColor,
-                            boxShadow: backendOnline ? `0 0 0 2px ${statusColor}33` : 'none',
-                            display: 'inline-block', flexShrink: 0
-                        }} />
-                        <span style={{ fontSize: '11.5px', fontWeight: '600', color: '#64748b', whiteSpace: 'nowrap' }}>{statusLabel}</span>
-                    </div>
-
-                    <label style={{
-                        display: 'flex', alignItems: 'center', gap: '7px',
-                        backgroundColor: '#f8fafc', border: '1px solid #e2e8f0',
-                        borderRadius: '8px', padding: '4px 10px',
-                        boxShadow: '0 1px 2px rgba(0,0,0,0.04)'
-                    }}>
-                        <Bot size={14} style={{ color: '#db0011', flexShrink: 0 }} />
-                        <select
-                            value={model}
-                            onChange={e => setModel(e.target.value)}
-                            aria-label="AI model"
-                            style={{
-                                backgroundColor: 'transparent', color: '#111827', border: 'none',
-                                padding: '3px 2px', fontSize: '13px', fontWeight: '600',
-                                cursor: 'pointer', outline: 'none', height: '28px',
-                                minWidth: '128px', maxWidth: '168px'
-                            }}
-                        >
-                            {AVAILABLE_MODELS.map(m => (
-                                <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                        </select>
-                    </label>
-
-                    {/* Workflows info button */}
-                    <button
-                        onClick={() => setShowDrawer(true)}
-                        title="Available workflows"
-                        style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: '40px', height: '40px', backgroundColor: 'white',
-                            border: '1px solid #e2e8f0', borderRadius: '8px',
-                            cursor: 'pointer', color: '#6b7280', flexShrink: 0, transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#f9fafb'; e.currentTarget.style.color = '#374151'; e.currentTarget.style.borderColor = '#cbd5e1'; }}
-                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'white'; e.currentTarget.style.color = '#6b7280'; e.currentTarget.style.borderColor = '#e2e8f0'; }}
-                    >
-                        <Info size={14} />
-                    </button>
-
-                    <button
-                        onClick={exportCurrentChat}
-                        title="Export chat"
-                        style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: '40px', height: '40px', backgroundColor: 'white',
-                            border: '1px solid #e2e8f0', borderRadius: '8px',
-                            cursor: 'pointer', color: '#6b7280', flexShrink: 0, transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#f9fafb'; e.currentTarget.style.color = '#374151'; e.currentTarget.style.borderColor = '#cbd5e1'; }}
-                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'white'; e.currentTarget.style.color = '#6b7280'; e.currentTarget.style.borderColor = '#e2e8f0'; }}
-                    >
-                        <Download size={14} />
-                    </button>
-
-                    <button
-                        onClick={clearCurrentChat}
-                        title="Clear chat"
-                        style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: '40px', height: '40px', backgroundColor: '#fff1f2',
-                            border: '1px solid #fecdd3', borderRadius: '8px',
-                            cursor: 'pointer', color: '#db0011', flexShrink: 0, transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#ffe4e6'; e.currentTarget.style.borderColor = '#fda4af'; }}
-                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = '#fff1f2'; e.currentTarget.style.borderColor = '#fecdd3'; }}
-                    >
-                        <Trash2 size={14} />
-                    </button>
-                </div>
-            </header>
-
-            {/* Workflows drawer */}
-            {showDrawer && (
-                <div style={{
-                    position: 'fixed', inset: 0, zIndex: 50,
-                    display: 'flex', justifyContent: 'flex-end'
-                }}>
-                    <div onClick={() => setShowDrawer(false)} style={{ position: 'absolute', inset: 0, backgroundColor: 'rgba(0,0,0,0.25)' }} />
-                    <div style={{
-                        position: 'relative', zIndex: 1,
-                        width: '380px', height: '100%',
-                        backgroundColor: 'white', boxShadow: '-4px 0 24px rgba(0,0,0,0.12)',
-                        display: 'flex', flexDirection: 'column',
-                        overflowY: 'auto', padding: '24px'
-                    }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                            <h2 style={{ margin: 0, fontSize: '18px', fontWeight: '700', color: '#111827' }}>
-                                Available Workflows
-                            </h2>
-                            <button onClick={() => setShowDrawer(false)} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#64748b', padding: '4px', borderRadius: '6px' }}>
-                                <X size={18} />
-                            </button>
-                        </div>
-                        <p style={{ margin: '0 0 20px', fontSize: '13px', color: '#64748b', lineHeight: '1.6' }}>
-                            Type your request naturally — the assistant will detect which workflow fits best and guide you through.
-                        </p>
-                        {availableWorkflows.map(wf => (
-                            <div key={wf.id} style={{
-                                padding: '16px', borderRadius: '10px', marginBottom: '12px',
-                                border: '1px solid #e2e8f0', backgroundColor: '#f8fafc'
-                            }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
-                                    <span style={{ fontSize: '20px' }}>{wf.icon}</span>
-                                    <span style={{ fontWeight: '700', fontSize: '14px', color: '#111827' }}>{wf.name}</span>
-                                    <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#94a3b8' }}>
-                                        {wf.step_count} step{wf.step_count !== 1 ? 's' : ''}
-                                    </span>
-                                </div>
-                                <p style={{ margin: 0, fontSize: '13px', color: '#475569', lineHeight: '1.55' }}>{wf.description}</p>
-                                {wf.params?.length > 0 && (
-                                    <div style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                                        {wf.params.filter(p => p.required).map(p => (
-                                            <span key={p.key} style={{
-                                                fontSize: '11px', padding: '2px 8px',
-                                                backgroundColor: '#fff1f2', color: '#9b0015',
-                                                borderRadius: '12px', border: '1px solid #fecdd3',
-                                                fontWeight: '600'
-                                            }}>
-                                                {p.label}
-                                            </span>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
-        </>
-    );
-}
-___________________________________________________________________________
-___________________________________________________________________________
-
-workflowsidebar
-import { useState } from 'react';
-import { Plus, MessageSquare, Trash2, Clock, ChevronLeft, ChevronRight } from 'lucide-react';
-import { useWorkflowChat } from '../lib/workflowChatContext';
-
-const formatDate = (iso) => {
-    const d = new Date(iso);
-    const now = new Date();
-    const diffDays = Math.floor((now - d) / 86400000);
-    if (diffDays === 0) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    if (diffDays === 1) return 'Yesterday';
-    if (diffDays < 7) return d.toLocaleDateString([], { weekday: 'short' });
-    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-};
-
-export default function WorkflowChatSidebar() {
-    const { chats, currentChatId, createNewChat, selectChat, deleteChat } = useWorkflowChat();
-    const [collapsed, setCollapsed] = useState(false);
-
-    const handleDelete = (chatId, e) => {
-        e.stopPropagation();
-        deleteChat(chatId);
-    };
-
-    if (collapsed) {
-        return (
-            <div style={{
-                width: '48px', minWidth: '48px', height: '100%',
-                background: 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
-                borderRight: '1px solid #e2e8f0',
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                paddingTop: '14px', flexShrink: 0
-            }}>
-                <button
-                    onClick={() => setCollapsed(false)}
-                    title="Expand sidebar"
-                    style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        width: '34px', height: '34px', backgroundColor: 'white',
-                        border: '1px solid #dbe1ea', borderRadius: '8px',
-                        cursor: 'pointer', color: '#64748b', transition: 'all 0.15s'
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#f9fafb'; e.currentTarget.style.color = '#374151'; }}
-                    onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'white'; e.currentTarget.style.color = '#6b7280'; }}
-                >
-                    <ChevronRight size={16} />
-                </button>
-            </div>
-        );
-    }
-
-    return (
-        <aside style={{
-            width: '272px', minWidth: '272px', height: '100%',
-            background: 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
-            borderRight: '1px solid #e2e8f0',
-            display: 'flex', flexDirection: 'column', flexShrink: 0, overflow: 'hidden'
-        }}>
-            <div style={{ padding: '14px 14px 10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <button
-                    onClick={createNewChat}
-                    style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        gap: '8px', flex: 1, padding: '11px 16px',
-                        background: 'linear-gradient(135deg, #7b0012 0%, #db0011 100%)',
-                        color: 'white', border: 'none', borderRadius: '8px',
-                        cursor: 'pointer', fontSize: '13px', fontWeight: '600',
-                        letterSpacing: '0.02em', boxShadow: '0 2px 8px rgba(123,0,18,0.25)',
-                        transition: 'all 0.15s'
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(123,0,18,0.35)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(123,0,18,0.25)'; }}
-                >
-                    <Plus size={15} strokeWidth={2.5} /> New Chat
-                </button>
-                <button
-                    onClick={() => setCollapsed(true)}
-                    title="Collapse sidebar"
-                    style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        width: '34px', height: '34px', backgroundColor: 'white',
-                        border: '1px solid #dbe1ea', borderRadius: '8px',
-                        cursor: 'pointer', color: '#64748b', flexShrink: 0, transition: 'all 0.15s'
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#f9fafb'; e.currentTarget.style.color = '#374151'; }}
-                    onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'white'; e.currentTarget.style.color = '#6b7280'; }}
-                >
-                    <ChevronLeft size={16} />
-                </button>
-            </div>
-
-            <div style={{ padding: '8px 16px 8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Clock size={12} style={{ color: '#94a3b8' }} />
-                <span style={{ color: '#64748b', fontSize: '11px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                    Recent Chats
-                </span>
-            </div>
-
-            <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 8px' }}>
-                {chats.length === 0 ? (
-                    <div style={{ padding: '32px 20px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
-                        <MessageSquare size={32} style={{ marginBottom: '10px', opacity: 0.45 }} />
-                        <div style={{ color: '#64748b', fontWeight: 600 }}>No conversations yet</div>
-                        <div style={{ fontSize: '12px', marginTop: '4px', opacity: 0.8 }}>Click "New Chat" to begin</div>
-                    </div>
-                ) : (
-                    chats.map(chat => {
-                        const isActive = currentChatId === chat.id;
-                        const msgCount = chat.messages?.length || 0;
-                        return (
-                            <div
-                                key={chat.id}
-                                onClick={() => selectChat(chat.id)}
-                                style={{
-                                    padding: '10px 12px', borderRadius: '8px', marginBottom: '3px',
-                                    cursor: 'pointer',
-                                    backgroundColor: isActive ? '#fff1f2' : 'transparent',
-                                    border: isActive ? '1px solid #fecdd3' : '1px solid transparent',
-                                    boxShadow: isActive ? '0 1px 2px rgba(123,0,18,0.08)' : 'none',
-                                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                    gap: '8px', transition: 'all 0.12s'
-                                }}
-                                onMouseEnter={e => { if (!isActive) e.currentTarget.style.backgroundColor = '#f1f5f9'; }}
-                                onMouseLeave={e => { if (!isActive) e.currentTarget.style.backgroundColor = 'transparent'; }}
-                            >
-                                <div style={{
-                                    width: '30px', height: '30px', borderRadius: '8px', flexShrink: 0,
-                                    backgroundColor: isActive ? '#9b0015' : '#e2e8f0',
-                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                    transition: 'background-color 0.12s'
-                                }}>
-                                    <MessageSquare size={14} color={isActive ? 'white' : '#64748b'} />
-                                </div>
-                                <div style={{ flex: 1, minWidth: 0 }}>
-                                    <div style={{
-                                        fontSize: '13px', fontWeight: isActive ? '700' : '500',
-                                        color: isActive ? '#9b0015' : '#334155',
-                                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: '1.3'
-                                    }}>
-                                        {chat.title}
-                                    </div>
-                                    {(() => {
-                                        const lastMsg = chat.messages?.[chat.messages.length - 1];
-                                        return lastMsg ? (
-                                            <div style={{
-                                                fontSize: '11.5px', color: '#94a3b8', marginTop: '2px',
-                                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: '1.4'
-                                            }}>
-                                                {lastMsg.content}
-                                            </div>
-                                        ) : null;
-                                    })()}
-                                    <div style={{ fontSize: '10.5px', color: '#cbd5e1', marginTop: '3px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                        <span>{formatDate(chat.createdAt)}</span>
-                                        {msgCount > 0 && (<><span style={{ opacity: 0.5 }}>·</span><span>{msgCount} msg{msgCount !== 1 ? 's' : ''}</span></>)}
-                                    </div>
-                                </div>
-                                <button
-                                    onClick={e => handleDelete(chat.id, e)}
-                                    style={{
-                                        backgroundColor: 'transparent', border: 'none', color: '#cbd5e1',
-                                        cursor: 'pointer', padding: '4px', borderRadius: '5px',
-                                        display: 'flex', alignItems: 'center', flexShrink: 0, transition: 'color 0.15s, background-color 0.15s'
-                                    }}
-                                    onMouseEnter={e => { e.currentTarget.style.color = '#dc2626'; e.currentTarget.style.backgroundColor = '#fee2e2'; }}
-                                    onMouseLeave={e => { e.currentTarget.style.color = '#cbd5e1'; e.currentTarget.style.backgroundColor = 'transparent'; }}
-                                    title="Delete chat"
-                                >
-                                    <Trash2 size={13} />
-                                </button>
-                            </div>
-                        );
-                    })
-                )}
-            </div>
-
-            {chats.length > 0 && (
-                <div style={{ padding: '10px 16px', borderTop: '1px solid #e2e8f0', fontSize: '11px', color: '#94a3b8', textAlign: 'center' }}>
-                    {chats.length} conversation{chats.length !== 1 ? 's' : ''}
-                </div>
-            )}
-        </aside>
-    );
-}
-------------------------------------------------------------------------
-)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
-MessageInput
-import { useRef, useState, useCallback } from 'react';
-import { Send, Square } from 'lucide-react';
-
-export default function WorkflowMessageInput({ onSendMessage, isLoading, onStop, pendingConfirmation }) {
-    const [message, setMessage] = useState('');
-    const textareaRef = useRef(null);
-
-    const placeholder = pendingConfirmation
-        ? 'Fill in the parameters above to continue…'
-        : 'Describe what you want to do… (e.g. "validate my QA config at /opt/config.xlsx")';
-
-    const adjustHeight = useCallback(() => {
-        const el = textareaRef.current;
-        if (!el) return;
-        el.style.height = 'auto';
-        el.style.height = Math.min(el.scrollHeight, 150) + 'px';
-    }, []);
-
-    const handleChange = (e) => {
-        setMessage(e.target.value);
-        adjustHeight();
-    };
-
-    const handleSend = useCallback(() => {
-        const trimmed = message.trim();
-        if (!trimmed || isLoading || pendingConfirmation) return;
-        onSendMessage(trimmed);
-        setMessage('');
-        if (textareaRef.current) {
-            textareaRef.current.style.height = 'auto';
-        }
-    }, [message, isLoading, pendingConfirmation, onSendMessage]);
-
-    const handleKeyDown = (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            handleSend();
-        }
-    };
-
-    const charCount = message.length;
-    const overLimit = charCount > 3000;
-
-    return (
-        <div style={{
-            padding: '12px 20px 16px',
-            borderTop: '1px solid #e2e8f0',
-            backgroundColor: 'white',
-            flexShrink: 0
-        }}>
-            <div style={{
-                display: 'flex',
-                alignItems: 'flex-end',
-                gap: '10px',
-                border: `1px solid ${overLimit ? '#ef4444' : '#dbe1ea'}`,
-                borderRadius: '10px',
-                padding: '10px 12px',
-                backgroundColor: pendingConfirmation ? '#f8fafc' : 'white',
-                boxShadow: '0 1px 3px rgba(15,23,42,0.06)',
-                transition: 'border-color 0.15s'
-            }}>
-                <textarea
-                    ref={textareaRef}
-                    value={message}
-                    onChange={handleChange}
-                    onKeyDown={handleKeyDown}
-                    placeholder={placeholder}
-                    disabled={pendingConfirmation}
-                    rows={1}
-                    style={{
-                        flex: 1,
-                        border: 'none',
-                        outline: 'none',
-                        resize: 'none',
-                        fontSize: '14px',
-                        color: pendingConfirmation ? '#94a3b8' : '#1f2937',
-                        backgroundColor: 'transparent',
-                        fontFamily: 'inherit',
-                        lineHeight: '1.6',
-                        maxHeight: '150px',
-                        overflowY: 'auto',
-                    }}
-                />
-
-                {isLoading ? (
-                    <button
-                        onClick={onStop}
-                        title="Stop generation"
-                        style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: '38px', height: '38px', flexShrink: 0,
-                            backgroundColor: '#dc2626', border: 'none', borderRadius: '8px',
-                            cursor: 'pointer', color: 'white', transition: 'all 0.15s'
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#b91c1c'; }}
-                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = '#dc2626'; }}
-                    >
-                        <Square size={14} fill="white" />
-                    </button>
-                ) : (
-                    <button
-                        onClick={handleSend}
-                        disabled={!message.trim() || pendingConfirmation || overLimit}
-                        title="Send message"
-                        style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: '38px', height: '38px', flexShrink: 0,
-                            background: (!message.trim() || pendingConfirmation || overLimit)
-                                ? '#e2e8f0'
-                                : 'linear-gradient(135deg, #7b0012, #db0011)',
-                            border: 'none', borderRadius: '8px',
-                            cursor: (!message.trim() || pendingConfirmation || overLimit) ? 'not-allowed' : 'pointer',
-                            color: (!message.trim() || pendingConfirmation || overLimit) ? '#94a3b8' : 'white',
-                            transition: 'all 0.15s',
-                            boxShadow: (!message.trim() || pendingConfirmation || overLimit) ? 'none' : '0 2px 8px rgba(123,0,18,0.25)'
-                        }}
-                    >
-                        <Send size={15} />
-                    </button>
-                )}
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', padding: '0 2px' }}>
-                <span style={{ fontSize: '11px', color: '#94a3b8' }}>Shift+Enter for new line</span>
-                {charCount > 0 && (
-                    <span style={{ fontSize: '11px', color: overLimit ? '#ef4444' : '#94a3b8', fontWeight: overLimit ? '600' : '400' }}>
-                        {charCount.toLocaleString()}{overLimit ? ' (over limit)' : ''}
-                    </span>
-                )}
-            </div>
-        </div>
-    );
-}
-_________________________________________________________________
-__________________________________________________________________
-workflowchatContext
-
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-
-const STORAGE_KEY = 'workflow-assistant-chats';
-
-const generateId = () => `chat-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-const loadFromStorage = () => {
-    try {
-        const stored = localStorage.getItem(STORAGE_KEY);
-        return stored ? JSON.parse(stored) : { chats: [], currentChatId: null };
-    } catch {
-        return { chats: [], currentChatId: null };
-    }
-};
-
-const saveToStorage = (data) => {
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch {}
-};
-
-const WorkflowChatContext = createContext(null);
-
-export function WorkflowChatProvider({ children }) {
-    const [chats, setChats] = useState([]);
-    const [currentChatId, setCurrentChatId] = useState(null);
-    const [currentMessages, setCurrentMessages] = useState([]);
-    const [isLoading, setIsLoading] = useState(false);
-    const [streamingContent, setStreamingContent] = useState('');
-    const [model, setModel] = useState('minimax/minimax-m2.5:free');
-    const [temperature] = useState(0.7);
-
-    // Workflow-specific state
-    const [activeWorkflow, setActiveWorkflow] = useState(null);
-    const [extractedParams, setExtractedParams] = useState({});
-    const [pendingConfirmation, setPendingConfirmation] = useState(null);
-    const [stepStatuses, setStepStatuses] = useState({});
-    const [streamingLlmContent, setStreamingLlmContent] = useState('');
-
-    useEffect(() => {
-        const data = loadFromStorage();
-        setChats(data.chats);
-        if (data.currentChatId && data.chats.find(c => c.id === data.currentChatId)) {
-            setCurrentChatId(data.currentChatId);
-            const chat = data.chats.find(c => c.id === data.currentChatId);
-            setCurrentMessages(chat?.messages || []);
-        }
-    }, []);
-
-    useEffect(() => {
-        saveToStorage({ chats, currentChatId });
-    }, [chats, currentChatId]);
-
-    const resetWorkflowState = useCallback(() => {
-        setActiveWorkflow(null);
-        setExtractedParams({});
-        setPendingConfirmation(null);
-        setStepStatuses({});
-        setStreamingLlmContent('');
-    }, []);
-
-    const createNewChat = useCallback(() => {
-        const newChat = {
-            id: generateId(),
-            title: 'New Chat',
-            createdAt: new Date().toISOString(),
-            messages: []
-        };
-        setChats(prev => [newChat, ...prev]);
-        setCurrentChatId(newChat.id);
-        setCurrentMessages([]);
-        resetWorkflowState();
-        return newChat.id;
-    }, [resetWorkflowState]);
-
-    const selectChat = useCallback((chatId) => {
-        setCurrentChatId(chatId);
-        const chat = chats.find(c => c.id === chatId);
-        setCurrentMessages(chat?.messages || []);
-        resetWorkflowState();
-    }, [chats, resetWorkflowState]);
-
-    const deleteChat = useCallback((chatId) => {
-        setChats(prev => prev.filter(c => c.id !== chatId));
-        if (currentChatId === chatId) {
-            setCurrentChatId(null);
-            setCurrentMessages([]);
-            resetWorkflowState();
-        }
-    }, [currentChatId, resetWorkflowState]);
-
-    const updateCurrentMessages = useCallback((updater) => {
-        setCurrentMessages(prev => {
-            const newMessages = typeof updater === 'function' ? updater(prev) : updater;
-            setChats(chats => chats.map(chat => {
-                if (chat.id === currentChatId) {
-                    const firstUserMsg = newMessages.find(m => m.role === 'user');
-                    const title = firstUserMsg
-                        ? firstUserMsg.content.slice(0, 40) + (firstUserMsg.content.length > 40 ? '...' : '')
-                        : chat.title;
-                    return { ...chat, messages: newMessages, title };
-                }
-                return chat;
-            }));
-            return newMessages;
-        });
-    }, [currentChatId]);
-
-    const clearCurrentChat = useCallback(() => {
-        setCurrentMessages([]);
-        setChats(prev => prev.map(chat =>
-            chat.id === currentChatId ? { ...chat, messages: [], title: 'New Chat' } : chat
-        ));
-        resetWorkflowState();
-    }, [currentChatId, resetWorkflowState]);
-
-    const exportCurrentChat = useCallback(() => {
-        const blob = new Blob([JSON.stringify({ messages: currentMessages, model, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `workflow-chat-${new Date().toISOString().split('T')[0]}.json`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
-    }, [currentMessages, model]);
-
-    const initStepStatuses = useCallback((steps) => {
-        const initial = {};
-        steps.forEach(s => { initial[s.id] = 'pending'; });
-        setStepStatuses(initial);
-    }, []);
-
-    const updateStepStatus = useCallback((stepId, status) => {
-        setStepStatuses(prev => ({ ...prev, [stepId]: status }));
-    }, []);
-
-    const appendStreamingLlm = useCallback((chunk) => {
-        setStreamingLlmContent(prev => prev + chunk);
-    }, []);
-
-    const value = {
-        chats,
-        currentChatId,
-        currentMessages,
-        isLoading,
-        setIsLoading,
-        streamingContent,
-        setStreamingContent,
-        model,
-        setModel,
-        temperature,
-        // Workflow state
-        activeWorkflow,
-        setActiveWorkflow,
-        extractedParams,
-        setExtractedParams,
-        pendingConfirmation,
-        setPendingConfirmation,
-        stepStatuses,
-        updateStepStatus,
-        initStepStatuses,
-        streamingLlmContent,
-        setStreamingLlmContent,
-        appendStreamingLlm,
-        // Actions
-        createNewChat,
-        selectChat,
-        deleteChat,
-        updateCurrentMessages,
-        clearCurrentChat,
-        exportCurrentChat,
-        resetWorkflowState,
-    };
-
-    return (
-        <WorkflowChatContext.Provider value={value}>
-            {children}
-        </WorkflowChatContext.Provider>
-    );
-}
-
-export function useWorkflowChat() {
-    const context = useContext(WorkflowChatContext);
-    if (!context) throw new Error('useWorkflowChat must be used within a WorkflowChatProvider');
-    return context;
-}
-________________________________________________________
-))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
-
-TEST SCENARIOS
-# Workflow Assistant — Test Scenarios
-
-All test files are in `tests/workflow_assistant/test_files/`.  
-Generate them by running: `python tests/workflow_assistant/create_test_files.py`
-
----
-
-## Test File Reference
-
-| File | Purpose |
-|---|---|
-| `test_transform_data.xlsx` | 3 sheets (Transactions, Products, Addresses) covering all 11 ops |
-| `qa_config_valid.xlsx` | Clean QA config — should PASS validation |
-| `qa_config_errors.xlsx` | QA config with 7 deliberate errors — should FAIL |
-| `comp_config_valid.xlsx` | Clean COMP config — should PASS validation |
-| `comp_config_errors.xlsx` | COMP config with 6 deliberate errors — should FAIL |
-
-Adjust all file paths below to match your server's actual path to the `test_files/` folder.
-
----
-
-## WORKFLOW 1 — Transform Validation
-
-### TC-T1 · DateExtract — inline JSON, extract year
-
-**Prompt:**
-```
-Run a DateExtract transform on the transaction_date field to extract the year.
-New field name: transaction_year
-Sample data: [{"id":1,"transaction_date":"2024-01-15","amount":1500},{"id":2,"transaction_date":"2024-03-22","amount":850},{"id":3,"transaction_date":"2023-12-01","amount":300}]
-Operation params: {"component": "year"}
-```
-
-**Expected workflow card:** Transform Validation  
-**Expected steps:** Read Input File (skipped) → Execute Transform → Write Results (skipped) → Summarize  
-**Expected result:** New `transaction_year` column with values 2024, 2024, 2023  
-
----
-
-### TC-T2 · Concatenate — inline JSON, join first and last name
-
-**Prompt:**
-```
-Concatenate first_name and last_name into a field called full_name.
-Use a space as separator.
-Sample data: [{"id":1,"first_name":"Alice","last_name":"Johnson"},{"id":2,"first_name":"Bob","last_name":"Smith"},{"id":3,"first_name":"Carol","last_name":"Williams"}]
-```
-
-**Expected:** `full_name` = "Alice Johnson", "Bob Smith", "Carol Williams"
-
----
-
-### TC-T3 · Formula — calculate revenue (amount × quantity)
-
-**Prompt:**
-```
-Apply a Formula transform. New field: revenue. Inputs: amount,quantity.
-Formula: A * B
-Data: [{"id":1,"amount":1500,"quantity":3},{"id":2,"amount":850,"quantity":1},{"id":3,"amount":25000,"quantity":10},{"id":4,"amount":300,"quantity":2}]
-```
-
-**Expected:** `revenue` = 4500, 850, 250000, 600
-
----
-
-### TC-T4 · Conditional — flag high-value transactions
-
-**Prompt:**
-```
-Run a Conditional transform. New field: is_high_value.
-Input field: amount
-Condition: amount > 10000
-True value: Yes, False value: No
-Sample: [{"id":1,"amount":1500},{"id":2,"amount":12500},{"id":3,"amount":300},{"id":4,"amount":25000}]
-```
-
-**Expected:** `is_high_value` = No, Yes, No, Yes
-
----
-
-### TC-T5 · MapValues — map status codes to labels
-
-**Prompt:**
-```
-MapValues transform. Input: status. New field: status_label.
-Mapping: {"Active": "LIVE", "Inactive": "CLOSED", "Pending": "PENDING_REVIEW"}
-Data: [{"id":1,"status":"Active"},{"id":2,"status":"Inactive"},{"id":3,"status":"Pending"},{"id":4,"status":"Active"}]
-```
-
-**Expected:** `status_label` = LIVE, CLOSED, PENDING\_REVIEW, LIVE
-
----
-
-### TC-T6 · StringOperation — uppercase customer names
-
-**Prompt:**
-```
-StringOperation transform — apply upper to full_name. New field: upper_name.
-Data: [{"id":"C001","full_name":"alice johnson"},{"id":"C002","full_name":"bob smith"},{"id":"C003","full_name":"carol williams"}]
-```
-
-**Expected:** `upper_name` = "ALICE JOHNSON", "BOB SMITH", "CAROL WILLIAMS"
-
----
-
-### TC-T7 · NumericOperation — mean of three scores
-
-**Prompt:**
-```
-NumericOperation transform. Inputs: score1,score2,score3. New field: avg_score. Operation: mean.
-Data: [{"product_id":"P001","score1":85,"score2":90,"score3":78},{"product_id":"P002","score1":92,"score2":88,"score3":95},{"product_id":"P003","score1":70,"score2":75,"score3":80}]
-```
-
-**Expected:** `avg_score` ≈ 84.33, 91.67, 75.0
-
----
-
-### TC-T8 · CopyField — duplicate a field
-
-**Prompt:**
-```
-CopyField transform. Copy product_id into new field backup_id.
-Data: [{"product_id":"P001","product_name":"Widget A"},{"product_id":"P002","product_name":"Widget B"}]
-```
-
-**Expected:** `backup_id` = "P001", "P002" (identical to product\_id)
-
----
-
-### TC-T9 · SetValue — add a constant region field
-
-**Prompt:**
-```
-SetValue transform. New field: region. Set all rows to the value "EMEA".
-Data: [{"trade_id":"T001","amount":5000},{"trade_id":"T002","amount":12000},{"trade_id":"T003","amount":800}]
-```
-
-**Expected:** `region` = "EMEA" for every row
-
----
-
-### TC-T10 · Split — extract city from address
-
-**Prompt:**
-```
-Split transform. Input: full_address. New field: city. Split by ", " and take part index 1.
-Data: [{"id":"C001","full_address":"123 Main St, New York, NY 10001"},{"id":"C002","full_address":"456 Oak Ave, Los Angeles, CA 90001"},{"id":"C003","full_address":"789 Pine Rd, Chicago, IL 60601"}]
-Operation params: {"separator": ", ", "part": 1}
-```
-
-**Expected:** `city` = "New York", "Los Angeles", "Chicago"
-
----
-
-### TC-T11 · Replace — clean N/A values in country_code
-
-**Prompt:**
-```
-Replace transform on country_code field. New field: clean_country.
-Replace N/A with Unknown and TBD with Pending.
-Operation params: {"replacements": {"N/A": "Unknown", "TBD": "Pending"}}
-Data: [{"id":"C001","country_code":"US"},{"id":"C002","country_code":"GB"},{"id":"C003","country_code":"N/A"},{"id":"C004","country_code":"TBD"}]
-```
-
-**Expected:** `clean_country` = US, GB, Unknown, Pending
-
----
-
-### TC-T12 · Read from Excel file — DateExtract on Transactions sheet
-
-**Prompt (adjust path):**
-```
-Read the Transactions sheet from D:/office/rag_app/controldash/tests/workflow_assistant/test_files/test_transform_data.xlsx
-Run a DateExtract on transaction_date. New field: tx_year. Component: year.
-```
-
-**Expected:**
-- Read Input File step: `success` — shows row_count=8, columns listed
-- Execute Transform: `success` — tx\_year column populated for all 8 rows
-- Write Results: `skipped` (no output path given)
-- Summarize: LLM produces markdown table with before/after
-
----
-
-### TC-T13 · Read from Excel AND write results to file
-
-**Prompt (adjust paths):**
-```
-Read the Products sheet from D:/office/rag_app/controldash/tests/workflow_assistant/test_files/test_transform_data.xlsx
-Apply a NumericOperation (mean) on score1,score2,score3. New field: avg_score.
-Write the results to D:/office/rag_app/controldash/tests/workflow_assistant/test_files/products_transformed.xlsx
-```
-
-**Expected:**
-- Read Input File: `success` (5 rows, 7 columns)
-- Execute Transform: `success`
-- Write Results: `success` — confirms path and row count
-- Output file `products_transformed.xlsx` created in test_files/
-
----
-
-### TC-T14 · Missing params — triggers ParamVerificationCard
-
-**Prompt:**
-```
-Run a transform on my data
-```
-
-**Expected:** LLM cannot extract `operation_type`, `new_field_name`, `input_fields` → `params_required` event fires → **ParamVerificationCard** appears with dropdown for operation type and text inputs
-
----
-
-### TC-T15 · Unrecognised intent — plain LLM fallback
-
-**Prompt:**
-```
-What is the capital of France?
-```
-
-**Expected:** No workflow card appears. Plain LLM answer returned. No step indicators.
-
----
-
-## WORKFLOW 2 — Config File Validation
-
-### TC-V1 · Validate valid QA config — should PASS
-
-**Prompt (adjust path):**
-```
-Validate my QA config at D:/office/rag_app/controldash/tests/workflow_assistant/test_files/qa_config_valid.xlsx
-```
-
-**Expected:**
-- Start Validation: `success` (task_id returned)
-- Wait for Validation: `success` (polls until `completed`)
-- Summarize: PASS verdict, all 5 sheets clean
-- Write Summary: `skipped` (no output path)
-
----
-
-### TC-V2 · Validate QA config with errors — should FAIL
-
-**Prompt (adjust path):**
-```
-Check my QA config for errors: D:/office/rag_app/controldash/tests/workflow_assistant/test_files/qa_config_errors.xlsx
-Control type: QA
-```
-
-**Expected errors the LLM should report:**
-
-| Sheet | Row | Issue |
-|---|---|---|
-| InputFiles | 3 | Missing FilePath, FileType |
-| InputFiles | 4 | Missing Encoding (warning) |
-| Rules | 4 | Missing RuleName |
-| Rules | 5 | Duplicate (account\_id, target\_account\_id) |
-| Enrichment | 3 | Invalid SourceSheet "NonExistentSheet" |
-| Enrichment | 4 | Missing SourceSheet |
-| FieldOperations | 3 | Missing OutputField |
-| OutputRules | 2 | Missing OutputPath |
-
----
-
-### TC-V3 · Validate QA config and save summary to file
-
-**Prompt (adjust paths):**
-```
-Validate D:/office/rag_app/controldash/tests/workflow_assistant/test_files/qa_config_errors.xlsx as QA.
-Save the validation report to D:/office/rag_app/controldash/tests/workflow_assistant/test_files/qa_validation_report.txt
-```
-
-**Expected:**
-- All 4 steps run
-- Write Summary: `success` — confirms file path and char count
-- File `qa_validation_report.txt` created containing the markdown report
-
----
-
-### TC-V4 · Validate valid COMP config — should PASS
-
-**Prompt (adjust path):**
-```
-Run validation on my completeness config file at D:/office/rag_app/controldash/tests/workflow_assistant/test_files/comp_config_valid.xlsx
-```
-
-**Expected:** PASS verdict, all 5 sheets clean
-
----
-
-### TC-V5 · Validate COMP config with errors
-
-**Prompt (adjust path):**
-```
-validate comp config D:/office/rag_app/controldash/tests/workflow_assistant/test_files/comp_config_errors.xlsx
-```
-
-**Expected errors:**
-
-| Sheet | Issue |
-|---|---|
-| InputFiles | Row 3: missing FilePath, FileType |
-| Rules | Row 4: missing RuleName |
-| Rules | Row 5: duplicate (trade\_id, target\_trade\_id) |
-| Enrichment | Row 3: invalid SourceSheet "BadSheet" |
-| FieldOperations | Row 2: missing OutputField |
-
----
-
-### TC-V6 · Missing file_path param — triggers form
-
-**Prompt:**
-```
-validate my QA config
-```
-
-**Expected:** LLM extracts `control_type=null`, `file_path=null` → **ParamVerificationCard** shows text input for file path and dropdown for control type
-
----
-
-### TC-V7 · Partial extraction — file path found but not control type
-
-**Prompt:**
-```
-Check for errors in my config file at /opt/configs/myconfig.xlsx
-```
-
-**Expected:** LLM extracts `file_path=/opt/configs/myconfig.xlsx`, `control_type=null` → ParamVerificationCard shows pre-filled file path (read-only) and dropdown to pick QA or COMP
-
----
-
-## WORKFLOW 3 — Config Search
-
-> Config search requires parquet files to exist in `api/data/search_data/`. These tests assume they are present.
-
-### TC-S1 · Search all sheets for a field name
-
-**Prompt:**
-```
-Search config for account_id
-```
-
-**Expected:** Run Search step searches all sheets/types, summarises matching rows grouped by sheet
-
----
-
-### TC-S2 · Search restricted to one sheet
-
-**Prompt:**
-```
-Find rules that reference customer_name in the rules sheet
-```
-
-**Expected:** `sheet=rules` extracted; search limited to rules sheet
-
----
-
-### TC-S3 · Search with control type filter
-
-**Prompt:**
-```
-Search QA config for gross_amount in field operations
-```
-
-**Expected:** `control_type=QA`, `sheet=FieldOperations` (or no sheet), search limited to QA files
-
----
-
-### TC-S4 · No results — LLM suggests alternatives
-
-**Prompt:**
-```
-Search config for zzzzznonexistent_field_xyz
-```
-
-**Expected:** Search returns 0 results. LLM summary suggests alternative spellings or notes the field is not configured.
-
----
-
-### TC-S5 · Missing query param — triggers form
-
-**Prompt:**
-```
-search the config
-```
-
-**Expected:** `query` not extracted → **ParamVerificationCard** shows text input for search query, optional sheet + control type selects
-
----
-
-## Edge Cases
-
-### TC-E1 · Stop mid-stream
-1. Start any transform or validation
-2. Click the **Stop** button (red square) while steps are running
-3. **Expected:** Stream aborts cleanly, no error shown
-
-### TC-E2 · Backend offline
-1. Stop the FastAPI server
-2. Type any prompt
-3. **Expected:** Error message in chat: "Error: ... Please check that the backend is running"
-
-### TC-E3 · Cancel ParamVerificationCard
-1. Send a prompt that triggers missing params
-2. Click **Cancel** on the card
-3. **Expected:** Card disappears, chat input re-enables, no workflow executes
-
-### TC-E4 · Invalid file path in transform
-**Prompt:**
-```
-Read data from /nonexistent/path/file.xlsx and run a DateExtract on date_field. New field: year.
-```
-**Expected:** Read Input File step: `error` with "File not found" message. Other steps still run (using empty data, may error downstream).
-
-### TC-E5 · Invalid JSON in sample_data
-**Prompt:**
-```
-Run a CopyField transform. Input: id. New field: id_copy.
-Sample data: {this is not valid json}
-```
-**Expected:** Execute Transform step: `error`. LLM summary explains the JSON parse failure.
-
-### TC-E6 · New chat clears workflow state
-1. Complete any workflow (workflow card shows success)
-2. Click **New Chat** in sidebar
-3. Type a new prompt
-4. **Expected:** Previous workflow card gone, fresh classification for new prompt
