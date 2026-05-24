@@ -1,1593 +1,383 @@
-ai--ass
-"""
-AI Assistant Router - Streaming chat endpoint for AI models
-"""
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-import logging
-import json
-import os
-import asyncio
-import random
-from datetime import datetime
-from pathlib import Path
 
-from .ai_tools import TOOL_DEFINITIONS, execute_tool, ensure_user_workspace
-from .ai_skills.skill_loader import SKILL_ALIASES, get_skill_builder
-from .rag_service import get_rag_kb
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/ai", tags=["AI Assistant"])
-
-JUDGMENT_ENABLED = os.environ.get("JUDGMENT_ENABLED", "false").lower() == "true"
-JUDGMENT_MODEL = os.environ.get("JUDGMENT_MODEL", "minimax/minimax-m2.5:free")
-JUDGMENT_SAMPLE_RATE = float(os.environ.get("JUDGMENT_SAMPLE_RATE", "0.2"))
-DEFAULT_CRITERIA_TEMPLATE = os.environ.get("DEFAULT_CRITERIA", "technical_accuracy")
-SSE_CHUNK_SIZE = 50
-# Keep the last N user/assistant message pairs to stay within token limits.
-MAX_HISTORY_MESSAGES = int(os.environ.get("AI_MAX_HISTORY_MESSAGES", "20"))
-# Total tool calls allowed across all turns in one chat completion.
-MAX_TOOL_CALLS = int(os.environ.get("AI_MAX_TOOL_CALLS", "10"))
-
-# ── Context compaction ────────────────────────────────────────────────────────
-# Assumed context window for the configured model.  Override per deployment.
-CONTEXT_MAX_TOKENS   = int(os.environ.get("AI_CONTEXT_MAX_TOKENS", "8192"))
-# When estimated prompt tokens exceed this fraction of the window, compact.
-COMPACTION_THRESHOLD = float(os.environ.get("AI_COMPACTION_THRESHOLD", "0.70"))
-# After compaction, target this fraction of the window for old-message summary.
-COMPACTION_TARGET    = float(os.environ.get("AI_COMPACTION_TARGET", "0.12"))
-# ─────────────────────────────────────────────────────────────────────────────
-
-CRITERIA_TEMPLATES = {
-    "technical_accuracy": {
-        "name": "Technical Accuracy",
-        "criteria": [
-            "Answer must be technically correct and factual",
-            "Code examples must be syntactically valid and follow best practices",
-            "No outdated or deprecated practices mentioned",
-            "Information aligns with current industry standards"
-        ]
-    },
-    "conciseness": {
-        "name": "Conciseness",
-        "criteria": [
-            "Answer should be brief and to the point",
-            "Avoid unnecessary verbosity or repetition",
-            "Maximum 200 words unless complexity requires more",
-            "Every sentence adds value"
-        ]
-    },
-    "completeness": {
-        "name": "Completeness",
-        "criteria": [
-            "Fully addresses all parts of the user's question",
-            "Includes necessary context and explanations",
-            "Provides actionable steps or examples where appropriate",
-            "No important information is missing"
-        ]
-    },
-    "code_quality": {
-        "name": "Code Quality",
-        "criteria": [
-            "Code follows language-specific best practices and conventions",
-            "Includes error handling where appropriate",
-            "Code is readable, well-structured, and maintainable",
-            "Variable and function names are descriptive"
-        ]
-    }
-}
-
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-
-class ChatRequest(BaseModel):
-    model: str = Field(default="minimax/minimax-m2.5:free", description="Model name to use")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Temperature for response randomness")
-    messages: List[Message] = Field(..., description="Conversation messages")
-    max_tokens: Optional[int] = Field(default=4096, description="Maximum tokens in response")
-    environment: str = Field(default="dev", description="Environment (dev, poc, prod)")
-    active_skills: List[str] = Field(default_factory=list, description="Optional assistant skills to activate")
-    user_id: Optional[str] = Field(default=None, description="User ID — scopes all file tool calls to the user's workspace")
-
-
-def detect_requested_skills(request: ChatRequest, user_message: str) -> List[str]:
-    requested = {skill.lower() for skill in request.active_skills}
-    normalized_message = user_message.lower()
-
-    for skill_name, skill_config in SKILL_ALIASES.items():
-        if skill_name in requested:
-            requested.add(skill_name)
-            continue
-        if any(trigger in normalized_message for trigger in skill_config["triggers"]):
-            requested.add(skill_name)
-
-    return [skill for skill in requested if skill in SKILL_ALIASES]
-
-
-_SKILL_OUTPUT_CONTRACTS: Dict[str, str] = {
-    "flowchart":           "- flow-json: ```flow-json with {title, nodes, edges}. Nodes may include a details array.",
-    "field_flow":          "- flow-json: ```flow-json with {title, nodes, edges}. Nodes may include a details array.",
-    "chart":               "- chart-json: ```chart-json with {type, title, xKey, yKeys, data}.",
-    "html_artifact":       "- html-artifact: ```html-artifact — one complete self-contained HTML document, inline CSS/JS only.",
-    "dashboard_artifact":  "- html-artifact: ```html-artifact — one complete self-contained HTML document, inline CSS/JS only.",
-    "form_artifact":       "- html-artifact: ```html-artifact — one complete self-contained HTML document, inline CSS/JS only.",
-    "completeness_steps":  "- completeness nodes: include node_id, node_name, objective, inputs_needed, instruction, validation, expected_output.",
-}
-
-
-def build_default_skill_system_prompt(active_skills: Optional[List[str]] = None) -> str:
-    """Build a compact system prompt covering only the active skills."""
-    if active_skills:
-        skill_list = ", ".join(active_skills)
-        contracts = [
-            _SKILL_OUTPUT_CONTRACTS[s]
-            for s in active_skills
-            if s in _SKILL_OUTPUT_CONTRACTS
-        ]
-        # deduplicate (html_artifact / dashboard_artifact share the same contract)
-        seen: set = set()
-        unique_contracts = [c for c in contracts if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
-        contracts_block = ("\n\nOutput contracts:\n" + "\n".join(unique_contracts)) if unique_contracts else ""
-        return (
-            f"Active skills: {skill_list}. Use them when the request benefits from that format."
-            f"{contracts_block}"
-            "\n\nUse only data present or safely inferable. If data is missing, ask instead of inventing."
-        )
-    # No skills active — minimal prompt, no skill listing or contracts
-    return "Answer clearly and concisely. Use markdown tables where tabular data helps; do not wrap tables in code blocks."
-
-
-def _parse_json_object(content: str):
-    if not content:
-        return None
-
-    cleaned = content.strip()
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in cleaned:
-        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
-
-    try:
-        parsed = json.loads(cleaned)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                parsed = json.loads(cleaned[start:end + 1])
-                return parsed if isinstance(parsed, dict) else None
-            except json.JSONDecodeError:
-                return None
-    return None
-
-
-def _render_completeness_markdown(instruction_data: Dict[str, Any]) -> str:
-    run_parameters = instruction_data.get("run_parameters", [])
-    node_instructions = instruction_data.get("node_instructions", [])
-    missing_information = instruction_data.get("missing_information", [])
-
-    lines = ["## Run Parameters", ""]
-    if run_parameters:
-        lines.extend(["| Parameter | Required | Instruction |", "|---|---:|---|"])
-        for param in run_parameters:
-            lines.append(f"| {param.get('name', '')} | {param.get('required', True)} | {param.get('instruction', '')} |")
-    else:
-        lines.append("No run parameters were identified.")
-
-    lines.extend(["", "## Node Instructions", ""])
-    if node_instructions:
-        lines.extend([
-            "| Order | Node ID | Node | Inputs Needed | Instruction | Validation | Expected Output |",
-            "|---:|---|---|---|---|---|---|"
-        ])
-        for node in node_instructions:
-            inputs = ", ".join(node.get("inputs_needed", []))
-            validation = "<br>".join(node.get("validation", []))
-            lines.append(
-                f"| {node.get('order', '')} | {node.get('node_id', '')} | {node.get('node_name', '')} | "
-                f"{inputs} | {node.get('instruction', '')} | {validation} | {node.get('expected_output', '')} |"
-            )
-    else:
-        lines.append("No node instructions were generated.")
-
-    if missing_information:
-        lines.extend(["", "## Missing Information", ""])
-        for item in missing_information:
-            lines.append(f"- {item}")
-
-    return "\n".join(lines)
-
-
-def _validate_skill_plan(skill_name: str, plan_data: Any) -> bool:
-    """Validate that skill plan contains expected keys based on skill type."""
-    if not isinstance(plan_data, dict):
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
         return False
-
-    if SKILL_ALIASES.get(skill_name, {}).get("skill_format") == "markdown":
-        return all(key in plan_data for key in ["should_use_markdown_skill", "skill_name"])
-
-    required_keys = {
-        "field_flow": ["should_use_field_flow"],
-        "flowchart": ["should_flowchart", "title"],
-        "tools": ["should_use_tools"],
-        "html_artifact": ["should_create_html_artifact", "title"],
-        "dashboard_artifact": ["should_create_dashboard_artifact", "title"],
-        "form_artifact": ["should_create_form_artifact", "title"],
-        "completeness_steps": ["goal", "required_parameters", "selected_nodes", "missing_information"],
-    }
-
-    required = required_keys.get(skill_name, [])
-    return all(key in plan_data for key in required)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "apply", "update"}
 
 
-def _fallback_skill_plan(skill_name: str, user_message: str) -> Optional[Dict[str, Any]]:
-    if skill_name == "html_artifact":
-        return {
-            "should_create_html_artifact": True,
-            "artifact_type": "mini_app",
-            "title": "HTML Artifact",
-            "interaction_level": "interactive",
-            "layout_model": "other",
-            "data_needed": [],
-            "visual_direction": "Professional, self-contained browser-native HTML artifact.",
-            "acceptance_checks": ["Render in the assistant preview", "Use inline CSS and JavaScript only"],
-            "fallback_plan": True,
-        }
-
-    if skill_name == "dashboard_artifact":
-        return {
-            "should_create_dashboard_artifact": True,
-            "title": "Dashboard Artifact",
-            "metrics": [],
-            "sections": ["summary", "exceptions", "details"],
-            "data_needed": [],
-            "visual_direction": "Dense, readable internal operations dashboard.",
-            "fallback_plan": True,
-        }
-
-    if skill_name == "form_artifact":
-        return {
-            "should_create_form_artifact": True,
-            "title": "Interactive Form Artifact",
-            "inputs": [],
-            "outputs": [],
-            "data_needed": [],
-            "interaction_notes": "Client-side validation, calculated output, and reset behavior.",
-            "fallback_plan": True,
-        }
-
-    if SKILL_ALIASES.get(skill_name, {}).get("skill_format") == "markdown":
-        return {
-            "should_use_markdown_skill": True,
-            "skill_name": skill_name,
-            "reason": "The user explicitly requested or triggered this skill.",
-            "data_needed": [],
-            "output_mode": "answer",
-            "fallback_plan": True,
-        }
-
+def _find_column(columns, candidates: List[str]) -> Optional[str]:
+    normalized = {str(c).strip().lower().replace(" ", "").replace("_", ""): c for c in columns}
+    for candidate in candidates:
+        key = candidate.strip().lower().replace(" ", "").replace("_", "")
+        if key in normalized:
+            return normalized[key]
     return None
 
 
-async def _plan_single_skill(
-    client: AsyncOpenAI,
-    request: ChatRequest,
-    skill_name: str,
-    user_message: str,
-) -> tuple[str, str]:
-    """Plan one skill and return (skill_name, plan_json). Runs independently so callers can gather."""
-    builder = get_skill_builder(skill_name)
-    planning_fn = builder.get("planning")
-
-    if planning_fn is None:
-        return skill_name, "{}"
-
-    try:
-        if skill_name == "completeness_steps":
-            plan_result = await client.chat.completions.create(
-                model=request.model,
-                messages=[{"role": "user", "content": planning_fn(user_message)}],
-                temperature=0.2,
-                max_tokens=900,
-            )
-            plan_content = extract_message_content(plan_result.choices[0].message.content)
-            logger.info(f"Skill '{skill_name}' raw planning response: {repr(plan_content[:500])}")
-            completeness_plan = _parse_json_object(plan_content) or {
-                "goal": user_message,
-                "required_parameters": ["expectedRunDate", "inputConfigFilePath", "srcFilePath", "tgtFilePath"],
-                "selected_nodes": [],
-                "missing_information": []
-            }
-
-            if not isinstance(completeness_plan, dict) or "goal" not in completeness_plan:
-                logger.warning(f"Invalid completeness_plan for {skill_name}, using default")
-                completeness_plan = {
-                    "goal": user_message,
-                    "required_parameters": [],
-                    "selected_nodes": [],
-                    "missing_information": ["Failed to parse planning response"]
-                }
-
-            instruction_fn = builder.get("instruction")
-            if instruction_fn:
-                instruction_result = await client.chat.completions.create(
-                    model=request.model,
-                    messages=[{"role": "user", "content": instruction_fn(user_message, completeness_plan)}],
-                    temperature=0.2,
-                    max_tokens=2200,
-                )
-                instruction_content = extract_message_content(instruction_result.choices[0].message.content)
-                instruction_data = _parse_json_object(instruction_content)
-
-                if instruction_data:
-                    return skill_name, json.dumps({
-                        "plan": completeness_plan,
-                        "instructions": instruction_data,
-                        "markdown": _render_completeness_markdown(instruction_data)
-                    }, indent=2)
-                return skill_name, instruction_content
-        else:
-            planning_prompt = planning_fn(user_message)
-            logger.info(f"Skill '{skill_name}' planning prompt: {repr(planning_prompt[:300])}")
-            result = await client.chat.completions.create(
-                model=request.model,
-                messages=[{"role": "user", "content": planning_prompt}],
-                temperature=0.2,
-                max_tokens=1500,
-            )
-            plan_content = extract_message_content(result.choices[0].message.content)
-            logger.info(f"Skill '{skill_name}' raw planning response: {repr(plan_content[:500])}")
-            parsed_plan = _parse_json_object(plan_content)
-            logger.info(f"Skill '{skill_name}' parsed plan: {parsed_plan}")
-
-            if parsed_plan is None or not _validate_skill_plan(skill_name, parsed_plan):
-                logger.warning(f"Invalid or incomplete planning response for {skill_name}: {plan_content[:200] if plan_content else 'empty'}")
-                fallback_plan = _fallback_skill_plan(skill_name, user_message)
-                return skill_name, json.dumps(fallback_plan) if fallback_plan else "{}"
-            if parsed_plan.get("should_use_markdown_skill") is False:
-                logger.info(f"Skill '{skill_name}' planner declined this request")
-                return skill_name, "{}"
-            return skill_name, json.dumps(parsed_plan)
-
-    except Exception as e:
-        logger.error(f"Failed to run planning for skill '{skill_name}': {e}", exc_info=True)
-        fallback_plan = _fallback_skill_plan(skill_name, user_message)
-        return skill_name, json.dumps(fallback_plan) if fallback_plan else "{}"
-
-    return skill_name, "{}"
-
-
-async def run_skill_planning_turn(client: AsyncOpenAI, request: ChatRequest, user_message: str, skills: List[str]) -> Dict[str, str]:
-    """Run planning for all triggered skills concurrently."""
-    skills_with_planners = [s for s in skills if get_skill_builder(s).get("planning") is not None]
-    if not skills_with_planners:
-        return {}
-
-    results = await asyncio.gather(
-        *[_plan_single_skill(client, request, s, user_message) for s in skills_with_planners],
-        return_exceptions=True,
-    )
-
-    plans: Dict[str, str] = {}
-    for item in results:
-        if isinstance(item, Exception):
-            logger.error(f"Skill planning task raised an exception: {item}", exc_info=item)
-            continue
-        skill_name, plan_content = item
-        plans[skill_name] = plan_content
-
-    return plans
-
-
-def build_skill_system_messages(skill_plans: Dict[str, str]) -> List[Dict[str, str]]:
-    messages = []
-
-    for skill_name, plan_content in skill_plans.items():
-        logger.info(f"Building system message for skill '{skill_name}', plan_content: {repr(plan_content[:200] if plan_content else 'empty')}")
-        if not plan_content or plan_content == "{}":
-            logger.info(f"Skipping skill '{skill_name}' - empty plan")
-            continue
-
-        builder = get_skill_builder(skill_name)
-        system_fn = builder.get("system")
-
-        if system_fn is None:
-            logger.info(f"Skipping skill '{skill_name}' - no system_fn")
-            continue
-
+def _clean_row_dict(row: dict) -> dict:
+    cleaned = {}
+    for key, value in row.items():
         try:
-            parsed_plan = json.loads(plan_content)
-            logger.info(f"Calling system_fn for skill '{skill_name}' with parsed plan: {parsed_plan}")
-            system_prompt = system_fn(plan_content)
-            logger.info(f"Skill '{skill_name}' system prompt (first 200 chars): {repr(system_prompt[:200])}")
-            messages.append({"role": "system", "content": system_prompt})
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in skill plan for '{skill_name}': {e}, content: {repr(plan_content[:200])}")
-        except Exception as e:
-            logger.error(f"Failed to build system prompt for skill '{skill_name}': {e}")
-
-    return messages
+            is_null = value is None or (hasattr(value, "__class__") and str(value) == "nan")
+        except Exception:
+            is_null = value is None
+        cleaned[str(key)] = None if is_null else value
+    return cleaned
 
 
-def get_openai_api_key() -> str:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if api_key:
-        return api_key
-    raise HTTPException(status_code=500, detail="No API key configured. Set OPENAI_API_KEY.")
-
-
-def get_api_base_url() -> str:
-    custom_endpoint = os.environ.get("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1")
-    if custom_endpoint:
-        return custom_endpoint.rstrip("/")
-    return "https://api.openai.com/v1"
-
-
-_openai_client: Optional[AsyncOpenAI] = None
-
-
-def get_openai_client() -> AsyncOpenAI:
-    """Return the module-level AsyncOpenAI singleton, creating it on first call.
-
-    Reusing one client across requests preserves the connection pool and avoids
-    the overhead of TLS handshakes on every chat request.
-    """
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncOpenAI(
-            api_key=get_openai_api_key(),
-            base_url=get_api_base_url(),
-            timeout=120,
-        )
-    return _openai_client
-
-
-def extract_message_content(message_content: Any) -> str:
-    if isinstance(message_content, str):
-        return message_content
-
-    if isinstance(message_content, list):
-        text_parts = []
-        for item in message_content:
-            if isinstance(item, dict):
-                if item.get("type") == "text" and item.get("text"):
-                    text_parts.append(item["text"])
-                elif item.get("type") == "output" and item.get("output"):
-                    text_parts.append(item["output"])
-            else:
-                item_type = getattr(item, "type", None)
-                item_text = getattr(item, "text", None) or getattr(item, "output", None)
-                if item_type in ("text", "output") and item_text:
-                    text_parts.append(item_text)
-        return "".join(text_parts)
-
-    if hasattr(message_content, "content"):
-        content = message_content.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return extract_message_content(content)
-
-    return ""
-
-
-async def emit_sse_chunks(content: str):
-    for i in range(0, len(content), SSE_CHUNK_SIZE):
-        chunk_content = content[i:i + SSE_CHUNK_SIZE]
-        yield f"data: {json.dumps({'content': chunk_content})}\n\n"
-        await asyncio.sleep(0)
-
-
-def _should_enable_tools(requested_skills: List[str], skill_plans: Dict[str, str], user_message: str) -> bool:
-    if "tools" in requested_skills:
-        return True
-
-    # Some skills, like field_flow, need read_excel even when the user did not
-    # explicitly say "use tools".
-    if "field_flow" in requested_skills:
-        return True
-
-    if "xlsx" in requested_skills:
-        return True
-
-    tool_words = (
-        "read file", "write file", "read excel", "read xlsx", "spreadsheet",
-        "run command", "execute command", "shell", "grep", "glob",
-        "find files", "search files", "call api", "api call",
-    )
-    normalized = user_message.lower()
-    if any(word in normalized for word in tool_words):
-        return True
-
-    for plan_content in skill_plans.values():
-        plan = _parse_json_object(plan_content)
-        if not plan:
-            continue
-        if plan.get("should_use_tools") or plan.get("excel_file"):
-            return True
-        if plan.get("skill_name") == "xlsx":
-            return True
-        if plan.get("skill_name") == "web-artifacts-builder" and plan.get("output_mode") in ("tool_use", "file_artifact"):
-            return True
-
-    return False
-
-
-def _tool_call_to_message(tool_call: Any) -> Dict[str, Any]:
-    return {
-        "id": tool_call.id,
-        "type": "function",
-        "function": {
-            "name": tool_call.function.name,
-            "arguments": tool_call.function.arguments or "{}",
-        },
-    }
-
-
-def _parse_tool_arguments(raw_arguments: str) -> Dict[str, Any]:
-    if not raw_arguments:
-        return {}
+async def _exec_locate_excel_file(confirmed_params: dict, prior_results: dict):
+    """Resolve the user workbook path through the configured secure workspace."""
+    file_path = (confirmed_params.get("file_path") or confirmed_params.get("config_file_path") or "").strip()
+    if not file_path:
+        return "error", "file_path is required"
 
     try:
-        parsed = json.loads(raw_arguments)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        parsed = _parse_json_object(raw_arguments)
-        return parsed or {}
+        path = _secure_path(file_path)
+    except ValueError as exc:
+        return "error", str(exc)
 
-
-def _tool_call_label(tool_name: str, tool_args: Dict[str, Any]) -> str:
-    """Return a human-readable status label for a tool call."""
-    if tool_name == "read":
-        return f"Reading file: {tool_args.get('filePath', '')}"
-    if tool_name == "write":
-        return f"Writing file: {tool_args.get('filePath', '')}"
-    if tool_name == "read_excel":
-        return f"Reading Excel: {tool_args.get('filePath', '')}"
-    if tool_name == "write_excel":
-        return f"Writing Excel: {tool_args.get('filePath', '')}"
-    if tool_name == "shell":
-        cmd = tool_args.get('command', '')
-        return f"Running command: {cmd[:60]}{'…' if len(cmd) > 60 else ''}"
-    if tool_name == "glob":
-        return f"Searching files: {tool_args.get('pattern', '')}"
-    if tool_name == "grep":
-        return f"Searching for: {tool_args.get('pattern', '')}"
-    if tool_name == "api_call":
-        return f"Calling API: {tool_args.get('method', 'GET')} {tool_args.get('endpoint', '')}"
-    return f"Running tool: {tool_name}"
-
-
-async def run_tool_enabled_chat(
-    client: AsyncOpenAI,
-    request: ChatRequest,
-    provider_messages: List[Dict[str, Any]],
-    workspace_path: Optional[Path] = None,
-):
-    """Async generator yielding tool_call status events and a final content event.
-
-    Budget is tracked in tool calls consumed, not turns taken.  A turn that
-    makes 5 parallel calls costs 5 units; a turn with 1 call costs 1 unit.
-    When the budget hits zero the loop stops after completing the current
-    batch — we never abandon in-flight calls — and forces a final response.
-    """
-    messages = list(provider_messages)
-    usage_acc: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    calls_remaining = MAX_TOOL_CALLS
-    budget_exhausted = False
-    turn = 0
-
-    while calls_remaining > 0:
-        turn += 1
-        result = await client.chat.completions.create(
-            model=request.model,
-            messages=messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",
-        )
-        _accumulate_usage(usage_acc, result.usage)
-        choice = result.choices[0]
-        message = choice.message
-        tool_calls = message.tool_calls or []
-
-        logger.info(
-            "Tool chat turn %d: finish_reason=%s tool_calls=%d calls_remaining=%d",
-            turn, choice.finish_reason, len(tool_calls), calls_remaining,
-        )
-
-        if not tool_calls:
-            # Model finished naturally — no budget prompt needed.
-            yield {"type": "final", "content": extract_message_content(message.content), "usage": usage_acc}
-            return
-
-        messages.append({
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": [_tool_call_to_message(tc) for tc in tool_calls],
-        })
-
-        # Parse args once; emit all labels immediately so the frontend shows
-        # every pending tool before any of them starts executing.
-        parsed_calls = [
-            (tc, tc.function.name, _parse_tool_arguments(tc.function.arguments))
-            for tc in tool_calls
-        ]
-        for tc, name, targs in parsed_calls:
-            yield {"type": "tool_call", "tool": name, "label": _tool_call_label(name, targs)}
-
-        # Execute all tools in this batch concurrently.
-        async def _run_tool(tc, name, targs):
-            logger.info("Executing tool '%s' with args: %s", name, targs)
-            tool_result = await execute_tool(name, targs, workspace_path=workspace_path)
-            logger.info("Tool '%s' result preview: %s", name, tool_result[:200])
-            return tc.id, tool_result
-
-        tool_results = await asyncio.gather(
-            *[_run_tool(tc, name, targs) for tc, name, targs in parsed_calls]
-        )
-
-        for call_id, tool_result in tool_results:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": tool_result,
-            })
-
-        # Deduct after completing the batch so we never abandon in-flight calls.
-        calls_remaining -= len(tool_calls)
-        if calls_remaining <= 0:
-            budget_exhausted = True
-            logger.warning(
-                "Tool call budget exhausted after %d call(s) across %d turn(s) — forcing final response",
-                MAX_TOOL_CALLS, turn,
-            )
-            break
-
-    # Only reached when the budget ran out while the model was still calling tools.
-    # budget_exhausted=False here means MAX_TOOL_CALLS=0 — skip the hint entirely.
-    final_messages = list(messages)
-    if budget_exhausted:
-        final_messages.append({
-            "role": "system",
-            "content": "Tool call budget exhausted. Summarize the available tool results and clearly mention anything still missing.",
-        })
-
-    result = await client.chat.completions.create(
-        model=request.model,
-        messages=final_messages,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-    )
-    _accumulate_usage(usage_acc, result.usage)
-    yield {"type": "final", "content": extract_message_content(result.choices[0].message.content), "usage": usage_acc}
-
-
-async def judge_response(
-    user_message: str,
-    ai_response: str,
-    criteria_template: str = DEFAULT_CRITERIA_TEMPLATE,
-    model: str = JUDGMENT_MODEL
-) -> Optional[Dict[str, Any]]:
-    if not JUDGMENT_ENABLED:
-        return None
-
-    if criteria_template not in CRITERIA_TEMPLATES:
-        criteria_template = DEFAULT_CRITERIA_TEMPLATE
-
-    criteria = CRITERIA_TEMPLATES[criteria_template]
-    criteria_list = "\n".join([f"- {c}" for c in criteria["criteria"]])
-
-    judge_prompt = f"""You are an expert evaluator. Judge the following AI response based on these criteria:
-
-{criteria_list}
-
-User's Question:
-{user_message}
-
-AI Response to Judge:
-{ai_response}
-
-Provide your evaluation in JSON format:
-{{
-  "score": <0-100>,
-  "reasoning": "<brief explanation>",
-  "passed": <true if score >= 60, false otherwise>
-}}
-
-Be objective and fair. Consider the question's complexity when evaluating."""
-
-    try:
-        start_time = asyncio.get_running_loop().time()
-        client = get_openai_client()
-        result = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": judge_prompt}],
-            temperature=0.3,
-            max_tokens=500,
-        )
-        content = extract_message_content(result.choices[0].message.content)
-
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-
-        judgment = json.loads(content.strip())
-
-        duration_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
-        judgment["judge_model"] = model
-        judgment["judgment_duration_ms"] = duration_ms
-
-        logger.info(f"Judged response: score={judgment.get('score')}, passed={judgment.get('passed')}")
-        return judgment
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse judgment JSON: {str(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"Judgment error: {str(e)}")
-        return None
-
-
-def _estimate_tokens(messages: List[Message]) -> int:
-    """Rough token estimate: 1 token ≈ 4 characters (good enough for threshold checks)."""
-    return sum(len(m.content) for m in messages) // 4
-
-
-async def _compact_messages(
-    client: AsyncOpenAI,
-    model: str,
-    messages: List[Message],
-) -> tuple[List[Message], bool]:
-    """Summarise older messages when estimated tokens exceed COMPACTION_THRESHOLD.
-
-    Returns (messages, was_compacted).  The oldest messages are replaced with a
-    single system-role summary; recent messages are kept verbatim so the model
-    retains immediate context.
-    """
-    estimated = _estimate_tokens(messages)
-    threshold = int(CONTEXT_MAX_TOKENS * COMPACTION_THRESHOLD)
-
-    if estimated <= threshold:
-        return messages, False
-
-    # Work out how many recent messages fit inside the target budget.
-    target_chars = int(CONTEXT_MAX_TOKENS * COMPACTION_TARGET) * 4
-    recent: List[Message] = []
-    chars_kept = 0
-    for msg in reversed(messages):
-        msg_len = len(msg.content)
-        if chars_kept + msg_len <= target_chars:
-            recent.insert(0, msg)
-            chars_kept += msg_len
-        else:
-            break
-
-    to_summarise = messages[: len(messages) - len(recent)]
-    if not to_summarise:
-        return messages, False
-
-    history_text = "\n\n".join(
-        f"{m.role.upper()}: {m.content}" for m in to_summarise
-    )
-
-    logger.info(
-        "Compacting %d messages (~%d estimated tokens, threshold %d). Keeping %d recent.",
-        len(to_summarise), estimated, threshold, len(recent),
-    )
-
-    try:
-        summary_result = await client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Summarise the following conversation history. "
-                    "Preserve key facts, file paths, errors, decisions, and any "
-                    "context needed to continue the conversation. Be concise.\n\n"
-                    + history_text
-                ),
-            }],
-            temperature=0.1,
-            max_tokens=600,
-        )
-        summary_text = extract_message_content(summary_result.choices[0].message.content)
-    except Exception as e:
-        logger.error("Compaction summary call failed: %s — skipping compaction", e)
-        return messages, False
-
-    summary_msg = Message(
-        role="system",
-        content=f"[Earlier conversation compacted — summary]\n{summary_text}",
-    )
-
-    logger.info("Compaction complete. %d → 1 summary + %d recent messages.", len(to_summarise), len(recent))
-    return [summary_msg] + recent, True
-
-
-def _accumulate_usage(acc: Dict[str, int], usage) -> None:
-    """Add provider usage counters into a running total dict."""
-    if not usage:
-        return
-    acc["prompt_tokens"]     += getattr(usage, "prompt_tokens",     0) or 0
-    acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-    acc["total_tokens"]      += getattr(usage, "total_tokens",      0) or 0
-
-
-def _trim_messages(messages: List[Message]) -> List[Message]:
-    """Keep only the most recent MAX_HISTORY_MESSAGES to avoid exceeding token limits."""
-    if len(messages) <= MAX_HISTORY_MESSAGES:
-        return messages
-    trimmed = len(messages) - MAX_HISTORY_MESSAGES
-    logger.info("Trimming %d old message(s) from history (keeping last %d)", trimmed, MAX_HISTORY_MESSAGES)
-    return messages[-MAX_HISTORY_MESSAGES:]
-
-
-async def stream_chat_response(request: ChatRequest):
-    full_response = ""
-    user_message = ""
-
-    try:
-        client = get_openai_client()
-
-        for msg in reversed(request.messages):
-            if msg.role == "user":
-                user_message = msg.content
-                break
-
-        requested_skills = detect_requested_skills(request, user_message)
-
-        logger.info(
-            "AI Chat request: model=%s temp=%s messages=%d env=%s skills=%s",
-            request.model, request.temperature, len(request.messages),
-            request.environment, requested_skills,
-        )
-
-        skill_plans = await run_skill_planning_turn(client, request, user_message, requested_skills) if requested_skills else {}
-        skill_system_messages = build_skill_system_messages(skill_plans)
-
-        compacted_messages, was_compacted = await _compact_messages(client, request.model, request.messages)
-        trimmed_messages = _trim_messages(compacted_messages)
-
-        workspace_path = ensure_user_workspace(request.user_id) if request.user_id else None
-        system_content = build_default_skill_system_prompt(requested_skills or None)
-        if workspace_path:
-            system_content += f"\n\nWorkspace: {workspace_path}. Use relative file paths for all file operations."
-
-        rag_kb = get_rag_kb()
-        rag_chunks = await rag_kb.async_search(user_message, top_k=3)
-        if rag_chunks:
-            rag_context = rag_kb.format_context(rag_chunks)
-            system_content = rag_context + "\n\n" + system_content
-            logger.info("RAG: injected %d chunk(s) for query: %s", len(rag_chunks), user_message[:80])
-
-        provider_messages = [
-            {"role": "system", "content": system_content},
-            *skill_system_messages,
-            *[{"role": m.role, "content": m.content} for m in trimmed_messages]
-        ]
-
-        usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-        if _should_enable_tools(requested_skills, skill_plans, user_message):
-            async for event in run_tool_enabled_chat(client, request, provider_messages, workspace_path=workspace_path):
-                if event["type"] == "tool_call":
-                    yield f"data: {json.dumps({'tool_call': event['tool'], 'tool_label': event['label']})}\n\n"
-                elif event["type"] == "final":
-                    full_response = event["content"]
-                    event_usage = event.get("usage") or {}
-                    usage["prompt_tokens"]     = event_usage.get("prompt_tokens", 0)
-                    usage["completion_tokens"] = event_usage.get("completion_tokens", 0)
-                    usage["total_tokens"]      = event_usage.get("total_tokens", 0)
-        else:
-            result = await client.chat.completions.create(
-                model=request.model,
-                messages=provider_messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
-            full_response = extract_message_content(result.choices[0].message.content)
-            _accumulate_usage(usage, result.usage)
-
-        if not full_response:
-            logger.warning("AI provider returned an empty response")
-            yield f"data: {json.dumps({'error': 'Empty response from AI provider'})}\n\n"
-            return
-
-        async for chunk in emit_sse_chunks(full_response):
-            yield chunk
-
-        yield f"data: {json.dumps({'done': True, 'usage': usage, 'compacted': was_compacted})}\n\n"
-
-        # Sample judgments — running on every response doubles API cost for no extra signal.
-        if JUDGMENT_ENABLED and full_response and user_message and random.random() < JUDGMENT_SAMPLE_RATE:
-            asyncio.create_task(
-                _silent_judge_and_save(
-                    user_message=user_message,
-                    ai_response=full_response,
-                    model=request.model,
-                    temperature=request.temperature,
-                    environment=request.environment,
-                )
-            )
-
-    except HTTPException as e:
-        yield f"data: {json.dumps({'error': e.detail})}\n\n"
-    except Exception as e:
-        logger.error(f"AI Chat error: {str(e)}")
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-
-async def _silent_judge_and_save(
-    user_message: str,
-    ai_response: str,
-    model: str,
-    temperature: float,
-    environment: str = "dev",
-):
-    try:
-        from .judgment_service import JudgmentService
-        import time
-
-        judgment = await judge_response(
-            user_message=user_message,
-            ai_response=ai_response,
-            criteria_template=DEFAULT_CRITERIA_TEMPLATE,
-            model=JUDGMENT_MODEL
-        )
-
-        if judgment:
-            judgment_data = {
-                "judgment_id": f"judgment-{int(time.time())}-{os.urandom(4).hex()}",
-                "chat_id": "unknown",
-                "message_id": "unknown",
-                "timestamp": datetime.now().isoformat() + "Z",
-                "model_used": model,
-                "criteria_template": DEFAULT_CRITERIA_TEMPLATE,
-                "criteria_list": CRITERIA_TEMPLATES[DEFAULT_CRITERIA_TEMPLATE]["criteria"],
-                "user_message": user_message,
-                "ai_response": ai_response,
-                "judgment": judgment,
-                "metadata": {
-                    "temperature": temperature,
-                    "response_length": len(ai_response),
-                    "user_id": "anonymous",
-                    "environment": environment,
-                }
-            }
-            JudgmentService.save_judgment(judgment_data)
-            logger.info(f"Silently judged and saved: score={judgment.get('score')}")
-
-    except Exception as e:
-        logger.error(f"Silent judgment failed: {str(e)}")
-
-
-@router.post("/chat")
-async def chat(request: ChatRequest):
-    return StreamingResponse(
-        stream_chat_response(request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-
-@router.get("/models")
-async def get_available_models():
-    models = [
-        {"id": "minimax/minimax-m2.5:free", "name": "Minimax", "description": "Fast and cost-effective"}
-    ]
-    return {"models": models}
-
-
-@router.get("/skills")
-async def get_available_skills():
-    return {
-        "skills": [
-            {
-                "id": skill_name,
-                "name": config["name"],
-                "description": config["description"],
-                "triggers": list(config["triggers"]),
-                "skill_format": config.get("skill_format", "toml"),
-                "source_file": config.get("source_file")
-            }
-            for skill_name, config in SKILL_ALIASES.items()
-        ]
-    }
-
-
-@router.get("/tools")
-async def get_available_tools():
-    return {"tools": TOOL_DEFINITIONS}
-
-
-@router.get("/health")
-async def health_check():
-    try:
-        has_openai_key = bool(os.environ.get("OPENAI_API_KEY"))
-        return {
-            "status": "healthy" if has_openai_key else "not_configured",
-            "providers": {
-                "openai": has_openai_key,
-                "base_url": get_api_base_url()
-            }
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-__________________________________
-
-"""
-RAG knowledge base for ControlDash AI Assistant.
-
-Search pipeline
----------------
-1. Keyword pre-filter  (BM25-lite, always runs, zero cost)
-   → top RAG_KEYWORD_PRE_K candidates
-2. Embedding re-rank   (optional, configured via env var)
-   → cosine similarity, returns top_k final results
-
-Embedding providers (set RAG_EMBEDDING_PROVIDER):
-  "keyword_only"         – default, no embeddings (steps 1 only)
-  "openrouter"           – OpenAI-compatible embeddings API (OpenRouter)
-  "sentence_transformer" – local model, zero API cost, runs on CPU
-
-OpenRouter / OpenAI provider env vars:
-  OPENAI_API_KEY         (shared with ai_assistant.py)
-  OPENAI_API_BASE_URL    (shared with ai_assistant.py)
-  RAG_EMBEDDING_MODEL    default "text-embedding-ada-002"
-
-Sentence-transformer env vars:
-  RAG_ST_MODEL           default "all-MiniLM-L6-v2"  (~90 MB, fast on CPU)
-
-Cache strategy
---------------
-Chunk embeddings are expensive to build (API calls or local inference).
-They are cached to disk keyed by:
-    SHA-256(source JSON bytes) + provider + model name
-
-Cache is invalidated automatically when rag_assist_system_prompt.json
-changes.  Old cache files are left on disk and cleaned up only when a
-new cache file is written (keeps the last two versions).
-
-Cache location: RAG_CACHE_DIR env var
-  default: <repo-root>/api/.rag_cache/
-"""
-
-import asyncio
-import hashlib
-import json
-import logging
-import os
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
-
-# ── Paths & config ────────────────────────────────────────────────────────────
-RAG_JSON_PATH = (
-    Path(__file__).resolve().parent.parent.parent / "rag_assist_system_prompt.json"
-)
-_DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / ".rag_cache"
-RAG_CACHE_DIR = Path(os.environ.get("RAG_CACHE_DIR", str(_DEFAULT_CACHE_DIR)))
-
-EMBEDDING_PROVIDER    = os.environ.get("RAG_EMBEDDING_PROVIDER", "keyword_only")
-OPENROUTER_EMBED_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "text-embedding-ada-002")
-ST_MODEL_NAME         = os.environ.get("RAG_ST_MODEL", "all-MiniLM-L6-v2")
-KEYWORD_PRE_K         = int(os.environ.get("RAG_KEYWORD_PRE_K", "10"))
-
-# ── Chunker tuning ────────────────────────────────────────────────────────────
-MIN_KEYS        = 2
-MIN_CHUNK_CHARS = 250
-MAX_CHUNK_CHARS = 2200
-
-# ── Stop words ────────────────────────────────────────────────────────────────
-_STOP_WORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
-    "for", "from", "has", "have", "in", "is", "it", "its", "not", "of",
-    "on", "or", "that", "the", "this", "to", "was", "were", "which",
-    "with", "you", "your", "all", "any", "can", "each", "if", "may",
-    "must", "no", "set", "than", "then", "they", "true", "false", "null",
-    "none", "type", "use", "used", "via", "will", "format", "example",
-    "description", "required", "string", "array", "object", "integer",
-    "number", "boolean", "value", "field", "fields",
-}
-
-
-# ── Cosine similarity (numpy optional) ───────────────────────────────────────
-try:
-    import numpy as np
-
-    def _cosine_sim(a: List[float], b: List[float]) -> float:
-        va, vb = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
-        denom = np.linalg.norm(va) * np.linalg.norm(vb)
-        return float(np.dot(va, vb) / denom) if denom > 1e-10 else 0.0
-
-except ImportError:
-    def _cosine_sim(a: List[float], b: List[float]) -> float:
-        dot  = sum(x * y for x, y in zip(a, b))
-        mag  = (sum(x * x for x in a) ** 0.5) * (sum(x * x for x in b) ** 0.5)
-        return dot / mag if mag > 1e-10 else 0.0
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Embedding providers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class OpenRouterEmbeddingProvider:
-    """
-    OpenAI-compatible embeddings via OpenRouter (or any OpenAI endpoint).
-
-    Shares the same OPENAI_API_KEY / OPENAI_API_BASE_URL that ai_assistant.py
-    already uses, so no extra credentials are needed.
-
-    embed_batch() uses the *sync* OpenAI client so it can be called from a
-    thread-pool executor during cache-build without blocking the event loop.
-
-    embed_query_async() uses the *async* client for per-request calls.
-    """
-
-    def __init__(self) -> None:
-        self.model    = OPENROUTER_EMBED_MODEL
-        self.api_key  = os.environ.get(
-            "OPENAI_API_KEY",
-            "",
-        )
-        self.base_url = os.environ.get(
-            "OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1"
-        ).rstrip("/")
-        self._async_client = None
-
-    # ── sync (used in executor for cache build) ───────────────────────────────
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        from openai import OpenAI
-        client   = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=60)
-        response = client.embeddings.create(model=self.model, input=texts)
-        return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
-
-    # ── async (used at query time) ────────────────────────────────────────────
-    async def embed_query_async(self, query: str) -> List[float]:
-        from openai import AsyncOpenAI
-        if self._async_client is None:
-            self._async_client = AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=30
-            )
-        response = await self._async_client.embeddings.create(
-            model=self.model, input=[query]
-        )
-        return response.data[0].embedding
-
-
-class SentenceTransformerProvider:
-    """
-    Local embedding model via sentence-transformers.
-
-    The model is downloaded once to the HuggingFace cache (~90 MB for
-    all-MiniLM-L6-v2) and reused across restarts.  No API key required.
-    CPU inference is fast enough for <50 chunks.
-
-    Install:  pip install sentence-transformers
-    """
-
-    def __init__(self) -> None:
-        self.model_name = ST_MODEL_NAME
-        self._model     = None   # lazy-load on first use
-
-    def _get_model(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading SentenceTransformer model '%s' …", self.model_name)
-            self._model = SentenceTransformer(self.model_name)
-            logger.info("SentenceTransformer model loaded.")
-        return self._model
-
-    # ── sync (used in executor for cache build) ───────────────────────────────
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        model = self._get_model()
-        vecs  = model.encode(texts, batch_size=32, show_progress_bar=False)
-        return [v.tolist() for v in vecs]
-
-    # ── async (used at query time, runs model in thread pool) ─────────────────
-    async def embed_query_async(self, query: str) -> List[float]:
-        model  = self._get_model()
-        result = await asyncio.to_thread(
-            model.encode, [query], batch_size=1, show_progress_bar=False
-        )
-        return result[0].tolist()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Disk cache
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _source_hash() -> str:
-    """SHA-256 of the RAG JSON source file.  Changes → cache miss."""
-    if not RAG_JSON_PATH.exists():
-        return "missing"
-    return hashlib.sha256(RAG_JSON_PATH.read_bytes()).hexdigest()
-
-
-def _cache_path(source_hash: str) -> Path:
-    key = hashlib.sha256(
-        f"{source_hash}:{EMBEDDING_PROVIDER}:{OPENROUTER_EMBED_MODEL if EMBEDDING_PROVIDER == 'openrouter' else ST_MODEL_NAME}".encode()
-    ).hexdigest()[:20]
-    return RAG_CACHE_DIR / f"embeddings_{key}.json"
-
-
-def _load_cache(source_hash: str) -> Optional[Dict[str, List[float]]]:
-    path = _cache_path(source_hash)
     if not path.exists():
-        logger.info("RAG cache miss (no file at %s)", path)
-        return None
+        return "error", f"File not found: {file_path}"
+    if path.suffix.lower() not in (".xlsx", ".xlsm", ".xls"):
+        return "error", f"Unsupported config file type '{path.suffix}'. Use .xlsx, .xlsm, or .xls"
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("source_hash") != source_hash:
-            logger.info("RAG cache miss (source hash mismatch)")
-            return None
-        logger.info("RAG cache hit: loaded %d embeddings from %s", len(data["embeddings"]), path.name)
-        return data["embeddings"]   # {chunk_id: [floats]}
+        import pandas as pd
+        excel_file = pd.ExcelFile(path)
+        requested_sheet = (confirmed_params.get("sheet_name") or "FieldOperations").strip()
+        sheet_name = requested_sheet or ("FieldOperations" if "FieldOperations" in excel_file.sheet_names else excel_file.sheet_names[0])
+        if sheet_name not in excel_file.sheet_names:
+            return "error", f"Sheet '{sheet_name}' was not found. Available sheets: {excel_file.sheet_names}"
+        return "success", {"file_path": str(path), "sheet_name": sheet_name, "available_sheets": excel_file.sheet_names}
     except Exception as exc:
-        logger.warning("RAG cache read error (%s) — will rebuild", exc)
-        return None
+        logger.error("Locate Excel file error: %s", exc, exc_info=True)
+        return "error", str(exc)
 
+async def _exec_read_excel_config_row(step: dict, confirmed_params: dict, prior_results: dict):
+    """Read a row from the user-supplied Excel sheet by row number or NewFieldName."""
+    locate_result = prior_results.get("locate_config_file", {})
+    locate_value = locate_result.get("value", {}) if locate_result.get("status") == "success" else {}
+    file_path = locate_value.get("file_path") or confirmed_params.get("file_path") or confirmed_params.get("config_file_path")
+    sheet_name = locate_value.get("sheet_name") or confirmed_params.get("sheet_name") or step.get("sheet", "FieldOperations")
+    lookup_type = (confirmed_params.get("lookup_type") or "new_field_name").strip()
+    lookup_value = (confirmed_params.get("lookup_value") or "").strip()
 
-def _save_cache(source_hash: str, embeddings: Dict[str, List[float]]) -> None:
+    if not file_path:
+        return "error", "file_path is required"
+    if not lookup_value:
+        return "error", "lookup_value is required"
+
     try:
-        RAG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path = _cache_path(source_hash)
-        payload = {
-            "source_hash": source_hash,
-            "provider":    EMBEDDING_PROVIDER,
-            "model":       OPENROUTER_EMBED_MODEL if EMBEDDING_PROVIDER == "openrouter" else ST_MODEL_NAME,
-            "chunk_count": len(embeddings),
-            "embeddings":  embeddings,
-        }
-        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        logger.info("RAG cache saved: %d embeddings → %s", len(embeddings), path.name)
-        # clean up stale cache files (keep only the newest)
-        for old in RAG_CACHE_DIR.glob("embeddings_*.json"):
-            if old != path:
-                try:
-                    old.unlink()
-                    logger.debug("Removed stale cache file %s", old.name)
-                except OSError:
-                    pass
-    except Exception as exc:
-        logger.warning("RAG cache write error (%s) — search will still work", exc)
+        path = _secure_path(file_path)
+        import pandas as pd
 
+        df = pd.read_excel(path, sheet_name=sheet_name)
+        if df.empty:
+            return "error", f"Sheet '{sheet_name}' is empty"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Generic JSON chunker
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class RagChunk:
-    id: str
-    title: str            # human-readable breadcrumb
-    breadcrumb: List[str] # raw path segments from root
-    content: str          # "[Path: ...]\n\n<json>" — ready to inject
-    keywords: List[str] = field(default_factory=list)
-
-
-def _key_to_label(key: str) -> str:
-    s = re.sub(r'([A-Z])', r' \1', key)
-    return s.replace("_", " ").strip().title()
-
-
-def _breadcrumb_str(path: List[str]) -> str:
-    return " > ".join(_key_to_label(p) for p in path)
-
-
-def _chunk_id(path: List[str]) -> str:
-    return "__".join(re.sub(r'[^a-z0-9]', '_', p.lower()) for p in path) or "root"
-
-
-def _extract_tokens(obj: Any, depth: int = 3) -> List[str]:
-    tokens: List[str] = []
-    if depth <= 0:
-        return tokens
-    if isinstance(obj, str):
-        tokens += re.findall(r'[a-z][a-z0-9_]{2,}', obj.lower())
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            tokens += re.findall(r'[a-z][a-z0-9_]{2,}', k.lower())
-            tokens += _extract_tokens(v, depth - 1)
-    elif isinstance(obj, list):
-        for item in obj[:20]:
-            tokens += _extract_tokens(item, depth - 1)
-    return tokens
-
-
-def _make_keywords(path: List[str], obj: Any) -> List[str]:
-    all_tokens = [seg.lower() for seg in path] + _extract_tokens(obj)
-    filtered   = [t for t in all_tokens if t not in _STOP_WORDS and len(t) > 2]
-    seen: set  = set()
-    return [t for t in filtered if not (t in seen or seen.add(t))]  # type: ignore[func-returns-value]
-
-
-def _format_content(path: List[str], obj: Any) -> str:
-    breadcrumb = _breadcrumb_str(path) if path else "Root"
-    return f"[Path: {breadcrumb}]\n\n{json.dumps(obj, indent=2)}"
-
-
-def _is_chunkable(obj: Any, serialised: str) -> bool:
-    return isinstance(obj, dict) and (
-        len(obj) >= MIN_KEYS or len(serialised) >= MIN_CHUNK_CHARS
-    )
-
-
-def _chunk_node(obj: Any, path: List[str], out: List[RagChunk]) -> None:
-    """
-    Emit OR split — never both.
-      size > MAX  →  split into per-child chunks (recurse into children)
-      size ok     →  emit as one chunk (children captured inside the JSON)
-      too small   →  skip (absorbed into nearest parent chunk)
-    """
-    if not isinstance(obj, dict):
-        return
-    serialised = json.dumps(obj, indent=2)
-    if len(serialised) > MAX_CHUNK_CHARS:
-        for key, child in obj.items():
-            _chunk_node(child, path + [key], out)
-        return
-    if _is_chunkable(obj, serialised):
-        out.append(RagChunk(
-            id=_chunk_id(path),
-            title=_breadcrumb_str(path) if path else "Document Root",
-            breadcrumb=list(path),
-            content=_format_content(path, obj),
-            keywords=_make_keywords(path, obj),
-        ))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Knowledge base
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RagKnowledgeBase:
-    def __init__(self) -> None:
-        self.chunks: List[RagChunk] = []
-        # embeddings dict: chunk_id → float vector (None = not yet built)
-        self._embeddings: Optional[Dict[str, List[float]]] = None
-        self._embedding_lock = asyncio.Lock()
-        self._provider: Optional[Any] = None
-        self._source_hash: str = _source_hash()
-        self._load_chunks()
-        # Attempt a fast cache load at startup (sync, no API call)
-        if EMBEDDING_PROVIDER != "keyword_only":
-            cached = _load_cache(self._source_hash)
-            if cached is not None:
-                self._embeddings = cached
-
-    # ── Chunking ──────────────────────────────────────────────────────────────
-
-    def _load_chunks(self) -> None:
-        if not RAG_JSON_PATH.exists():
-            logger.warning("RAG JSON not found at %s", RAG_JSON_PATH)
-            return
-        try:
-            with open(RAG_JSON_PATH, encoding="utf-8") as fh:
-                data = json.load(fh)
-            _chunk_node(data, [], self.chunks)
-            logger.info("RAG: %d chunks loaded from %s", len(self.chunks), RAG_JSON_PATH.name)
-        except Exception as exc:
-            logger.error("RAG chunk load failed: %s", exc, exc_info=True)
-
-    # ── Provider factory ──────────────────────────────────────────────────────
-
-    def _get_provider(self):
-        if self._provider is None:
-            if EMBEDDING_PROVIDER == "openrouter":
-                self._provider = OpenRouterEmbeddingProvider()
-                logger.info("RAG embedding provider: OpenRouter (%s)", OPENROUTER_EMBED_MODEL)
-            elif EMBEDDING_PROVIDER == "sentence_transformer":
-                self._provider = SentenceTransformerProvider()
-                logger.info("RAG embedding provider: SentenceTransformer (%s)", ST_MODEL_NAME)
-        return self._provider
-
-    # ── Embedding build (sync, runs in executor) ──────────────────────────────
-
-    def _build_embeddings_sync(self) -> Dict[str, List[float]]:
-        """Build and cache chunk embeddings.  Always runs in a thread pool."""
-        cached = _load_cache(self._source_hash)
-        if cached is not None:
-            return cached
-
-        provider = self._get_provider()
-        if provider is None:
-            return {}
-
-        logger.info("RAG: building embeddings for %d chunks via %s …", len(self.chunks), EMBEDDING_PROVIDER)
-        texts = [c.content for c in self.chunks]
-        ids   = [c.id      for c in self.chunks]
-        vecs  = provider.embed_batch(texts)
-        result = dict(zip(ids, vecs))
-        _save_cache(self._source_hash, result)
-        return result
-
-    async def _ensure_embeddings(self) -> None:
-        """Guarantee embeddings are available; builds them if not cached."""
-        if self._embeddings is not None:
-            return
-        async with self._embedding_lock:
-            if self._embeddings is not None:   # double-check after acquiring lock
-                return
+        found_rows = []
+        if lookup_type == "row_number":
             try:
-                self._embeddings = await asyncio.to_thread(self._build_embeddings_sync)
-            except Exception as exc:
-                logger.error("RAG embedding build failed: %s — falling back to keyword-only", exc, exc_info=True)
-                self._embeddings = {}   # empty → no retry; keyword fallback used
+                row_idx = int(lookup_value) - 1
+            except ValueError:
+                return "error", f"Invalid row number: {lookup_value}"
+            if 0 <= row_idx < len(df):
+                row = _clean_row_dict(df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict())
+                row["_sheet"] = sheet_name
+                row["_row_number"] = row_idx + 1
+                row["_excel_row_number"] = row_idx + 2
+                found_rows.append(row)
+        else:
+            field_col = _find_column(
+                df.columns,
+                ["NewFieldName", "Newfieldname", "new_field_name", "OutputField", "Output Field", "FieldName", "Field Name"],
+            )
+            if not field_col:
+                return "error", f"No NewFieldName/OutputField-style column found in sheet '{sheet_name}'"
+            mask = df[field_col].astype(str).str.strip().str.lower() == lookup_value.lower()
+            for idx, row_data in df[mask].iterrows():
+                row = _clean_row_dict(row_data.where(row_data.notna(), other=None).to_dict())
+                row["_sheet"] = sheet_name
+                row["_row_number"] = idx + 1
+                row["_excel_row_number"] = idx + 2
+                row["_matched_column"] = field_col
+                found_rows.append(row)
 
-    # ── Keyword search (sync, always available) ───────────────────────────────
+        if not found_rows:
+            return "error", f"No rows found matching {lookup_type}='{lookup_value}' in sheet '{sheet_name}'"
 
-    def search(self, query: str, top_k: int = 3) -> List[RagChunk]:
-        """Pure keyword scoring — no embeddings, instant."""
-        if not self.chunks or not query:
-            return []
-        query_terms = set(re.findall(r'[a-z][a-z0-9_]{2,}', query.lower())) - _STOP_WORDS
-        if not query_terms:
-            return []
+        return "success", {
+            "file_path": str(path),
+            "sheet": sheet_name,
+            "rows": found_rows,
+            "total": len(found_rows),
+            "lookup": {lookup_type: lookup_value},
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Read Excel config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
 
-        scored: List[Tuple[float, RagChunk]] = []
-        for chunk in self.chunks:
-            kw_overlap   = len(query_terms & set(chunk.keywords))
-            title_hits   = sum(1 for t in query_terms if t in chunk.title.lower())
-            bc_overlap   = len(query_terms & {seg.lower() for seg in chunk.breadcrumb})
-            content_hits = min(sum(1 for t in query_terms if t in chunk.content.lower()), 10)
-            score = bc_overlap * 6 + title_hits * 5 + kw_overlap * 3 + content_hits
-            if score > 0:
-                scored.append((score, chunk))
 
-        scored.sort(key=lambda x: -x[0])
-        return [c for _, c in scored[:top_k]]
+def _formula_updates_for_columns(formula_config: dict, columns: List[str]) -> dict:
+    updates = {}
+    mapping = {
+        "operation_type": ["Operation", "Function"],
+        "new_field_name": ["NewFieldName", "Newfieldname", "new_field_name", "OutputField", "Output Field", "FieldName", "Field Name"],
+        "input_fields": ["Inputs", "Input", "InputField", "Input Field"],
+    }
+    for config_key, candidates in mapping.items():
+        column = _find_column(columns, candidates)
+        if column and formula_config.get(config_key) is not None:
+            updates[column] = formula_config[config_key]
 
-    # ── Hybrid search (async, used by ai_assistant.py) ────────────────────────
-
-    async def async_search(self, query: str, top_k: int = 3) -> List[RagChunk]:
-        """
-        Hybrid search:
-          1. Keyword pre-filter → KEYWORD_PRE_K candidates
-          2. Embedding re-rank  → top_k final results
-
-        Falls back to keyword-only if embeddings are unavailable.
-        """
-        candidates = self.search(query, top_k=KEYWORD_PRE_K)
-
-        if EMBEDDING_PROVIDER == "keyword_only" or not candidates:
-            return candidates[:top_k]
-
-        await self._ensure_embeddings()
-
-        if not self._embeddings:
-            logger.debug("RAG: no embeddings available — using keyword results")
-            return candidates[:top_k]
-
-        provider = self._get_provider()
-        if provider is None:
-            logger.warning("RAG: no embedding provider configured for '%s' — using keyword results", EMBEDDING_PROVIDER)
-            return candidates[:top_k]
-
+    params = formula_config.get("operation_params") or {}
+    if isinstance(params, str):
         try:
-            query_emb = await provider.embed_query_async(query)
-        except Exception as exc:
-            logger.warning("RAG query embedding failed (%s) — using keyword results", exc)
-            return candidates[:top_k]
+            params = json.loads(params)
+        except Exception:
+            params = {}
+    if isinstance(params, dict):
+        for key, value in params.items():
+            column = _find_column(columns, [key])
+            if column:
+                updates[column] = value
+        formula_column = _find_column(columns, ["Formula", "FormulaString", "Formula String"])
+        if formula_column and params.get("formulastring") is not None:
+            updates[formula_column] = params["formulastring"]
 
-        scored: List[Tuple[float, RagChunk]] = []
-        for chunk in candidates:
-            chunk_emb = self._embeddings.get(chunk.id)
-            if chunk_emb is None:
+    return updates
+
+
+async def _exec_rewrite_excel_config_row(step: dict, confirmed_params: dict, prior_results: dict):
+    """Optionally rewrite the analysed row in the same workbook and sheet."""
+    if not _truthy(confirmed_params.get("apply_changes")):
+        return "skipped", "apply_changes is not enabled; workbook was not modified"
+
+    formula_step_id = step.get("formula_step_id", "analyse_formula")
+    row_step_id = step.get("row_step_id", "read_field_mapping")
+    validator_step_id = step.get("validator_step_id", "execute_transform")
+    formula_prior = prior_results.get(formula_step_id, {})
+    row_prior = prior_results.get(row_step_id, {})
+    validator_prior = prior_results.get(validator_step_id, {})
+    if formula_prior.get("status") != "success":
+        return "error", f"Formula step '{formula_step_id}' did not succeed"
+    if row_prior.get("status") != "success":
+        return "error", f"Row step '{row_step_id}' did not succeed"
+    if validator_prior.get("status") != "success":
+        return "skipped", f"Validator step '{validator_step_id}' did not succeed; workbook was not modified"
+
+    row_value = row_prior.get("value", {})
+    rows = row_value.get("rows", []) if isinstance(row_value, dict) else []
+    if len(rows) != 1:
+        return "error", f"Expected exactly one row to update, found {len(rows)}"
+
+    formula_config = formula_prior.get("value", {})
+    if not isinstance(formula_config, dict):
+        return "error", "Formula config is not a JSON object"
+
+    try:
+        from openpyxl import load_workbook
+
+        path = _secure_path(row_value.get("file_path") or confirmed_params.get("file_path") or confirmed_params.get("config_file_path"))
+        sheet_name = row_value.get("sheet") or confirmed_params.get("sheet_name") or "FieldOperations"
+        target_row = int(rows[0].get("_excel_row_number") or (int(rows[0]["_row_number"]) + 1))
+
+        workbook = load_workbook(path)
+        if sheet_name not in workbook.sheetnames:
+            return "error", f"Sheet '{sheet_name}' was not found in workbook"
+        sheet = workbook[sheet_name]
+        headers = [sheet.cell(row=1, column=col).value for col in range(1, sheet.max_column + 1)]
+        updates = _formula_updates_for_columns(formula_config, [str(h) for h in headers if h])
+        if not updates:
+            return "skipped", "No matching workbook columns found for the generated formula config"
+
+        changed = {}
+        for col_idx, header in enumerate(headers, start=1):
+            if header not in updates:
                 continue
-            sim = _cosine_sim(query_emb, chunk_emb)
-            scored.append((sim, chunk))
+            old_value = sheet.cell(row=target_row, column=col_idx).value
+            new_value = updates[header]
+            if isinstance(new_value, (dict, list)):
+                new_value = json.dumps(new_value, default=str)
+            if old_value != new_value:
+                sheet.cell(row=target_row, column=col_idx).value = new_value
+                changed[str(header)] = {"old": old_value, "new": new_value}
 
-        scored.sort(key=lambda x: -x[0])
-        logger.debug(
-            "RAG hybrid: top scores %s",
-            [(round(s, 3), c.id) for s, c in scored[:top_k]],
-        )
-        return [c for _, c in scored[:top_k]]
+        if not changed:
+            return "skipped", "Generated config matches the workbook row; no changes written"
 
-    # ── Context formatter ─────────────────────────────────────────────────────
-
-    def format_context(self, chunks: List[RagChunk]) -> str:
-        if not chunks:
-            return ""
-        parts = ["[ControlDash Knowledge Base - Retrieved Context]"]
-        for chunk in chunks:
-            parts.append(f"\n### {chunk.title}\n{chunk.content}")
-        return "\n\n".join(parts)
-
-    # ── Debug helper ──────────────────────────────────────────────────────────
-
-    def debug_chunks(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "id":             c.id,
-                "title":          c.title,
-                "breadcrumb":     c.breadcrumb,
-                "keywords_count": len(c.keywords),
-                "content_chars":  len(c.content),
-                "has_embedding":  c.id in (self._embeddings or {}),
-            }
-            for c in self.chunks
-        ]
+        workbook.save(path)
+        return "success", {"written_to": str(path), "sheet": sheet_name, "excel_row_number": target_row, "changed": changed}
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Rewrite Excel config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
 
 
-# ── Singleton ─────────────────────────────────────────────────────────────────
+---------------------------------
+    elif ft == "locate_excel_file":
+        return await _exec_locate_excel_file(confirmed_params, prior_results)
+    elif ft == "read_excel_config_row":
+        return await _exec_read_excel_config_row(step, confirmed_params, prior_results)
+    elif ft == "read_config_row":
+        return await _exec_read_config_row(step, confirmed_params, prior_results)
+    elif ft == "rewrite_excel_config_row":
+        return await _exec_rewrite_excel_config_row(step, confirmed_params, prior_results)
+----------------------------------------
 
-_rag_kb: Optional[RagKnowledgeBase] = None
+  - id: field_mapping_analyser
+    name: "Field Mapping Formula Analyser"
+    description: "Look up a FieldOperations formula row by row number or field name — the LLM reads it, understands it, generates a corrected version, tests it, and summarises."
+    icon: "📋"
 
+    intent_classification:
+      examples:
+        - "read row 5 from field operations"
+        - "analyse the formula for extracted_year in field mapping"
+        - "look up the field operations formula for risk_score"
+        - "check the field mapping formula at row 12"
+        - "understand the formula for output_amount in fieldoperations"
+        - "analyse and improve the formula for customer_id"
+        - "find and test the formula for new_field balance_flag"
+        - "read row 3 from fieldoperations and test it"
+        - "what does the formula for status_label do"
+        - "analyse the fieldmapping formula for account_type"
+      keywords:
+        - field mapping
+        - field operations
+        - fieldmapping
+        - fieldoperations
+        - formula row
+        - analyse formula
+        - read formula
+        - lookup formula
+        - row from field
+        - field formula
+        - field operations row
+        - row number formula
 
-def get_rag_kb() -> RagKnowledgeBase:
-    global _rag_kb
-    if _rag_kb is None:
-        _rag_kb = RagKnowledgeBase()
-    return _rag_kb
-__________________________________________
+    params:
+      - key: file_path
+        label: "Config Excel File Path"
+        type: text
+        required: true
+        description: "Absolute path to the user's Excel config file inside the secure workflow workspace"
+        example: "/opt/configs/qa_config.xlsx"
 
-________
+      - key: sheet_name
+        label: "Sheet Name"
+        type: text
+        required: false
+        description: "Excel sheet to read and optionally update. Defaults to FieldOperations."
+        example: "FieldOperations"
 
-[OPEN — 10 seconds]
+      - key: lookup_type
+        label: "Look Up By"
+        type: select
+        required: true
+        options:
+          - new_field_name
+          - row_number
+        description: "Find the row by its output field name, or by its row number in the sheet"
+        example: "new_field_name"
 
-"This is our in-house AI Assistant, built directly into the Control Dashboard. It's not a generic chatbot — it understands our reconciliation framework, our data, and our processes through a curated internal knowledge base."
+      - key: lookup_value
+        label: "Field Name or Row Number"
+        type: text
+        required: true
+        description: "The NewFieldName value (e.g. extracted_year) or row number (e.g. 5)"
+        example: "extracted_year"
 
-[DEMO PROMPT 1 — 30 seconds]
+      - key: control_type
+        label: "Control Type (optional)"
+        type: select
+        required: false
+        options:
+          - QA
+          - COMP
+        description: "Filter to a specific control type — leave blank to search all"
+        example: "QA"
 
-Type into the chat:
+      - key: sample_data
+        label: "Sample Data (optional JSON array)"
+        type: textarea
+        required: false
+        description: "Test rows to run against the formula. Leave blank for LLM-generated test data."
+        example: '[{"trade_date": "2024-01-15", "amount": 200.5}]'
 
-"Summarize what the completeness control does and when it should be used."
+      - key: apply_changes
+        label: "Rewrite Workbook Row?"
+        type: select
+        required: false
+        options:
+          - "no"
+          - "yes"
+        description: "Set to yes only when the generated formula should be written back to the same row in the same sheet."
+        example: "no"
 
-While it responds:
+    steps:
+      - id: locate_config_file
+        name: "Locate Secure Config Workbook"
+        function_type: locate_excel_file
+        description: "Resolves and verifies the user-supplied Excel file path against the configured secure workspace"
 
-"Notice it answers from our own knowledge base — we've documented our internal processes and embedded them directly into the assistant, so it gives accurate, context-aware answers rather than generic responses from the internet."
+      - id: read_field_mapping
+        name: "Read FieldOperations Row"
+        function_type: read_excel_config_row
+        sheet: FieldOperations
+        description: "Reads the requested row from the selected Excel sheet by row number or NewFieldName/OutputField"
 
-[DEMO PROMPT 2 — 40 seconds]
+      - id: analyse_formula
+        name: "Understand, Improve & Generate Tests"
+        function_type: llm_build_formula_from_row
+        source_step_id: read_field_mapping
+        description: "LLM reads the existing row, understands the transform, proposes a corrected config if needed, and creates test rows"
 
-Type into the chat:
+      - id: execute_transform
+        name: "Validate Candidate Formula"
+        function_type: transform_execute_from_prior
+        formula_step_id: analyse_formula
+        description: "Runs the generated candidate formula and test cases through the transform engine"
 
-"What are the most common failure reasons in a data reconciliation run?"
+      - id: rewrite_field_mapping
+        name: "Optionally Rewrite Original Row"
+        function_type: rewrite_excel_config_row
+        row_step_id: read_field_mapping
+        formula_step_id: analyse_formula
+        validator_step_id: execute_transform
+        description: "If apply_changes is yes and there are changes, writes the candidate formula back to the same workbook row"
 
-While it responds:
+      - id: summarize
+        name: "Summarise Analysis"
+        function_type: llm_summarize
+        description: "Explains the original formula, improvements made, and test results"
+        prompt_template: >
+          A FieldOperations formula row was retrieved and analysed.
 
-"Every response is streamed in real time — no waiting for a full round-trip. The assistant draws from our structured knowledge base, keeping answers consistent and controlled. We decide what it knows and what it doesn't."
+          Workbook lookup:
+          {{locate_config_file.result}}
 
-[DEMO PROMPT 3 — 40 seconds]
+          Original row from FieldOperations config:
+          {{read_field_mapping.result}}
 
-Type into the chat:
+          Candidate formula config and generated test cases:
+          {{analyse_formula.result}}
 
-"How do I add a new control to the system?"
+          Transform validator results:
+          {{execute_transform.result}}
 
-While it responds:
+          Workbook rewrite result:
+          {{rewrite_field_mapping.result}}
 
-"This is where the business value is clearest. A new analyst would spend 2–3 hours reading documentation or asking a senior. With this, they get a precise, step-by-step answer in 10 seconds. Multiply that by your team size and onboarding cycles — that's real time recovered."
-
-[SAVINGS ANGLE — 25 seconds]
-
-"Three concrete savings:
-
-One — Analyst onboarding time drops significantly. The assistant knows the system end-to-end.
-
-Two — No external AI subscription needed. This runs on our own infrastructure with a controlled, curated knowledge base — we own the content and the cost.
-
-Three — Reduces escalations to senior staff for routine questions, freeing them for higher-value work."
-
-[CLOSE — 15 seconds]
-
-"It's already live and permission-gated — only authorized users see it. We control what it knows, what it can answer, and we log every interaction for audit. It's production-ready today."
+          Please:
+          1. Show the original formula row as a table
+          2. Explain in plain English what the formula does
+          3. Show the candidate formula config in a JSON code block and note any changes versus the original row
+          4. Show the generated test cases and before/after validator results
+          5. State whether the Excel workbook was modified, including file path, sheet, row number, and changed columns when applicable
+          6. Flag any issues found in the original or edge cases to watch
