@@ -1,0 +1,58 @@
+"""
+Executor: config_search
+"""
+import logging
+from typing import List
+
+from ..registry import executor
+from ..utils import ensure_api_root_on_path
+
+logger = logging.getLogger(__name__)
+
+
+@executor("config_search")
+async def _exec_config_search(step, confirmed_params, prior_results, **ctx):
+    ensure_api_root_on_path()
+    try:
+        from routers.config_search import (
+            _run_parquet_subprocess,
+            get_available_types,
+            get_file_path,
+        )
+
+        query = (confirmed_params.get("query") or "").strip()
+        sheet_filter = (confirmed_params.get("sheet") or "").strip()
+        type_filter = (confirmed_params.get("control_type") or "").strip()
+
+        if not query:
+            return "error", "Search query is required"
+
+        available_sheets = ["InputFiles", "rules", "Enrichment", "FieldOperations", "OutputRule"]
+        sheets_to_search = [sheet_filter] if sheet_filter else available_sheets
+        types_to_search = [type_filter] if type_filter else get_available_types()
+
+        results_all: List[dict] = []
+        for type_name in types_to_search:
+            for sheet_name in sheets_to_search:
+                file_path = get_file_path(type_name, sheet_name)
+                if not file_path.exists():
+                    continue
+                try:
+                    sr = _run_parquet_subprocess("search", {
+                        "file_path": str(file_path),
+                        "query": query,
+                        "column": None,
+                        "limit": 100,
+                    })
+                    rows = sr.get("results", [])
+                    for row in rows[:20]:
+                        row["_type"] = type_name
+                        row["_sheet"] = sheet_name
+                    results_all.extend(rows[:20])
+                except Exception:
+                    continue
+
+        return "success", {"results": results_all, "total": len(results_all), "query": query}
+    except Exception as exc:
+        logger.error("Config search step error: %s", exc, exc_info=True)
+        return "error", str(exc)

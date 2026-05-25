@@ -1,0 +1,352 @@
+"""
+Executors: config_validate_start, poll_until, locate_excel_file_glob,
+           fetch_validation_results, apply_config_fixes
+"""
+import asyncio
+import json
+import logging
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+from ..registry import executor
+from ..utils import ensure_api_root_on_path, get_allowed_roots, secure_path, truthy
+
+logger = logging.getLogger(__name__)
+
+
+@executor("config_validate_start")
+async def _exec_config_validate_start(step, confirmed_params, prior_results, **ctx):
+    ensure_api_root_on_path()
+    try:
+        from control_execution.control_runner import control_runner
+        from control_execution.task_persistence import TASK_STORAGE_DIR
+
+        # WF6: file_path may be resolved by a locate step
+        file_path = (confirmed_params.get("file_path") or confirmed_params.get("file_input") or "").strip()
+        locate_result = prior_results.get("locate_config_file", {})
+        if locate_result.get("status") == "success" and isinstance(locate_result.get("value"), dict):
+            file_path = locate_result["value"].get("file_path") or file_path
+
+        control_type = (confirmed_params.get("control_type") or "").strip()
+
+        results_dir = TASK_STORAGE_DIR / "config_validator_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        control_params = {
+            "control_name": "config_validator",
+            "task_name": f"Config Validation ({control_type}) - {Path(file_path).name}",
+            "run_env": "DEV",
+            "expected_run_date": datetime.now().strftime("%Y-%m-%d"),
+            "python_script_path": "api/config_validator_script.py",
+            "script_arguments": [file_path, control_type],
+            "environment_variables": {
+                "FILE_PATH": file_path,
+                "CONTROL_TYPE": control_type,
+                "RESULTS_DIR": str(results_dir),
+            },
+            "control_id": "config_validator",
+        }
+        result = control_runner.run_control_task(control_params)
+        return "success", result
+    except Exception as exc:
+        logger.error("Config validate start error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("poll_until")
+async def _exec_poll_until(step, confirmed_params, prior_results, **ctx):
+    ensure_api_root_on_path()
+    try:
+        from control_execution.control_runner import control_runner
+
+        # task_step_id is configurable — defaults to start_validation for WF2, run_control for WF7
+        task_step_id = step.get("task_step_id", "start_validation")
+        start_result = prior_results.get(task_step_id, {}).get("value", {})
+        task_id = start_result.get("task_id") if isinstance(start_result, dict) else None
+        if not task_id:
+            return "error", f"No task_id found in step '{task_step_id}'"
+
+        poll_config = step.get("poll_config", {})
+        interval = poll_config.get("interval_seconds", 3)
+        max_attempts = poll_config.get("max_attempts", 40)
+        done_statuses = poll_config.get("done_statuses", ["completed", "failed", "error"])
+
+        for _ in range(max_attempts):
+            status = control_runner.get_task_status(task_id)
+            if status.get("status", "") in done_statuses:
+                return "success", status
+            await asyncio.sleep(interval)
+
+        return "error", f"Polling timed out after {max_attempts * interval}s"
+    except Exception as exc:
+        logger.error("Poll step error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("locate_excel_file_glob")
+async def _exec_locate_excel_file_glob(step, confirmed_params, prior_results, **ctx):
+    """Resolve config file: direct path verify OR glob search across workspace."""
+    file_input = (confirmed_params.get("file_input") or confirmed_params.get("file_path") or "").strip()
+    search_root_raw = (confirmed_params.get("search_root") or "").strip()
+
+    if not file_input:
+        return "error", "file_input is required"
+
+    path = Path(file_input)
+
+    # Direct absolute path — just verify
+    if path.is_absolute():
+        if not path.exists():
+            return "error", f"File not found: {file_input}"
+        if path.suffix.lower() not in (".xlsx", ".xls", ".xlsm"):
+            return "error", f"Not an Excel file: {file_input}"
+        try:
+            secured = secure_path(file_input)
+        except ValueError as exc:
+            return "error", str(exc)
+        import pandas as pd
+        ef = pd.ExcelFile(secured)
+        return "success", {
+            "file_path": str(secured),
+            "available_sheets": ef.sheet_names,
+            "resolved_via": "direct_path",
+        }
+
+    # Partial name / glob — search workspace roots
+    roots = []
+    if search_root_raw:
+        try:
+            roots = [secure_path(search_root_raw)]
+        except ValueError as exc:
+            return "error", str(exc)
+    else:
+        roots = get_allowed_roots()
+
+    if not roots:
+        return "error", (
+            "No search root configured. "
+            "Set WORKFLOW_WORKSPACE or AI_ALLOWED_PATHS env var, or provide an absolute file path."
+        )
+
+    excel_exts = {".xlsx", ".xls", ".xlsm"}
+    matches = []
+    for root in roots:
+        if not root.exists():
+            continue
+        pattern = f"**/{file_input}" if not any(c in file_input for c in ("*", "?")) else f"**/{file_input}"
+        for candidate in root.glob(pattern):
+            if candidate.suffix.lower() in excel_exts:
+                matches.append(candidate)
+
+    if not matches:
+        return "error", f"No Excel file matching '{file_input}' found under configured workspace"
+
+    if len(matches) == 1:
+        import pandas as pd
+        ef = pd.ExcelFile(matches[0])
+        return "success", {
+            "file_path": str(matches[0]),
+            "available_sheets": ef.sheet_names,
+            "resolved_via": "glob_search",
+        }
+
+    # Multiple matches — return list and ask user to be more specific
+    match_strs = [str(m) for m in matches[:8]]
+    return "error", (
+        f"Ambiguous: {len(matches)} files match '{file_input}'. "
+        f"Please provide a more specific path. Matches found: {match_strs}"
+    )
+
+
+@executor("fetch_validation_results")
+async def _exec_fetch_validation_results(step, confirmed_params, prior_results, **ctx):
+    """Read the results JSON written by the config validator subprocess."""
+    ensure_api_root_on_path()
+    try:
+        from control_execution.task_persistence import TASK_STORAGE_DIR
+
+        start_result = prior_results.get("start_validation", {}).get("value", {})
+        task_id = start_result.get("task_id") if isinstance(start_result, dict) else None
+        if not task_id:
+            return "error", "No task_id from start_validation step"
+
+        results_file = TASK_STORAGE_DIR / "config_validator_results" / f"{task_id}.json"
+        if not results_file.exists():
+            return "error", f"Results file not found for task {task_id}. Validation may have failed before writing results."
+
+        with open(results_file, "r", encoding="utf-8") as f:
+            results = json.load(f)
+
+        results["task_id"] = task_id
+        return "success", results
+    except json.JSONDecodeError as exc:
+        return "error", f"Results file is corrupted: {exc}"
+    except Exception as exc:
+        logger.error("Fetch validation results error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("apply_config_fixes")
+async def _exec_apply_config_fixes(step, confirmed_params, prior_results, **ctx):
+    """Apply LLM-suggested cell fixes to the config workbook. Backs up first."""
+    if not truthy(confirmed_params.get("apply_fixes")):
+        return "skipped", "apply_fixes is not enabled — workbook was not modified"
+
+    suggestions_result = prior_results.get("analyse_suggestions", {})
+    if suggestions_result.get("status") != "success":
+        return "error", "analyse_suggestions step did not succeed — cannot apply fixes"
+
+    fix_data = suggestions_result.get("value", {})
+    fix_list = fix_data.get("fix_list", []) if isinstance(fix_data, dict) else []
+
+    if not fix_list:
+        return "skipped", "fix_list is empty — no fixes to apply"
+
+    locate_result = prior_results.get("locate_config_file", {})
+    if locate_result.get("status") != "success":
+        return "error", "locate_config_file step did not succeed — cannot resolve file path"
+
+    file_path_str = locate_result["value"].get("file_path")
+    if not file_path_str:
+        return "error", "No file_path in locate_config_file result"
+
+    try:
+        path = secure_path(file_path_str)
+        backup_path = path.parent / f"{path.stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}"
+        shutil.copy2(path, backup_path)
+
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+
+        applied = []
+        failed = []
+
+        for fix in fix_list:
+            sheet_name = fix.get("sheet")
+            row_num = fix.get("row")
+            col_name = fix.get("column")
+            suggested_value = fix.get("suggested_value")
+
+            if not sheet_name or not row_num or not col_name:
+                failed.append({**fix, "error": "Missing sheet, row, or column in fix entry"})
+                continue
+
+            if sheet_name not in wb.sheetnames:
+                failed.append({**fix, "error": f"Sheet '{sheet_name}' not found in workbook"})
+                continue
+
+            ws = wb[sheet_name]
+            headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+
+            try:
+                col_idx = [str(h) for h in headers].index(col_name) + 1
+            except ValueError:
+                failed.append({**fix, "error": f"Column '{col_name}' not found in sheet '{sheet_name}'"})
+                continue
+
+            excel_row = int(row_num) + 1  # +1 to skip header row
+            old_value = ws.cell(row=excel_row, column=col_idx).value
+            ws.cell(row=excel_row, column=col_idx).value = suggested_value
+            applied.append({**fix, "old_value": old_value, "excel_row": excel_row})
+
+        wb.save(path)
+        return "success", {
+            "written_to": str(path),
+            "backup_path": str(backup_path),
+            "applied_count": len(applied),
+            "failed_count": len(failed),
+            "applied": applied,
+            "failed": failed,
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Apply config fixes error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("run_control")
+async def _exec_run_control(step, confirmed_params, prior_results, **ctx):
+    """Start a control run in UAT env with yesterday's date."""
+    ensure_api_root_on_path()
+    try:
+        from datetime import date, timedelta
+        from control_execution.control_runner import control_runner
+
+        control_id = (confirmed_params.get("control_id") or "").strip()
+        if not control_id:
+            return "error", "control_id is required"
+
+        run_env = "UAT"
+        expected_run_date = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        locate_result = prior_results.get("locate_config_file", {})
+        config_file = ""
+        if locate_result.get("status") == "success" and isinstance(locate_result.get("value"), dict):
+            config_file = locate_result["value"].get("file_path", "")
+
+        control_params = {
+            "control_name": control_id,
+            "task_name": f"Control Run — {control_id} ({expected_run_date})",
+            "run_env": run_env,
+            "expected_run_date": expected_run_date,
+            "python_script_path": "api/generic_controller.py",
+            "script_arguments": [],
+            "environment_variables": {
+                "CONTROL_ID": control_id,
+                "ENV": run_env,
+                "expected_run_date": expected_run_date,
+                "CONFIG_FILE": config_file,
+            },
+            "control_id": control_id,
+        }
+        result = control_runner.run_control_task(control_params)
+        return "success", result
+    except Exception as exc:
+        logger.error("Run control error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("fetch_control_results")
+async def _exec_fetch_control_results(step, confirmed_params, prior_results, **ctx):
+    """
+    Fetch control run results from the output summary xlsx.
+    TODO: implement full xlsx parsing when summary file format is finalised.
+          The summary xlsx has separate QA and COMP break sections.
+          For now returns task status + last 100 log lines as a placeholder.
+    """
+    ensure_api_root_on_path()
+    try:
+        from control_execution.control_runner import control_runner
+
+        task_step_id = step.get("task_step_id", "run_control")
+        run_result = prior_results.get(task_step_id, {}).get("value", {})
+        task_id = run_result.get("task_id") if isinstance(run_result, dict) else None
+
+        if not task_id:
+            return "error", f"No task_id found in step '{task_step_id}'"
+
+        status = control_runner.get_task_status(task_id)
+
+        logs = {}
+        try:
+            logs = control_runner.get_task_logs(task_id, "execution", lines=100, from_line=0)
+        except Exception as log_exc:
+            logger.warning("Could not fetch logs for task %s: %s", task_id, log_exc)
+
+        # TODO: locate and parse the summary xlsx written by the control subprocess.
+        #       Expected structure: one xlsx with QA sheet and COMP sheet, each with
+        #       a break-level summary table. Parse with openpyxl and return as dicts.
+        summary_xlsx = None  # placeholder until format is confirmed
+
+        return "success", {
+            "task_id": task_id,
+            "final_status": status.get("status"),
+            "return_code": status.get("return_code"),
+            "logs": logs,
+            "summary_xlsx": summary_xlsx,
+        }
+    except Exception as exc:
+        logger.error("Fetch control results error: %s", exc, exc_info=True)
+        return "error", str(exc)

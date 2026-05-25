@@ -1,0 +1,402 @@
+"""
+Executors: locate_excel_file, read_excel_config_row, read_config_row,
+           rewrite_excel_config_row, read_excel_sheet_structure, append_excel_row
+"""
+import json
+import logging
+from typing import List, Optional
+
+from ..registry import executor
+from ..utils import clean_row_dict, ensure_api_root_on_path, find_column, secure_path, truthy
+
+logger = logging.getLogger(__name__)
+
+_FIELD_NAME_CANDIDATES = [
+    "NewFieldName", "Newfieldname", "new_field_name",
+    "OutputField", "Output Field", "FieldName", "Field Name",
+]
+
+
+def _formula_updates_for_columns(formula_config: dict, columns: List[str]) -> dict:
+    updates = {}
+    mapping = {
+        "operation_type": ["Operation", "Function"],
+        "new_field_name": _FIELD_NAME_CANDIDATES,
+        "input_fields": ["Inputs", "Input", "InputField", "Input Field"],
+    }
+    for config_key, candidates in mapping.items():
+        column = find_column(columns, candidates)
+        if column and formula_config.get(config_key) is not None:
+            updates[column] = formula_config[config_key]
+
+    params = formula_config.get("operation_params") or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+    if isinstance(params, dict):
+        for key, value in params.items():
+            column = find_column(columns, [key])
+            if column:
+                updates[column] = value
+        formula_column = find_column(columns, ["Formula", "FormulaString", "Formula String"])
+        if formula_column and params.get("formulastring") is not None:
+            updates[formula_column] = params["formulastring"]
+
+    return updates
+
+
+@executor("locate_excel_file")
+async def _exec_locate_excel_file(step, confirmed_params, prior_results, **ctx):
+    """Resolve and verify a user-supplied Excel file path within the secure workspace."""
+    file_path = (confirmed_params.get("file_path") or confirmed_params.get("config_file_path") or "").strip()
+    if not file_path:
+        return "error", "file_path is required"
+
+    try:
+        path = secure_path(file_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    if not path.exists():
+        return "error", f"File not found: {file_path}"
+    if path.suffix.lower() not in (".xlsx", ".xlsm", ".xls"):
+        return "error", f"Unsupported config file type '{path.suffix}'. Use .xlsx, .xlsm, or .xls"
+
+    try:
+        import pandas as pd
+        excel_file = pd.ExcelFile(path)
+        requested_sheet = (confirmed_params.get("sheet_name") or "FieldOperations").strip()
+        sheet_name = requested_sheet if requested_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
+        if requested_sheet and requested_sheet not in excel_file.sheet_names:
+            return "error", f"Sheet '{requested_sheet}' not found. Available: {excel_file.sheet_names}"
+        return "success", {
+            "file_path": str(path),
+            "sheet_name": sheet_name,
+            "available_sheets": excel_file.sheet_names,
+        }
+    except Exception as exc:
+        logger.error("Locate Excel file error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("read_excel_config_row")
+async def _exec_read_excel_config_row(step, confirmed_params, prior_results, **ctx):
+    """Read a row from the user-supplied Excel sheet by row number or NewFieldName."""
+    import pandas as pd
+
+    locate_result = prior_results.get("locate_config_file", {})
+    locate_value = locate_result.get("value", {}) if locate_result.get("status") == "success" else {}
+    file_path = locate_value.get("file_path") or confirmed_params.get("file_path") or confirmed_params.get("config_file_path")
+    sheet_name = locate_value.get("sheet_name") or confirmed_params.get("sheet_name") or step.get("sheet", "FieldOperations")
+    lookup_type = (confirmed_params.get("lookup_type") or "new_field_name").strip()
+    lookup_value = (confirmed_params.get("lookup_value") or "").strip()
+
+    if not file_path:
+        return "error", "file_path is required"
+    if not lookup_value:
+        return "error", "lookup_value is required"
+
+    try:
+        path = secure_path(file_path)
+        df = pd.read_excel(path, sheet_name=sheet_name)
+        if df.empty:
+            return "error", f"Sheet '{sheet_name}' is empty"
+
+        found_rows = []
+        if lookup_type == "row_number":
+            try:
+                row_idx = int(lookup_value) - 1
+            except ValueError:
+                return "error", f"Invalid row number: {lookup_value}"
+            if 0 <= row_idx < len(df):
+                row = clean_row_dict(df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict())
+                row["_sheet"] = sheet_name
+                row["_row_number"] = row_idx + 1
+                row["_excel_row_number"] = row_idx + 2
+                found_rows.append(row)
+        else:
+            field_col = find_column(df.columns, _FIELD_NAME_CANDIDATES)
+            if not field_col:
+                return "error", f"No NewFieldName/OutputField column found in sheet '{sheet_name}'"
+            mask = df[field_col].astype(str).str.strip().str.lower() == lookup_value.lower()
+            for idx, row_data in df[mask].iterrows():
+                row = clean_row_dict(row_data.where(row_data.notna(), other=None).to_dict())
+                row["_sheet"] = sheet_name
+                row["_row_number"] = idx + 1
+                row["_excel_row_number"] = idx + 2
+                row["_matched_column"] = field_col
+                found_rows.append(row)
+
+        if not found_rows:
+            return "error", f"No rows found matching {lookup_type}='{lookup_value}' in sheet '{sheet_name}'"
+
+        return "success", {
+            "file_path": str(path),
+            "sheet": sheet_name,
+            "rows": found_rows,
+            "total": len(found_rows),
+            "lookup": {lookup_type: lookup_value},
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Read Excel config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("read_config_row")
+async def _exec_read_config_row(step, confirmed_params, prior_results, **ctx):
+    """Read a row from a config parquet sheet by row number or NewFieldName."""
+    ensure_api_root_on_path()
+    try:
+        import pandas as pd
+        from routers.config_search import get_available_types, get_file_path
+
+        lookup_type = (confirmed_params.get("lookup_type") or "new_field_name").strip()
+        lookup_value = (confirmed_params.get("lookup_value") or "").strip()
+        type_filter = (confirmed_params.get("control_type") or "").strip()
+        sheet_name = step.get("sheet", "FieldOperations")
+
+        if not lookup_value:
+            return "error", "lookup_value is required"
+
+        types_to_search = [type_filter] if type_filter else get_available_types()
+        found_rows = []
+
+        for type_name in types_to_search:
+            file_path = get_file_path(type_name, sheet_name)
+            if not file_path.exists():
+                continue
+            try:
+                df = pd.read_parquet(file_path)
+                if lookup_type == "row_number":
+                    row_idx = int(lookup_value) - 1
+                    if 0 <= row_idx < len(df):
+                        row = df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict()
+                        row["_type"] = type_name
+                        row["_sheet"] = sheet_name
+                        row["_row_number"] = int(lookup_value)
+                        found_rows.append(row)
+                else:
+                    field_col = next(
+                        (c for c in df.columns if c.lower() in (
+                            "newfieldname", "new_field_name", "fieldname",
+                            "field_name", "outputfield", "output_field"
+                        )),
+                        None,
+                    )
+                    if field_col:
+                        mask = df[field_col].astype(str).str.lower() == lookup_value.lower()
+                        for idx, row_data in df[mask].iterrows():
+                            row = row_data.where(row_data.notna(), other=None).to_dict()
+                            row["_type"] = type_name
+                            row["_sheet"] = sheet_name
+                            row["_row_number"] = idx + 1
+                            found_rows.append(row)
+            except Exception as inner_exc:
+                logger.warning("Could not read %s/%s: %s", type_name, sheet_name, inner_exc)
+                continue
+
+        if not found_rows:
+            return "error", f"No rows found matching {lookup_type}='{lookup_value}' in sheet '{sheet_name}'"
+
+        return "success", {"rows": found_rows, "total": len(found_rows), "sheet": sheet_name, "lookup": {lookup_type: lookup_value}}
+    except Exception as exc:
+        logger.error("Read config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("rewrite_excel_config_row")
+async def _exec_rewrite_excel_config_row(step, confirmed_params, prior_results, **ctx):
+    """Rewrite the analysed row in the workbook.
+
+    Applies when:
+      - step has force_apply: true (used by config_update_and_run which always writes), OR
+      - confirmed_params apply_changes is truthy (used by field_mapping_analyser)
+    """
+    force = step.get("force_apply", False)
+    if not force and not truthy(confirmed_params.get("apply_changes")):
+        return "skipped", "apply_changes is not enabled; workbook was not modified"
+
+    formula_step_id = step.get("formula_step_id", "analyse_formula")
+    row_step_id = step.get("row_step_id", "read_field_mapping")
+    validator_step_id = step.get("validator_step_id", "execute_transform")
+
+    formula_prior = prior_results.get(formula_step_id, {})
+    row_prior = prior_results.get(row_step_id, {})
+    validator_prior = prior_results.get(validator_step_id, {})
+
+    if formula_prior.get("status") != "success":
+        return "error", f"Formula step '{formula_step_id}' did not succeed"
+    if row_prior.get("status") != "success":
+        return "error", f"Row step '{row_step_id}' did not succeed"
+    if validator_prior.get("status") != "success":
+        return "skipped", f"Validator step '{validator_step_id}' did not succeed; workbook was not modified"
+
+    row_value = row_prior.get("value", {})
+    rows = row_value.get("rows", []) if isinstance(row_value, dict) else []
+    if len(rows) != 1:
+        return "error", f"Expected exactly one row to update, found {len(rows)}"
+
+    formula_config = formula_prior.get("value", {})
+    if not isinstance(formula_config, dict):
+        return "error", "Formula config is not a JSON object"
+
+    try:
+        from openpyxl import load_workbook
+
+        path = secure_path(
+            row_value.get("file_path")
+            or confirmed_params.get("file_path")
+            or confirmed_params.get("config_file_path")
+        )
+        sheet_name = row_value.get("sheet") or confirmed_params.get("sheet_name") or "FieldOperations"
+        target_row = int(rows[0].get("_excel_row_number") or (int(rows[0]["_row_number"]) + 1))
+
+        wb = load_workbook(path)
+        if sheet_name not in wb.sheetnames:
+            return "error", f"Sheet '{sheet_name}' not found in workbook"
+
+        ws = wb[sheet_name]
+        headers = [ws.cell(row=1, column=col).value for col in range(1, ws.max_column + 1)]
+        updates = _formula_updates_for_columns(formula_config, [str(h) for h in headers if h])
+        if not updates:
+            return "skipped", "No matching workbook columns found for the generated formula config"
+
+        changed = {}
+        for col_idx, header in enumerate(headers, start=1):
+            if header not in updates:
+                continue
+            old_value = ws.cell(row=target_row, column=col_idx).value
+            new_value = updates[header]
+            if isinstance(new_value, (dict, list)):
+                new_value = json.dumps(new_value, default=str)
+            if old_value != new_value:
+                ws.cell(row=target_row, column=col_idx).value = new_value
+                changed[str(header)] = {"old": old_value, "new": new_value}
+
+        if not changed:
+            return "skipped", "Generated config matches the workbook row; no changes written"
+
+        wb.save(path)
+        return "success", {
+            "written_to": str(path),
+            "sheet": sheet_name,
+            "excel_row_number": target_row,
+            "changed": changed,
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Rewrite Excel config row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("read_excel_sheet_structure")
+async def _exec_read_excel_sheet_structure(step, confirmed_params, prior_results, **ctx):
+    """Read column headers and last 3 rows of the target sheet to capture its schema."""
+    import pandas as pd
+
+    locate_result = prior_results.get("locate_config_file", {})
+    locate_value = locate_result.get("value", {}) if locate_result.get("status") == "success" else {}
+    file_path = (
+        locate_value.get("file_path")
+        or confirmed_params.get("file_path")
+        or confirmed_params.get("file_input")
+        or ""
+    ).strip()
+    sheet_name = (confirmed_params.get("sheet_name") or "FieldOperations").strip()
+
+    if not file_path:
+        return "error", "Cannot resolve file_path for read_excel_sheet_structure"
+
+    try:
+        path = secure_path(file_path)
+        df = pd.read_excel(path, sheet_name=sheet_name)
+        columns = list(df.columns)
+        sample_rows = (
+            df.tail(3).where(df.tail(3).notna(), other=None).to_dict(orient="records")
+        )
+        return "success", {
+            "file_path": str(path),
+            "sheet_name": sheet_name,
+            "columns": columns,
+            "sample_rows": sample_rows,
+            "row_count": len(df),
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Read sheet structure error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("append_excel_row")
+async def _exec_append_excel_row(step, confirmed_params, prior_results, **ctx):
+    """Append the validated new row to the end of the target Excel sheet."""
+    row_step_id = step.get("row_step_id", "build_row")
+    validator_step_id = step.get("validator_step_id", "execute_transform")
+
+    build_result = prior_results.get(row_step_id, {})
+    if build_result.get("status") != "success":
+        return "error", f"Step '{row_step_id}' did not succeed — row not appended"
+
+    validate_result = prior_results.get(validator_step_id, {})
+    if validate_result.get("status") != "success":
+        return "error", f"Validation step '{validator_step_id}' did not succeed — row not appended"
+
+    build_data = build_result.get("value", {})
+    row_dict = build_data.get("row_dict", {}) if isinstance(build_data, dict) else {}
+    if not row_dict:
+        return "error", "build_row did not produce a row_dict"
+
+    locate_result = prior_results.get("locate_config_file", {})
+    locate_value = locate_result.get("value", {}) if locate_result.get("status") == "success" else {}
+    file_path = (
+        locate_value.get("file_path")
+        or confirmed_params.get("file_path")
+        or confirmed_params.get("file_input")
+        or ""
+    ).strip()
+    sheet_name = (confirmed_params.get("sheet_name") or "FieldOperations").strip()
+
+    if not file_path:
+        return "error", "Cannot resolve file_path for append_excel_row"
+
+    try:
+        from openpyxl import load_workbook
+
+        path = secure_path(file_path)
+        wb = load_workbook(path)
+
+        if sheet_name not in wb.sheetnames:
+            return "error", f"Sheet '{sheet_name}' not found in workbook"
+
+        ws = wb[sheet_name]
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+
+        row_values = []
+        for header in headers:
+            val = row_dict.get(str(header))
+            if isinstance(val, (dict, list)):
+                val = json.dumps(val, default=str)
+            row_values.append(val)
+
+        ws.append(row_values)
+        new_row_number = ws.max_row
+
+        wb.save(path)
+        return "success", {
+            "written_to": str(path),
+            "sheet": sheet_name,
+            "row_number": new_row_number,
+            "row_dict": row_dict,
+            "columns_written": len([v for v in row_values if v is not None]),
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Append Excel row error: %s", exc, exc_info=True)
+        return "error", str(exc)

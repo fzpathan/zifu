@@ -1,0 +1,197 @@
+"""
+FastAPI routes for the Workflow Assistant.
+"""
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from .core import (
+    classify_intent,
+    execute_workflow_steps,
+    extract_params,
+    find_missing_params,
+)
+from .utils import accumulate_usage, get_openai_client, load_workflows, sse
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/workflow-ai", tags=["Workflow AI Assistant"])
+
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class WorkflowChatRequest(BaseModel):
+    message: str
+    conversation_history: List[Message] = []
+    model: str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    workflow_id: Optional[str] = None
+    confirmed_params: Optional[Dict[str, Any]] = None
+
+
+async def stream_workflow_chat(request: WorkflowChatRequest):
+    client = get_openai_client()
+    try:
+        data = load_workflows()
+        workflows_list = data.get("workflows", [])
+        workflows_by_id = {w["id"]: w for w in workflows_list}
+
+        usage_acc: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        # Fast-path: confirmed re-send with all params already collected
+        if request.workflow_id and request.confirmed_params is not None:
+            workflow = workflows_by_id.get(request.workflow_id)
+            if not workflow:
+                yield sse({"event": "error", "error": f"Unknown workflow: {request.workflow_id}"})
+                return
+
+            yield sse({
+                "event": "workflow_classified",
+                "workflow_id": workflow["id"],
+                "workflow_name": workflow["name"],
+                "description": workflow["description"],
+                "icon": workflow.get("icon", ""),
+                "steps": [{"id": s["id"], "name": s["name"]} for s in workflow["steps"]],
+                "confidence": 1.0,
+            })
+
+            async for chunk in execute_workflow_steps(workflow, request.confirmed_params, client, request.model, usage_acc):
+                yield chunk
+            return
+
+        # Phase 1 — intent classification
+        classification, classify_usage = await classify_intent(client, request.model, request.message, workflows_list)
+        accumulate_usage(usage_acc, classify_usage)
+        workflow_id = classification.get("workflow_id")
+        confidence = float(classification.get("confidence") or 0.0)
+
+        if not workflow_id or workflow_id not in workflows_by_id or confidence < 0.3:
+            # No match — plain LLM fallback enriched with RAG context
+            fallback_system = (
+                "You are a helpful assistant for ControlDash, a data orchestration and ETL "
+                "control platform. Help the user with questions about controls, transforms, "
+                "validations, and configurations."
+            )
+            try:
+                from ..rag_service import get_rag_kb
+                rag_kb = get_rag_kb()
+                chunks = await rag_kb.async_search(request.message, top_k=3)
+                rag_context = rag_kb.format_context(chunks)
+                if rag_context:
+                    fallback_system = rag_context + "\n\n" + fallback_system
+            except Exception as rag_exc:
+                logger.debug("RAG search skipped in fallback: %s", rag_exc)
+
+            result = await client.chat.completions.create(
+                model=request.model,
+                messages=[
+                    {"role": "system", "content": fallback_system},
+                    {"role": "user", "content": request.message},
+                ],
+                temperature=0.7,
+                max_tokens=1000,
+            )
+            accumulate_usage(usage_acc, result.usage)
+            from ..ai_assistant import extract_message_content
+            content = extract_message_content(result.choices[0].message.content)
+            yield sse({"event": "content", "content": content})
+            yield sse({"event": "done", "needs_confirm": False, "usage": usage_acc})
+            return
+
+        workflow = workflows_by_id[workflow_id]
+
+        yield sse({
+            "event": "workflow_classified",
+            "workflow_id": workflow_id,
+            "workflow_name": workflow["name"],
+            "description": workflow["description"],
+            "icon": workflow.get("icon", ""),
+            "steps": [{"id": s["id"], "name": s["name"]} for s in workflow["steps"]],
+            "confidence": confidence,
+        })
+
+        # Phase 2 — param extraction
+        params_config = workflow.get("params", [])
+        extracted, extract_usage = await extract_params(client, request.model, request.message, params_config)
+        accumulate_usage(usage_acc, extract_usage)
+
+        yield sse({"event": "params_extracted", "extracted_params": extracted})
+
+        # Phase 3 — check for missing required params
+        missing = find_missing_params(params_config, extracted)
+
+        if missing:
+            yield sse({
+                "event": "params_required",
+                "workflow_id": workflow_id,
+                "missing_params": missing,
+                "extracted_params": extracted,
+                "all_params": params_config,
+            })
+            yield sse({"event": "done", "needs_confirm": True, "all_params_present": False, "usage": usage_acc})
+        else:
+            yield sse({
+                "event": "done",
+                "needs_confirm": True,
+                "all_params_present": True,
+                "workflow_id": workflow_id,
+                "extracted_params": extracted,
+                "usage": usage_acc,
+            })
+
+    except Exception as exc:
+        logger.error("Workflow chat error: %s", exc, exc_info=True)
+        yield sse({"event": "error", "error": str(exc)})
+
+
+@router.post("/chat")
+async def chat(request: WorkflowChatRequest):
+    return StreamingResponse(
+        stream_workflow_chat(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/workflows")
+async def get_workflows():
+    try:
+        data = load_workflows()
+        workflows = data.get("workflows", [])
+        return {
+            "workflows": [
+                {
+                    "id": w["id"],
+                    "name": w["name"],
+                    "description": w["description"],
+                    "icon": w.get("icon", ""),
+                    "param_count": len(w.get("params", [])),
+                    "step_count": len(w.get("steps", [])),
+                    "params": w.get("params", []),
+                }
+                for w in workflows
+            ]
+        }
+    except Exception as exc:
+        logger.error("Error loading workflows: %s", exc)
+        return {"workflows": [], "error": str(exc)}
+
+
+@router.get("/health")
+async def health():
+    try:
+        data = load_workflows()
+        count = len(data.get("workflows", []))
+        return {"status": "ok", "workflow_count": count, "yaml_loaded": True}
+    except Exception as exc:
+        return {"status": "error", "yaml_loaded": False, "error": str(exc)}

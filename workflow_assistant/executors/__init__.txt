@@ -1,0 +1,8 @@
+# Import all executor modules so their @executor decorators self-register.
+# Add a new import here whenever a new executor module is created.
+from . import config_search  # noqa: F401
+from . import config_validation  # noqa: F401
+from . import field_mapping  # noqa: F401
+from . import file_ops  # noqa: F401
+from . import llm_ops  # noqa: F401
+from . import transform  # noqa: F401

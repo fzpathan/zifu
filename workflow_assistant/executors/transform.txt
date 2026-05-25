@@ -1,0 +1,95 @@
+"""
+Executors: transform_execute, transform_execute_from_prior
+"""
+import json
+import logging
+
+from ..registry import executor
+from ..utils import ensure_api_root_on_path
+
+logger = logging.getLogger(__name__)
+
+
+@executor("transform_execute")
+async def _exec_transform(step, confirmed_params, prior_results, **ctx):
+    ensure_api_root_on_path()
+    try:
+        import pandas as pd
+        from transform_operations.transform_operations import TransformOperations
+
+        ops = TransformOperations()
+
+        # Prefer data read from file over inline sample_data
+        read_result = prior_results.get("read_input_file", {})
+        if read_result.get("status") == "success" and read_result.get("value"):
+            file_data = read_result["value"]
+            sample_data = file_data.get("rows", []) if isinstance(file_data, dict) else file_data
+        else:
+            sample_data = confirmed_params.get("sample_data", "[]")
+            if isinstance(sample_data, str):
+                sample_data = json.loads(sample_data) if sample_data.strip() else []
+
+        if not sample_data:
+            return "error", "No sample data provided. Either supply Sample Data JSON or an Input File Path."
+
+        op_params_raw = confirmed_params.get("operation_params") or "{}"
+        if isinstance(op_params_raw, str) and op_params_raw.strip():
+            try:
+                op_params = json.loads(op_params_raw)
+            except Exception:
+                op_params = {}
+        elif isinstance(op_params_raw, dict):
+            op_params = op_params_raw
+        else:
+            op_params = {}
+
+        operation = {
+            "Operation": confirmed_params.get("operation_type", ""),
+            "NewFieldName": confirmed_params.get("new_field_name", ""),
+            "Inputs": confirmed_params.get("input_fields", ""),
+            **op_params,
+        }
+
+        df = pd.DataFrame(sample_data)
+        result_df = ops.execute_operation(df, operation)
+        result_df = result_df.where(result_df.notna(), other=None)
+        for col in result_df.columns:
+            if result_df[col].dtype.kind in ("M", "m"):
+                result_df[col] = result_df[col].astype(str)
+        return "success", result_df.to_dict(orient="records")
+    except Exception as exc:
+        logger.error("Transform step error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("transform_execute_from_prior")
+async def _exec_transform_from_prior(step, confirmed_params, prior_results, **ctx):
+    # Try formula_step_id first, then build_step_id — one may be skipped by a condition
+    candidates = list(filter(None, [step.get("formula_step_id"), step.get("build_step_id")]))
+    if not candidates:
+        candidates = ["build_formula"]
+
+    prior = None
+    for sid in candidates:
+        candidate = prior_results.get(sid, {})
+        if candidate.get("status") == "success":
+            prior = candidate
+            break
+
+    if prior is None:
+        ids = ", ".join(candidates)
+        return "error", f"No successful formula step found among [{ids}] — cannot run transform"
+
+    formula_config = prior.get("value", {})
+    if not isinstance(formula_config, dict):
+        return "error", f"Formula step result is not a dict: {type(formula_config)}"
+
+    merged = {**confirmed_params}
+    for key in ("operation_type", "new_field_name", "input_fields", "operation_params"):
+        if formula_config.get(key) is not None:
+            merged[key] = formula_config[key]
+
+    if formula_config.get("sample_data") and not merged.get("sample_data"):
+        merged["sample_data"] = formula_config["sample_data"]
+
+    return await _exec_transform(step, merged, prior_results, **ctx)

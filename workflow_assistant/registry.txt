@@ -1,0 +1,51 @@
+"""
+Executor registry — self-registering pattern for workflow step function_types.
+
+Usage in any executor module:
+    from ..registry import executor
+
+    @executor("my_function_type")
+    async def _exec_my_fn(step, confirmed_params, prior_results, **ctx):
+        ...
+        return "success", result
+
+The dispatcher (execute_step) looks up the registered function by function_type
+and calls it with a consistent signature. ctx carries: client, model, usage_acc.
+"""
+import logging
+from typing import Any, Callable, Dict
+
+logger = logging.getLogger(__name__)
+
+_REGISTRY: Dict[str, Callable] = {}
+
+
+def executor(*function_types: str):
+    """Decorator that registers an async executor function for one or more function_type strings."""
+    def decorator(fn: Callable) -> Callable:
+        for ft in function_types:
+            if ft in _REGISTRY:
+                logger.warning("executor '%s' already registered — overwriting with %s", ft, fn.__name__)
+            _REGISTRY[ft] = fn
+        return fn
+    return decorator
+
+
+def get_executor(function_type: str) -> Callable | None:
+    return _REGISTRY.get(function_type)
+
+
+async def execute_step(
+    step: dict,
+    confirmed_params: dict,
+    prior_results: dict,
+    client: Any,
+    model: str,
+    usage_acc: Dict[str, int],
+):
+    """Look up and call the registered executor for step['function_type']."""
+    ft = step.get("function_type", "")
+    fn = get_executor(ft)
+    if fn is None:
+        return "error", f"Unknown function_type: '{ft}' — no executor registered"
+    return await fn(step, confirmed_params, prior_results, client=client, model=model, usage_acc=usage_acc)

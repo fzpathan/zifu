@@ -1,0 +1,340 @@
+"""
+Executors: llm_summarize, llm_build_formula, llm_build_formula_from_row,
+           llm_build_row_for_sheet, llm_analyse_suggestions
+"""
+import json
+import logging
+import re
+
+from ..registry import executor
+from ..utils import accumulate_usage, extract_json, render_template
+
+logger = logging.getLogger(__name__)
+
+_FORMULA_SYSTEM_PROMPT = """You are a ControlDash transform formula expert. Generate a valid transform operation config as JSON.
+
+Available operation types and their parameters:
+- DateExtract   : Inputs=<date_col>, operation_params={"component": "year|month|day|hour|minute|second|weekday|quarter|dayofyear"}
+- Concatenate   : Inputs=<col1,col2,...>, operation_params={"separator": " "}
+- Formula       : Inputs=<col1,col2,...>, operation_params={"formulastring": "<pandas eval expr, e.g. col1 * 0.1>"}
+- Conditional   : Inputs=<col>, operation_params={"condition": "<expr>", "true_value": "<val>", "false_value": "<val>"}
+- MapValues     : Inputs=<col>, operation_params={"mapping": {"old": "new", ...}}
+- StringOperation: Inputs=<col>, operation_params={"operation": "upper|lower|strip|title|reverse"}
+- NumericOperation: Inputs=<col1,col2,...>, operation_params={"operation": "abs|round|ceil|floor|sqrt|log|sum|mean|max|min", "decimal_places": 2}
+- SetValue      : Inputs=<any_col>, operation_params={"value": "<fixed_value>"}
+- CopyField     : Inputs=<source_col>
+- Split         : Inputs=<col>, operation_params={"delimiter": "-", "index": 0}
+- Replace       : Inputs=<col>, operation_params={"pattern": "old", "replacement": "new", "use_regex": false}
+
+Respond with valid JSON only — no markdown, no text outside the JSON:
+{
+  "operation_type": "...",
+  "new_field_name": "snake_case_output_name",
+  "input_fields": "col1" or "col1,col2",
+  "operation_params": { ... },
+  "sample_data": [ { "col1": "val1" }, ... ],
+  "explanation": "one-line plain-English description of what this formula does"
+}
+
+Rules:
+- sample_data must have at least 3 rows containing ALL input field(s) with realistic values
+- new_field_name must be snake_case
+- operation_params must only include keys valid for the chosen operation_type
+- If user supplies sample_data, use those rows exactly; otherwise generate realistic test rows"""
+
+_ROW_BUILDER_SYSTEM_PROMPT = """You are a ControlDash FieldOperations sheet expert.
+Generate a new complete row for an Excel sheet based on user input.
+
+Respond with valid JSON only — no markdown, no text outside the JSON:
+{
+  "row_dict": { "<column_name>": "<value_or_null>", ... },
+  "operation_type": "...",
+  "new_field_name": "snake_case_output_name",
+  "input_fields": "col1" or "col1,col2",
+  "operation_params": { ... },
+  "sample_data": [ { "col1": "val1" }, ... ],
+  "explanation": "one-line description"
+}
+
+Rules for row_dict:
+- Every column from the schema must appear as a key
+- Map the formula components to the most appropriate column names based on the sample rows
+- Columns that don't apply get null
+- Do not add extra keys beyond the schema columns
+- sample_data must have at least 3 rows with all input fields"""
+
+_ANALYSE_SUGGESTIONS_SYSTEM_PROMPT = """You are a ControlDash config validation expert.
+Analyse the validation results and produce a structured fix list.
+
+Respond with valid JSON only — no markdown, no text outside the JSON:
+{
+  "fix_list": [
+    {
+      "sheet": "<sheet_name>",
+      "row": <1-based data row, not counting header>,
+      "column": "<column_name>",
+      "current_value": "<current cell value or null>",
+      "suggested_value": "<corrected value>",
+      "reason": "<one-sentence explanation>"
+    }
+  ],
+  "summary": "<markdown string: overall verdict PASS/FAIL, error count by sheet>"
+}
+
+If validation passed with no errors, return an empty fix_list and a PASS summary."""
+
+
+def _extract_message_content(content) -> str:
+    from ...ai_assistant import extract_message_content
+    return extract_message_content(content)
+
+
+async def _get_rag_context(query: str, top_k: int = 2) -> str:
+    try:
+        from ...rag_service import get_rag_kb
+        rag_kb = get_rag_kb()
+        chunks = await rag_kb.async_search(query, top_k=top_k)
+        return rag_kb.format_context(chunks)
+    except Exception as exc:
+        logger.debug("RAG search skipped: %s", exc)
+        return ""
+
+
+async def _stream_llm_summary(step, confirmed_params, prior_results, client, model):
+    """Async generator that yields (chunk_type, content) for streaming summarization."""
+    try:
+        prompt_template = step.get("prompt_template", "")
+        rendered = render_template(prompt_template, confirmed_params, prior_results)
+
+        extra_parts = []
+        for sid, sdata in prior_results.items():
+            status = sdata.get("status", "unknown")
+            v = sdata.get("value")
+            if v is not None:
+                extra_parts.append(f"[{sid}] status={status}: {json.dumps(v, default=str)[:3000]}")
+        if extra_parts:
+            rendered += "\n\nFull step results:\n" + "\n".join(extra_parts)
+
+        system_prompt = (
+            "You are a concise ControlDash workflow summarizer. "
+            "Use short markdown sections and compact tables only when useful. "
+            "Do not output horizontal rules, divider lines, long separator lines, "
+            "or repeated dashed/equals characters. Keep the response under 450 words."
+        )
+
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": rendered},
+            ],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        content = _extract_message_content(result.choices[0].message.content)
+        content = re.sub(r"(?m)^\s*[-=_]{5,}\s*$\n?", "", content).strip()
+        yield "chunk", content
+        yield "done", content
+        yield "usage", result.usage
+    except Exception as exc:
+        logger.error("LLM summarize error: %s", exc, exc_info=True)
+        yield "error", str(exc)
+
+
+@executor("llm_summarize")
+async def _exec_llm_summarize(step, confirmed_params, prior_results, **ctx):
+    return "llm_stream", _stream_llm_summary(
+        step, confirmed_params, prior_results, ctx["client"], ctx["model"]
+    )
+
+
+@executor("llm_build_formula")
+async def _exec_llm_build_formula(step, confirmed_params, prior_results, **ctx):
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    description = (confirmed_params.get("formula_description") or "").strip()
+    new_field_hint = (confirmed_params.get("new_field_name") or "").strip()
+    sample_data_raw = confirmed_params.get("sample_data", "")
+
+    sample_data = []
+    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
+        try:
+            sample_data = json.loads(sample_data_raw)
+        except Exception:
+            pass
+    elif isinstance(sample_data_raw, list):
+        sample_data = sample_data_raw
+
+    user_msg = f"Build a transform formula for: {description}"
+    if new_field_hint:
+        user_msg += f"\nDesired output field name: {new_field_hint}"
+    if sample_data:
+        user_msg += f"\nUse this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
+
+    system_prompt = _FORMULA_SYSTEM_PROMPT
+    rag_context = await _get_rag_context(description)
+    if rag_context:
+        system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        return "success", json.loads(extract_json(raw))
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for formula config: {exc}"
+    except Exception as exc:
+        logger.error("LLM build formula error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("llm_build_formula_from_row")
+async def _exec_llm_build_formula_from_row(step, confirmed_params, prior_results, **ctx):
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    source_step_id = step.get("source_step_id", "read_field_mapping")
+    prior = prior_results.get(source_step_id, {})
+
+    if prior.get("status") != "success":
+        return "error", f"Source step '{source_step_id}' did not succeed — cannot analyse formula"
+
+    row_data = prior.get("value", {})
+    sample_data_raw = confirmed_params.get("sample_data", "")
+    sample_data = []
+    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
+        try:
+            sample_data = json.loads(sample_data_raw)
+        except Exception:
+            pass
+    elif isinstance(sample_data_raw, list):
+        sample_data = sample_data_raw
+
+    user_msg = (
+        f"Analyse and improve this existing FieldOperations formula row:\n"
+        f"{json.dumps(row_data, default=str)[:2000]}\n\n"
+        "Map the columns to the transform format:\n"
+        "  - NewFieldName → new_field_name\n"
+        "  - Operation    → operation_type\n"
+        "  - Inputs       → input_fields\n"
+        "  - All remaining columns → operation_params\n\n"
+    )
+    if sample_data:
+        user_msg += f"Use this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
+    else:
+        user_msg += "Generate at least 3 realistic test rows that include all input field(s)."
+
+    rows_list = row_data.get("rows", [row_data]) if isinstance(row_data, dict) and "rows" in row_data else [row_data]
+    first_row = rows_list[0] if rows_list else {}
+    op_type = str(first_row.get("Operation") or first_row.get("operation_type") or "transform")
+    rag_context = await _get_rag_context(f"{op_type} transform operation")
+
+    system_prompt = _FORMULA_SYSTEM_PROMPT
+    if rag_context:
+        system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        return "success", json.loads(extract_json(raw))
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON when analysing formula: {exc}"
+    except Exception as exc:
+        logger.error("LLM analyse formula error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("llm_build_row_for_sheet")
+async def _exec_llm_build_row_for_sheet(step, confirmed_params, prior_results, **ctx):
+    """Build a complete Excel row dict from a plain-English description or partial formula JSON."""
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    structure_step_id = step.get("structure_step_id", "read_sheet_structure")
+    structure_result = prior_results.get(structure_step_id, {})
+
+    if structure_result.get("status") != "success":
+        return "error", f"Step '{structure_step_id}' did not succeed — cannot build row"
+
+    structure = structure_result.get("value", {})
+    columns = structure.get("columns", [])
+    sample_rows = structure.get("sample_rows", [])
+    sheet_name = structure.get("sheet_name", "FieldOperations")
+
+    formula_input = (confirmed_params.get("formula_input") or "").strip()
+    input_format = (confirmed_params.get("input_format") or "description").strip()
+
+    if not formula_input:
+        return "error", "formula_input is required for add_new action"
+
+    if input_format == "formula_json":
+        user_msg = (
+            f"Sheet '{sheet_name}' has these columns: {columns}\n"
+            f"Sample rows from the sheet: {json.dumps(sample_rows[:3], default=str)}\n\n"
+            f"The user provided this formula JSON — fill any missing columns from the schema:\n"
+            f"{formula_input}"
+        )
+    else:
+        user_msg = (
+            f"Sheet '{sheet_name}' has these columns: {columns}\n"
+            f"Sample rows from the sheet: {json.dumps(sample_rows[:3], default=str)}\n\n"
+            f"Generate a new row for this transformation:\n{formula_input}"
+        )
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _ROW_BUILDER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        return "success", json.loads(extract_json(raw))
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for row config: {exc}"
+    except Exception as exc:
+        logger.error("LLM build row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("llm_analyse_suggestions")
+async def _exec_llm_analyse_suggestions(step, confirmed_params, prior_results, **ctx):
+    """Analyse validation results and produce a structured fix_list + summary."""
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    prompt_template = step.get("prompt_template", "")
+    rendered = render_template(prompt_template, confirmed_params, prior_results)
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _ANALYSE_SUGGESTIONS_SYSTEM_PROMPT},
+                {"role": "user", "content": rendered},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        return "success", json.loads(extract_json(raw))
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for fix suggestions: {exc}"
+    except Exception as exc:
+        logger.error("LLM analyse suggestions error: %s", exc, exc_info=True)
+        return "error", str(exc)

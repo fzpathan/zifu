@@ -1,0 +1,163 @@
+"""
+Shared utilities for the Workflow Assistant package.
+Path security, SSE helpers, JSON extraction, template rendering.
+"""
+import json
+import logging
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# api/ directory — two levels up from this file (workflow_assistant/ → routers/ → api/)
+_API_ROOT = Path(__file__).resolve().parent.parent.parent
+YAML_PATH = _API_ROOT / "workflow_definitions.yaml"
+
+_OPENROUTER_API_KEY = os.environ.get(
+    "OPENAI_API_KEY",
+    "",
+)
+_OPENROUTER_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1")
+
+
+def get_openai_client():
+    from openai import AsyncOpenAI
+    return AsyncOpenAI(api_key=_OPENROUTER_API_KEY, base_url=_OPENROUTER_BASE_URL)
+
+
+def ensure_api_root_on_path() -> None:
+    if str(_API_ROOT) not in sys.path:
+        sys.path.insert(0, str(_API_ROOT))
+
+
+def load_workflows() -> dict:
+    import yaml
+    with open(YAML_PATH, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def sse(event_data: dict) -> str:
+    return f"data: {json.dumps(event_data)}\n\n"
+
+
+def accumulate_usage(acc: Dict[str, int], usage) -> None:
+    if not usage:
+        return
+    acc["prompt_tokens"]     += getattr(usage, "prompt_tokens",     0) or 0
+    acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+    acc["total_tokens"]      += getattr(usage, "total_tokens",      0) or 0
+
+
+def extract_json(text: str) -> str:
+    text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
+    for opener, closer in [('{', '}'), ('[', ']')]:
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text[start:], start):
+            if esc:
+                esc = False
+                continue
+            if ch == '\\' and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+            if not in_str:
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+    return text
+
+
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "apply", "update"}
+
+
+def find_column(columns, candidates: List[str]) -> Optional[str]:
+    normalized = {str(c).strip().lower().replace(" ", "").replace("_", ""): c for c in columns}
+    for candidate in candidates:
+        key = candidate.strip().lower().replace(" ", "").replace("_", "")
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def clean_row_dict(row: dict) -> dict:
+    cleaned = {}
+    for key, value in row.items():
+        try:
+            is_null = value is None or (hasattr(value, "__class__") and str(value) == "nan")
+        except Exception:
+            is_null = value is None
+        cleaned[str(key)] = None if is_null else value
+    return cleaned
+
+
+def get_allowed_roots() -> List[Path]:
+    ws_raw = os.environ.get("WORKFLOW_WORKSPACE", "").strip()
+    if ws_raw:
+        return [Path(ws_raw).resolve()]
+    ap_raw = os.environ.get("AI_ALLOWED_PATHS", "").strip()
+    if ap_raw:
+        return [Path(p.strip()).resolve() for p in ap_raw.split(";") if p.strip()]
+    return []
+
+
+def secure_path(raw: str) -> Path:
+    resolved = Path(raw).resolve()
+    roots = get_allowed_roots()
+    if not roots:
+        return resolved
+    if any(resolved == root or root in resolved.parents for root in roots):
+        return resolved
+    roots_str = ", ".join(str(r) for r in roots)
+    raise ValueError(f"Access denied: '{raw}' is outside the allowed workspace(s): {roots_str}")
+
+
+def eval_condition(condition: str, confirmed_params: dict) -> bool:
+    """Evaluate a simple key == 'value' or key != 'value' condition string."""
+    if not condition:
+        return True
+    m = re.match(r"^\s*(\w+)\s*(==|!=)\s*['\"]([^'\"]*)['\"]", condition.strip())
+    if not m:
+        return True
+    key, op, value = m.group(1), m.group(2), m.group(3)
+    actual = str(confirmed_params.get(key) or "").strip()
+    return (actual == value) if op == "==" else (actual != value)
+
+
+def render_template(template: str, confirmed_params: dict, prior_results: dict) -> str:
+    """Render a {{key}} or {{step_id.field}} template against params and prior step results."""
+    def _resolve(match):
+        key = match.group(1).strip()
+        if "." in key:
+            step_id, field = key.split(".", 1)
+            step_entry = prior_results.get(step_id, {})
+            val = step_entry.get("value", {})
+            if isinstance(val, dict):
+                resolved = val.get(field, json.dumps(val, default=str))
+            elif isinstance(val, list):
+                resolved = json.dumps(val[:15], default=str)
+            else:
+                resolved = str(val)
+            return str(resolved)[:3000]
+        val = confirmed_params.get(key, "")
+        if isinstance(val, (dict, list)):
+            return json.dumps(val, default=str)[:500]
+        return str(val) if val is not None else ""
+
+    return re.sub(r"\{\{([^}]+)\}\}", _resolve, template)

@@ -1,0 +1,5 @@
+# Import executors first so all @executor decorators register before the router is used.
+from . import executors  # noqa: F401
+from .router import router
+
+__all__ = ["router"]

@@ -1,0 +1,205 @@
+"""
+Core workflow logic: intent classification, param extraction, step execution loop.
+"""
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+from .registry import execute_step
+from .utils import accumulate_usage, eval_condition, sse
+
+logger = logging.getLogger(__name__)
+
+_CLASSIFICATION_PROMPT = """You are a workflow router. Given the user message and the list of available workflows, identify the single best matching workflow.
+
+Available workflows:
+{workflows_summary}
+
+User message: "{message}"
+
+Respond with JSON only (no markdown fences):
+{{"workflow_id": "<id_or_null>", "confidence": 0.0}}
+
+Rules:
+- workflow_id must exactly match one of the available ids, or be null if nothing matches
+- confidence: 0.0-1.0. Use null if confidence < 0.35."""
+
+_EXTRACTION_PROMPT = """Extract the following parameter values from the user message.
+
+Parameters:
+{params_list}
+
+User message: "{message}"
+
+Respond with JSON only (no markdown). Return each parameter key with its extracted string value, or null if not found.
+Example: {{"file_path": "/opt/config.xlsx", "control_type": null}}"""
+
+
+def _extract_json(text: str) -> str:
+    from .utils import extract_json
+    return extract_json(text)
+
+
+def _extract_message_content(content) -> str:
+    from ..ai_assistant import extract_message_content
+    return extract_message_content(content)
+
+
+async def classify_intent(client, model: str, message: str, workflows: list) -> tuple:
+    parts = []
+    for w in workflows:
+        ic = w.get("intent_classification", {})
+        examples = ic.get("examples", [])[:5]
+        keywords = ic.get("keywords", [])[:10]
+        parts.append(
+            f"- id: {w['id']}\n  name: {w['name']}\n"
+            f"  description: {w['description']}\n"
+            f"  examples: {examples}\n"
+            f"  keywords: {keywords}"
+        )
+    prompt = _CLASSIFICATION_PROMPT.format(
+        workflows_summary="\n".join(parts),
+        message=message,
+    )
+    result = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=120,
+    )
+    raw = _extract_message_content(result.choices[0].message.content)
+    try:
+        return json.loads(_extract_json(raw)), result.usage
+    except Exception:
+        return {"workflow_id": None, "confidence": 0.0}, result.usage
+
+
+async def extract_params(client, model: str, message: str, params: list) -> tuple:
+    if not params:
+        return {}, None
+    lines = []
+    for p in params:
+        line = f"- key: {p['key']}, label: {p['label']}, description: {p.get('description', '')}"
+        if p.get("options"):
+            line += f", allowed_values: {p['options']}"
+        if p.get("example"):
+            line += f", example: \"{p['example']}\""
+        lines.append(line)
+    prompt = _EXTRACTION_PROMPT.format(
+        params_list="\n".join(lines),
+        message=message,
+    )
+    result = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=500,
+    )
+    raw = _extract_message_content(result.choices[0].message.content)
+    try:
+        return json.loads(_extract_json(raw)), result.usage
+    except Exception:
+        return {p["key"]: None for p in params}, result.usage
+
+
+def find_missing_params(params: list, extracted: dict) -> list:
+    missing = []
+    for p in params:
+        if p.get("required", False):
+            val = extracted.get(p["key"])
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(p)
+    return missing
+
+
+async def execute_workflow_steps(
+    workflow: dict,
+    confirmed_params: dict,
+    client,
+    model: str,
+    usage_acc: Dict[str, int] = None,
+):
+    steps = workflow.get("steps", [])
+    prior_results: Dict[str, Any] = {}
+    errors = 0
+    final_content = ""
+    if usage_acc is None:
+        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    for idx, step in enumerate(steps):
+        step_id = step["id"]
+
+        yield sse({
+            "event": "step_start",
+            "step_id": step_id,
+            "step_name": step["name"],
+            "step_index": idx,
+            "total_steps": len(steps),
+        })
+
+        # Evaluate optional condition — skip step if condition is false
+        condition = step.get("condition")
+        if condition and not eval_condition(condition, confirmed_params):
+            prior_results[step_id] = {"status": "skipped", "value": f"Condition not met: {condition}"}
+            yield sse({
+                "event": "step_result",
+                "step_id": step_id,
+                "step_name": step["name"],
+                "status": "skipped",
+                "result_preview": f"skipped — {condition}",
+            })
+            continue
+
+        status, result = await execute_step(step, confirmed_params, prior_results, client, model, usage_acc)
+
+        if status == "llm_stream":
+            gen = result
+            accumulated = ""
+            async for chunk_type, chunk_content in gen:
+                if chunk_type == "chunk":
+                    accumulated += chunk_content
+                    yield sse({"event": "llm_chunk", "content": chunk_content})
+                elif chunk_type == "done":
+                    accumulated = chunk_content
+                    final_content = accumulated
+                elif chunk_type == "usage":
+                    accumulate_usage(usage_acc, chunk_content)
+                elif chunk_type == "error":
+                    status = "error"
+                    result = chunk_content
+                    errors += 1
+                    break
+            if status == "llm_stream":
+                status = "success"
+                result = accumulated
+
+        if status == "error":
+            errors += 1
+
+        prior_results[step_id] = {"status": status, "value": result}
+
+        if isinstance(result, str):
+            preview = result[:300]
+        elif isinstance(result, (list, dict)):
+            preview = json.dumps(result, default=str)[:300]
+        else:
+            preview = str(result)[:300]
+
+        yield sse({
+            "event": "step_result",
+            "step_id": step_id,
+            "step_name": step["name"],
+            "status": status,
+            "result_preview": preview,
+        })
+
+    yield sse({"event": "final", "content": final_content})
+    yield sse({
+        "event": "done",
+        "needs_confirm": False,
+        "workflow_id": workflow["id"],
+        "total_steps_run": len(steps),
+        "errors": errors,
+        "usage": usage_acc,
+    })

@@ -1,0 +1,105 @@
+"""
+Executors: file_read, file_write, file_write_summary
+"""
+import logging
+
+from ..registry import executor
+from ..utils import secure_path
+
+logger = logging.getLogger(__name__)
+
+
+@executor("file_read")
+async def _exec_read_file(step, confirmed_params, prior_results, **ctx):
+    import pandas as pd
+    file_path = (confirmed_params.get("input_file_path") or "").strip()
+    if not file_path:
+        return "skipped", []
+
+    try:
+        path = secure_path(file_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    if not path.exists():
+        return "error", f"File not found: {file_path}"
+
+    try:
+        suffix = path.suffix.lower()
+        if suffix in (".xlsx", ".xls"):
+            sheet = confirmed_params.get("sheet_name") or 0
+            df = pd.read_excel(path, sheet_name=sheet)
+        elif suffix == ".csv":
+            df = pd.read_csv(path)
+        else:
+            return "error", f"Unsupported file type '{suffix}'. Use .xlsx, .xls, or .csv"
+
+        df = df.head(500)
+        rows = df.where(df.notna(), other=None).to_dict(orient="records")
+        return "success", {"rows": rows, "row_count": len(rows), "columns": list(df.columns), "file": file_path}
+    except Exception as exc:
+        logger.error("Read file error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("file_write")
+async def _exec_write_file(step, confirmed_params, prior_results, **ctx):
+    import pandas as pd
+    output_path = (confirmed_params.get("output_file_path") or "").strip()
+    if not output_path:
+        return "skipped", "No output path specified"
+
+    try:
+        secure_out = secure_path(output_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    transform_result = prior_results.get("execute_transform", {}).get("value")
+    if not transform_result or isinstance(transform_result, str):
+        return "error", "No transform results available to write"
+
+    try:
+        path = secure_out
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(transform_result if isinstance(transform_result, list) else [transform_result])
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            df.to_csv(path, index=False)
+        else:
+            if suffix not in (".xlsx", ".xls"):
+                path = path.with_suffix(".xlsx")
+            df.to_excel(path, index=False)
+        return "success", {"written_to": str(path), "rows": len(df), "columns": list(df.columns)}
+    except Exception as exc:
+        logger.error("Write file error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("file_write_summary")
+async def _exec_write_summary(step, confirmed_params, prior_results, **ctx):
+    output_path = (confirmed_params.get("summary_output_path") or "").strip()
+    if not output_path:
+        return "skipped", "No summary output path specified"
+
+    try:
+        secure_out = secure_path(output_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    summary = prior_results.get("summarize", {}).get("value", "")
+    if not summary:
+        return "error", "No summary content to write"
+
+    try:
+        path = secure_out
+        path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix.lower()
+        if suffix in (".xlsx", ".xls"):
+            import pandas as pd
+            pd.DataFrame({"Validation Summary": [summary]}).to_excel(path, index=False)
+        else:
+            path.write_text(summary, encoding="utf-8")
+        return "success", {"written_to": str(path), "size_chars": len(summary)}
+    except Exception as exc:
+        logger.error("Write summary error: %s", exc, exc_info=True)
+        return "error", str(exc)
