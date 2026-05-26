@@ -1,1308 +1,3238 @@
+src/components/loadworkflowmodel.jsx
+line 38
+const response = await fetch(`${API_BASE_URL}/api/workflows/delete/${workflowId}`, {
+-------------------------
+supervisery_sub.py
 
-  # ────────────────────────────────────────────────────────
-  - id: formula_builder
-    name: "Formula Builder & Auto-Test"
-    description: "Describe a transformation in plain English — the LLM generates the correct formula config, creates test data, runs it through the transform engine, and summarises the result."
-    icon: "🔧"
-
-    intent_classification:
-      examples:
-        - "create a formula to extract year from transaction_date"
-        - "build a transform to concatenate first_name and last_name"
-        - "I need a formula that maps status codes to labels"
-        - "generate a conditional formula for risk_rating"
-        - "create a transform to calculate age from birthdate"
-        - "build a formula to split account_number on a dash"
-        - "make a formula to round amount to 2 decimal places"
-        - "generate a SetValue formula for the status field"
-        - "create a formula to uppercase the customer_name column"
-        - "build a NumericOperation formula for abs of balance"
-      keywords:
-        - build formula
-        - create formula
-        - generate formula
-        - generate transform
-        - make a formula
-        - formula for
-        - transform for
-        - formula builder
-        - create a transform
-        - write a formula
-        - design a formula
-
-    params:
-      - key: formula_description
-        label: "Formula Description"
-        type: textarea
-        required: true
-        description: "Describe in plain English what transformation you want to achieve"
-        example: "Extract the year from transaction_date and store it in extracted_year"
-
-      - key: new_field_name
-        label: "Output Field Name (optional)"
-        type: text
-        required: false
-        description: "Name for the output field. Leave blank and the LLM will suggest one."
-        example: "extracted_year"
-
-      - key: sample_data
-        label: "Sample Data (optional JSON array)"
-        type: textarea
-        required: false
-        description: "Array of row objects to test against. Leave blank and the LLM will generate realistic test data."
-        example: '[{"id": 1, "transaction_date": "2024-03-15", "amount": 500}]'
-
-    steps:
-      - id: build_formula
-        name: "Generate Formula Config"
-        function_type: llm_build_formula
-        description: "LLM generates operation_type, field names, operation_params, and test data from the description"
-
-      - id: execute_transform
-        name: "Test the Formula"
-        function_type: transform_execute_from_prior
-        formula_step_id: build_formula
-        description: "Runs the LLM-generated formula through the transform engine"
-
-      - id: summarize
-        name: "Summarise Results"
-        function_type: llm_summarize
-        description: "Shows the generated config, before/after values, and confirms correctness"
-        prompt_template: >
-          The user wanted: "{{formula_description}}"
-
-          Generated formula config (from build_formula step):
-          {{build_formula.result}}
-
-          Transform engine results:
-          {{execute_transform.result}}
-
-          Please:
-          1. Show the generated formula config in a JSON code block
-          2. Show a before/after markdown table of the key field values
-          3. Confirm whether the formula worked as expected
-          4. Highlight any nulls, type issues, or edge cases to watch
-
-  # ────────────────────────────────────────────────────────
-  - id: field_mapping_analyser
-    name: "Field Mapping Formula Analyser"
-    description: "Look up a FieldOperations formula row by row number or field name — the LLM reads it, understands it, generates a corrected version, tests it, and summarises."
-    icon: "📋"
-
-    intent_classification:
-      examples:
-        - "read row 5 from field operations"
-        - "analyse the formula for extracted_year in field mapping"
-        - "look up the field operations formula for risk_score"
-        - "check the field mapping formula at row 12"
-        - "understand the formula for output_amount in fieldoperations"
-        - "analyse and improve the formula for customer_id"
-        - "find and test the formula for new_field balance_flag"
-        - "read row 3 from fieldoperations and test it"
-        - "what does the formula for status_label do"
-        - "analyse the fieldmapping formula for account_type"
-      keywords:
-        - field mapping
-        - field operations
-        - fieldmapping
-        - fieldoperations
-        - formula row
-        - analyse formula
-        - read formula
-        - lookup formula
-        - row from field
-        - field formula
-        - field operations row
-        - row number formula
-
-    params:
-      - key: lookup_type
-        label: "Look Up By"
-        type: select
-        required: true
-        options:
-          - new_field_name
-          - row_number
-        description: "Find the row by its output field name, or by its row number in the sheet"
-        example: "new_field_name"
-
-      - key: lookup_value
-        label: "Field Name or Row Number"
-        type: text
-        required: true
-        description: "The NewFieldName value (e.g. extracted_year) or row number (e.g. 5)"
-        example: "extracted_year"
-
-      - key: control_type
-        label: "Control Type (optional)"
-        type: select
-        required: false
-        options:
-          - QA
-          - COMP
-        description: "Filter to a specific control type — leave blank to search all"
-        example: "QA"
-
-      - key: sample_data
-        label: "Sample Data (optional JSON array)"
-        type: textarea
-        required: false
-        description: "Test rows to run against the formula. Leave blank for LLM-generated test data."
-        example: '[{"trade_date": "2024-01-15", "amount": 200.5}]'
-
-    steps:
-      - id: read_field_mapping
-        name: "Read FieldOperations Row"
-        function_type: read_config_row
-        sheet: FieldOperations
-        description: "Fetches the matching row(s) from the FieldOperations config parquet by field name or row number"
-
-      - id: analyse_formula
-        name: "Analyse & Improve Formula"
-        function_type: llm_build_formula_from_row
-        source_step_id: read_field_mapping
-        description: "LLM reads the existing formula config, understands it, and generates a corrected/improved version with test data"
-
-      - id: execute_transform
-        name: "Test the Improved Formula"
-        function_type: transform_execute_from_prior
-        formula_step_id: analyse_formula
-        description: "Runs the LLM-generated improved formula through the transform engine"
-
-      - id: summarize
-        name: "Summarise Analysis"
-        function_type: llm_summarize
-        description: "Explains the original formula, improvements made, and test results"
-        prompt_template: >
-          A FieldOperations formula row was retrieved and analysed.
-
-          Original row from FieldOperations config:
-          {{read_field_mapping.result}}
-
-          LLM-generated improved formula config:
-          {{analyse_formula.result}}
-
-          Transform test results:
-          {{execute_transform.result}}
-
-          Please:
-          1. Show the original formula row as a table
-          2. Explain in plain English what the formula does
-          3. Show the improved formula config in a JSON code block and note any changes made
-          4. Show a before/after table of the test results
-          5. Flag any issues found in the original or edge cases to watch
-
--------------------------------------------------------------------------
 """
-Workflow Assistant Router
-
-Non-agentic AI assistant where workflows are defined in YAML.
-The LLM is used only for:
-  1. Intent classification — pick the right workflow
-  2. Param extraction — pull required values from the user message
-  3. Step summarization — explain the results in natural language
-
-All step execution is deterministic and uses direct Python imports.
+Subprocess worker for supervisory aggregations.
+Reads JSON from stdin and writes JSON to stdout.
 """
-import asyncio
+
+from __future__ import annotations
+
 import json
-import logging
 import re
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-import yaml
-import os
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
-from pydantic import BaseModel
-
-from .ai_assistant import extract_message_content
-from .rag_service import get_rag_kb
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/workflow-ai", tags=["Workflow AI Assistant"])
-
-YAML_PATH = Path(__file__).resolve().parent.parent / "workflow_definitions.yaml"
-_API_ROOT = Path(__file__).resolve().parent.parent
-
-_OPENROUTER_API_KEY = os.environ.get(
-    "OPENAI_API_KEY",
-    "",
-)
-_OPENROUTER_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1")
-
-
-def get_openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=_OPENROUTER_API_KEY, base_url=_OPENROUTER_BASE_URL)
-
-
-def _ensure_api_root_on_path() -> None:
-    if str(_API_ROOT) not in sys.path:
-        sys.path.insert(0, str(_API_ROOT))
-
-
-def load_workflows() -> dict:
-    with open(YAML_PATH, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
-
-
-def _sse(event_data: dict) -> str:
-    return f"data: {json.dumps(event_data)}\n\n"
-
-
-def _accumulate_usage(acc: Dict[str, int], usage) -> None:
-    if not usage:
-        return
-    acc["prompt_tokens"]     += getattr(usage, "prompt_tokens",     0) or 0
-    acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-    acc["total_tokens"]      += getattr(usage, "total_tokens",      0) or 0
-
-
-def _extract_json(text: str) -> str:
-    """Find and return the first complete JSON object or array from raw LLM text.
-
-    Strips code fences first, then walks character-by-character to find the
-    matching closing bracket — handles preamble text before the JSON object.
-    """
-    text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
-    for opener, closer in [('{', '}'), ('[', ']')]:
-        start = text.find(opener)
-        if start == -1:
-            continue
-        depth = 0
-        in_str = False
-        esc = False
-        for i, ch in enumerate(text[start:], start):
-            if esc:
-                esc = False
-                continue
-            if ch == '\\' and in_str:
-                esc = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-            if not in_str:
-                if ch == opener:
-                    depth += 1
-                elif ch == closer:
-                    depth -= 1
-                    if depth == 0:
-                        return text[start:i + 1]
-    return text
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Path security
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _get_allowed_roots() -> List[Path]:
-    """Return the list of allowed root directories for file I/O.
-
-    Resolution order:
-      1. WORKFLOW_WORKSPACE env var  — explicit workspace for this assistant
-      2. AI_ALLOWED_PATHS env var    — shared allowlist used by ai_assistant / ai_tools
-      3. Empty list                  — no restriction (preserves previous behaviour)
-    """
-    ws_raw = os.environ.get("WORKFLOW_WORKSPACE", "").strip()
-    if ws_raw:
-        return [Path(ws_raw).resolve()]
-    ap_raw = os.environ.get("AI_ALLOWED_PATHS", "").strip()
-    if ap_raw:
-        return [Path(p.strip()).resolve() for p in ap_raw.split(";") if p.strip()]
-    return []
-
-
-def _secure_path(raw: str) -> Path:
-    """Resolve *raw* to an absolute path and verify it is inside an allowed root.
-
-    - Calls Path.resolve() so symlinks and ``../`` traversal attempts are
-      normalised before the check.
-    - Raises ValueError with a clear message if the path escapes every root.
-    - Returns the resolved Path when safe (or when no restriction is configured).
-    """
-    resolved = Path(raw).resolve()
-    roots = _get_allowed_roots()
-    if not roots:
-        return resolved  # no restriction configured
-    if any(resolved == root or root in resolved.parents for root in roots):
-        return resolved
-    roots_str = ", ".join(str(r) for r in roots)
-    raise ValueError(
-        f"Access denied: '{raw}' is outside the allowed workspace(s): {roots_str}"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Request model
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-
-class WorkflowChatRequest(BaseModel):
-    message: str
-    conversation_history: List[Message] = []
-    model: str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-    workflow_id: Optional[str] = None
-    confirmed_params: Optional[Dict[str, Any]] = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 — Intent classification
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CLASSIFICATION_PROMPT = """You are a workflow router. Given the user message and the list of available workflows, identify the single best matching workflow.
-
-Available workflows:
-{workflows_summary}
-
-User message: "{message}"
-
-Respond with JSON only (no markdown fences):
-{{"workflow_id": "<id_or_null>", "confidence": 0.0}}
-
-Rules:
-- workflow_id must exactly match one of the available ids, or be null if nothing matches
-- confidence: 0.0-1.0. Use null if confidence < 0.35."""
-
-
-async def classify_intent(client, model: str, message: str, workflows: list) -> dict:
-    parts = []
-    for w in workflows:
-        ic = w.get("intent_classification", {})
-        examples = ic.get("examples", [])[:5]
-        keywords = ic.get("keywords", [])[:10]
-        parts.append(
-            f"- id: {w['id']}\n  name: {w['name']}\n"
-            f"  description: {w['description']}\n"
-            f"  examples: {examples}\n"
-            f"  keywords: {keywords}"
-        )
-    prompt = _CLASSIFICATION_PROMPT.format(
-        workflows_summary="\n".join(parts),
-        message=message,
-    )
-    result = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=120,
-    )
-    raw = extract_message_content(result.choices[0].message.content)
-    try:
-        return json.loads(_extract_json(raw)), result.usage
-    except Exception:
-        return {"workflow_id": None, "confidence": 0.0}, result.usage
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2 — Param extraction
-# ─────────────────────────────────────────────────────────────────────────────
-
-_EXTRACTION_PROMPT = """Extract the following parameter values from the user message.
-
-Parameters:
-{params_list}
-
-User message: "{message}"
-
-Respond with JSON only (no markdown). Return each parameter key with its extracted string value, or null if not found.
-Example: {{"file_path": "/opt/config.xlsx", "control_type": null}}"""
-
-
-async def extract_params(client, model: str, message: str, params: list) -> dict:
-    if not params:
-        return {}
-    lines = []
-    for p in params:
-        line = f"- key: {p['key']}, label: {p['label']}, description: {p.get('description', '')}"
-        if p.get("options"):
-            line += f", allowed_values: {p['options']}"
-        if p.get("example"):
-            line += f", example: \"{p['example']}\""
-        lines.append(line)
-    prompt = _EXTRACTION_PROMPT.format(
-        params_list="\n".join(lines),
-        message=message,
-    )
-    result = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=500,
-    )
-    raw = extract_message_content(result.choices[0].message.content)
-    try:
-        return json.loads(_extract_json(raw)), result.usage
-    except Exception:
-        return {p["key"]: None for p in params}, result.usage
-
-
-def find_missing_params(params: list, extracted: dict) -> list:
-    missing = []
-    for p in params:
-        if p.get("required", False):
-            val = extracted.get(p["key"])
-            if val is None or (isinstance(val, str) and not val.strip()):
-                missing.append(p)
-    return missing
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 4 — Step executors (direct Python imports, no HTTP)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _exec_read_file(confirmed_params: dict, prior_results: dict):
-    _ensure_api_root_on_path()
-    file_path = (confirmed_params.get("input_file_path") or "").strip()
-    if not file_path:
-        return "skipped", []
-
-    try:
-        path = _secure_path(file_path)
-    except ValueError as exc:
-        return "error", str(exc)
-
-    if not path.exists():
-        return "error", f"File not found: {file_path}"
-
-    try:
-        import pandas as pd
-        suffix = path.suffix.lower()
-        if suffix in (".xlsx", ".xls"):
-            sheet = confirmed_params.get("sheet_name") or 0
-            df = pd.read_excel(path, sheet_name=sheet)
-        elif suffix == ".csv":
-            df = pd.read_csv(path)
-        else:
-            return "error", f"Unsupported file type '{suffix}'. Use .xlsx, .xls, or .csv"
-
-        df = df.head(500)
-        rows = df.where(df.notna(), other=None).to_dict(orient="records")
-        return "success", {"rows": rows, "row_count": len(rows), "columns": list(df.columns), "file": file_path}
-    except Exception as exc:
-        logger.error("Read file error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_write_file(confirmed_params: dict, prior_results: dict):
-    _ensure_api_root_on_path()
-    output_path = (confirmed_params.get("output_file_path") or "").strip()
-    if not output_path:
-        return "skipped", "No output path specified"
-
-    try:
-        secure_out = _secure_path(output_path)
-    except ValueError as exc:
-        return "error", str(exc)
-
-    transform_result = prior_results.get("execute_transform", {}).get("value")
-    if not transform_result or isinstance(transform_result, str):
-        return "error", "No transform results available to write"
-
-    try:
-        import pandas as pd
-        path = secure_out
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        df = pd.DataFrame(transform_result if isinstance(transform_result, list) else [transform_result])
-        suffix = path.suffix.lower()
-        if suffix == ".csv":
-            df.to_csv(path, index=False)
-        else:
-            if suffix not in (".xlsx", ".xls"):
-                path = path.with_suffix(".xlsx")
-            df.to_excel(path, index=False)
-
-        return "success", {"written_to": str(path), "rows": len(df), "columns": list(df.columns)}
-    except Exception as exc:
-        logger.error("Write file error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_write_summary(confirmed_params: dict, prior_results: dict):
-    output_path = (confirmed_params.get("summary_output_path") or "").strip()
-    if not output_path:
-        return "skipped", "No summary output path specified"
-
-    try:
-        secure_out = _secure_path(output_path)
-    except ValueError as exc:
-        return "error", str(exc)
-
-    summary = prior_results.get("summarize", {}).get("value", "")
-    if not summary:
-        return "error", "No summary content to write"
-
-    try:
-        path = secure_out
-        path.parent.mkdir(parents=True, exist_ok=True)
-        suffix = path.suffix.lower()
-
-        if suffix in (".xlsx", ".xls"):
-            import pandas as pd
-            df = pd.DataFrame({"Validation Summary": [summary]})
-            df.to_excel(path, index=False)
-        else:
-            path.write_text(summary, encoding="utf-8")
-
-        return "success", {"written_to": str(path), "size_chars": len(summary)}
-    except Exception as exc:
-        logger.error("Write summary error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_transform(confirmed_params: dict, prior_results: dict):
-    _ensure_api_root_on_path()
-    try:
-        import pandas as pd
-        from transform_operations.transform_operations import TransformOperations
-
-        ops = TransformOperations()
-
-        # Prefer data read from file over inline JSON
-        read_result = prior_results.get("read_input_file", {})
-        if read_result.get("status") == "success" and read_result.get("value"):
-            file_data = read_result["value"]
-            sample_data = file_data.get("rows", []) if isinstance(file_data, dict) else file_data
-        else:
-            sample_data = confirmed_params.get("sample_data", "[]")
-            if isinstance(sample_data, str):
-                sample_data = json.loads(sample_data) if sample_data.strip() else []
-
-        if not sample_data:
-            return "error", "No sample data provided. Either supply Sample Data JSON or an Input File Path."
-
-        op_params_raw = confirmed_params.get("operation_params") or "{}"
-        if isinstance(op_params_raw, str) and op_params_raw.strip():
-            try:
-                op_params = json.loads(op_params_raw)
-            except Exception:
-                op_params = {}
-        elif isinstance(op_params_raw, dict):
-            op_params = op_params_raw
-        else:
-            op_params = {}
-
-        operation = {
-            "Operation": confirmed_params.get("operation_type", ""),
-            "NewFieldName": confirmed_params.get("new_field_name", ""),
-            "Inputs": confirmed_params.get("input_fields", ""),
-            **op_params,
-        }
-
-        df = pd.DataFrame(sample_data)
-        result_df = ops.execute_operation(df, operation)
-        result_df = result_df.where(result_df.notna(), other=None)
-        # Convert Timestamps and other non-JSON types to strings
-        for col in result_df.columns:
-            if result_df[col].dtype.kind in ("M", "m"):  # datetime / timedelta
-                result_df[col] = result_df[col].astype(str)
-        return "success", result_df.to_dict(orient="records")
-    except Exception as exc:
-        logger.error("Transform step error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_config_validate_start(confirmed_params: dict, prior_results: dict):
-    _ensure_api_root_on_path()
-    try:
-        from control_execution.control_runner import control_runner
-        from control_execution.task_persistence import TASK_STORAGE_DIR
-
-        file_path = (confirmed_params.get("file_path") or "").strip()
-        control_type = (confirmed_params.get("control_type") or "").strip()
-
-        results_dir = TASK_STORAGE_DIR / "config_validator_results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-
-        control_params = {
-            "control_name": "config_validator",
-            "task_name": f"Config Validation ({control_type}) - {Path(file_path).name}",
-            "run_env": "DEV",
-            "expected_run_date": datetime.now().strftime("%Y-%m-%d"),
-            "python_script_path": "api/config_validator_script.py",
-            "script_arguments": [file_path, control_type],
-            "environment_variables": {
-                "FILE_PATH": file_path,
-                "CONTROL_TYPE": control_type,
-                "RESULTS_DIR": str(results_dir),
-            },
-            "control_id": "config_validator",
-        }
-        result = control_runner.run_control_task(control_params)
-        return "success", result
-    except Exception as exc:
-        logger.error("Config validate start error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_poll_until(confirmed_params: dict, prior_results: dict, poll_config: dict):
-    _ensure_api_root_on_path()
-    try:
-        from control_execution.control_runner import control_runner
-
-        start_result = prior_results.get("start_validation", {}).get("value", {})
-        task_id = start_result.get("task_id") if isinstance(start_result, dict) else None
-        if not task_id:
-            return "error", "No task_id from start_validation step"
-
-        interval = poll_config.get("interval_seconds", 3)
-        max_attempts = poll_config.get("max_attempts", 40)
-        done_statuses = poll_config.get("done_statuses", ["completed", "failed", "error"])
-
-        for _ in range(max_attempts):
-            status = control_runner.get_task_status(task_id)
-            if status.get("status", "") in done_statuses:
-                return "success", status
-            await asyncio.sleep(interval)
-
-        return "error", f"Polling timed out after {max_attempts * interval}s"
-    except Exception as exc:
-        logger.error("Poll step error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_config_search(confirmed_params: dict, prior_results: dict):
-    _ensure_api_root_on_path()
-    try:
-        from routers.config_search import (
-            _run_parquet_subprocess,
-            get_available_types,
-            get_file_path,
-        )
-
-        query = (confirmed_params.get("query") or "").strip()
-        sheet_filter = (confirmed_params.get("sheet") or "").strip()
-        type_filter = (confirmed_params.get("control_type") or "").strip()
-
-        if not query:
-            return "error", "Search query is required"
-
-        available_sheets = ["InputFiles", "rules", "Enrichment", "FieldOperations", "OutputRule"]
-        sheets_to_search = [sheet_filter] if sheet_filter else available_sheets
-        types_to_search = [type_filter] if type_filter else get_available_types()
-
-        results_all: List[dict] = []
-        for type_name in types_to_search:
-            for sheet_name in sheets_to_search:
-                file_path = get_file_path(type_name, sheet_name)
-                if not file_path.exists():
-                    continue
-                try:
-                    sr = _run_parquet_subprocess("search", {
-                        "file_path": str(file_path),
-                        "query": query,
-                        "column": None,
-                        "limit": 100,
-                    })
-                    rows = sr.get("results", [])
-                    for row in rows[:20]:
-                        row["_type"] = type_name
-                        row["_sheet"] = sheet_name
-                    results_all.extend(rows[:20])
-                except Exception:
-                    continue
-
-        return "success", {"results": results_all, "total": len(results_all), "query": query}
-    except Exception as exc:
-        logger.error("Config search step error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_llm_summarize(step: dict, confirmed_params: dict, prior_results: dict, client, model: str):
-    """Async generator that yields (chunk_type, content) tuples."""
-    try:
-        prompt_template = step.get("prompt_template", "")
-
-        def _resolve(match):
-            key = match.group(1).strip()
-            if "." in key:
-                step_id, field = key.split(".", 1)
-                step_entry = prior_results.get(step_id, {})
-                val = step_entry.get("value", {})
-                if isinstance(val, dict):
-                    # Fall back to the full dict JSON if the specific sub-key is absent
-                    resolved = val.get(field, json.dumps(val, default=str))
-                elif isinstance(val, list):
-                    resolved = json.dumps(val[:15], default=str)
-                else:
-                    resolved = str(val)
-                return str(resolved)[:3000]
-            else:
-                val = confirmed_params.get(key, "")
-                if isinstance(val, (dict, list)):
-                    return json.dumps(val, default=str)[:500]
-                return str(val) if val is not None else ""
-
-        rendered = re.sub(r"\{\{([^}]+)\}\}", _resolve, prompt_template)
-
-        # Append full prior results (with statuses) so the LLM knows what actually ran
-        extra_parts = []
-        for sid, sdata in prior_results.items():
-            status = sdata.get("status", "unknown")
-            v = sdata.get("value")
-            if v is not None:
-                extra_parts.append(f"[{sid}] status={status}: {json.dumps(v, default=str)[:3000]}")
-        if extra_parts:
-            rendered += "\n\nFull step results:\n" + "\n".join(extra_parts)
-
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": rendered}],
-            temperature=0.3,
-            max_tokens=1500,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-        full = ""
-        last_usage = None
-        async for chunk in stream:
-            if chunk.usage:
-                last_usage = chunk.usage
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                full += delta.content
-                yield "chunk", delta.content
-        yield "done", full
-        yield "usage", last_usage
-    except Exception as exc:
-        logger.error("LLM summarize error: %s", exc, exc_info=True)
-        yield "error", str(exc)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Formula Builder executors
-# ─────────────────────────────────────────────────────────────────────────────
-
-_FORMULA_SYSTEM_PROMPT = """You are a ControlDash transform formula expert. Generate a valid transform operation config as JSON.
-
-Available operation types and their parameters:
-- DateExtract   : Inputs=<date_col>, operation_params={"component": "year|month|day|hour|minute|second|weekday|quarter|dayofyear"}
-- Concatenate   : Inputs=<col1,col2,...>, operation_params={"separator": " "}
-- Formula       : Inputs=<col1,col2,...>, operation_params={"formulastring": "<pandas eval expr, e.g. col1 * 0.1>"}
-- Conditional   : Inputs=<col>, operation_params={"condition": "<expr>", "true_value": "<val>", "false_value": "<val>"}
-- MapValues     : Inputs=<col>, operation_params={"mapping": {"old": "new", ...}}
-- StringOperation: Inputs=<col>, operation_params={"operation": "upper|lower|strip|title|reverse"}
-- NumericOperation: Inputs=<col1,col2,...>, operation_params={"operation": "abs|round|ceil|floor|sqrt|log|sum|mean|max|min", "decimal_places": 2}
-- SetValue      : Inputs=<any_col>, operation_params={"value": "<fixed_value>"}
-- CopyField     : Inputs=<source_col>
-- Split         : Inputs=<col>, operation_params={"delimiter": "-", "index": 0}
-- Replace       : Inputs=<col>, operation_params={"pattern": "old", "replacement": "new", "use_regex": false}
-
-Respond with valid JSON only — no markdown, no text outside the JSON:
-{
-  "operation_type": "...",
-  "new_field_name": "snake_case_output_name",
-  "input_fields": "col1" or "col1,col2",
-  "operation_params": { ... },
-  "sample_data": [ { "col1": "val1" }, ... ],
-  "explanation": "one-line plain-English description of what this formula does"
+import traceback
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import polars as pl
+import pyarrow.parquet as pq
+
+
+FILTER_COLUMNS = {
+    "regulation": "Regulation",
+    "asset_class": "AssetClass",
+    "control_type": "Control Type",
+    "data_type": "Data Type",
+    "sub_control_type": "Sub-ControlType",
+    "remediation_status": "RemediationStatus",
+    "explain_issue": "ExplainIssue",
+    "explain_issue_notification": "ExplainIssueNotification",
+    "explain_issue_detail": "ExplainIssueDetail",
 }
 
-Rules:
-- sample_data must have at least 3 rows containing ALL input field(s) with realistic values
-- new_field_name must be snake_case
-- operation_params must only include keys valid for the chosen operation_type
-- If user supplies sample_data, use those rows exactly; otherwise generate realistic test rows"""
+AGE_BUCKETS_BY_SET = {
+    "CFTC": ["0-3", "3-7", "7-14", "14-30", "30-60"],
+    "EMIR": ["0-2", "3-10", "11-30", "31-50"],
+}
+DEFAULT_BUCKET_SET = "CFTC"
+AGE_BUCKET_COLUMNS = AGE_BUCKETS_BY_SET["CFTC"]
+DEFAULT_INITIAL_FILTERS = {
+    "regulation": ["CFTC-P45"],
+    "asset_class": ["FX"],
+    "data_type": ["TRADESTATE"],
+}
+
+DISPLAY_LABELS = {
+    "Regulation": "Regulation",
+    "AssetClass": "Asset Class",
+    "Control Type": "Control Type",
+    "Data Type": "Data Type",
+    "Sub-ControlType": "Sub-Control Type",
+    "RemediationPlan": "Remediation Plan",
+    "RemediationStatus": "Remediation Status",
+    "ExplainIssue": "ExplainIssue",
+    "ExplainIssueNotification": "ExplainIssueNotification",
+    "ExplainIssueDetail": "ExplainIssueDetail",
+}
+
+AGE_BUCKET_SET_COLUMN_CANDIDATES = {
+    "CFTC": {
+        "0-3": ["0-3", "CFTC_0-3", "0-3_CFTC", "CFTC_0_3", "0_3_CFTC"],
+        "3-7": ["3-7", "CFTC_3-7", "3-7_CFTC", "CFTC_3_7", "3_7_CFTC"],
+        "7-14": ["7-14", "CFTC_7-14", "7-14_CFTC", "CFTC_7_14", "7_14_CFTC"],
+        "14-30": ["14-30", "CFTC_14-30", "14-30_CFTC", "CFTC_14_30", "14_30_CFTC"],
+        "30-60": ["30-60", "CFTC_30-60", "30-60_CFTC", "CFTC_30_60", "30_60_CFTC"],
+    },
+    "EMIR": {
+        "0-2": ["0-2", "EMIR_0-2", "0-2_EMIR", "EMIR_0_2", "0_2_EMIR"],
+        "3-10": ["3-10", "EMIR_3-10", "3-10_EMIR", "EMIR_3_10", "3_10_EMIR"],
+        "11-30": ["11-30", "EMIR_11-30", "11-30_EMIR", "EMIR_11_30", "11_30_EMIR"],
+        "31-50": ["31-50", "EMIR_31-50", "31-50_EMIR", "EMIR_31_50", "31_50_EMIR"],
+    },
+}
 
 
-async def _exec_llm_build_formula(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict):
-    """LLM generates a full transform formula config + test data from a plain-English description."""
-    description = (confirmed_params.get("formula_description") or "").strip()
-    new_field_hint = (confirmed_params.get("new_field_name") or "").strip()
-    sample_data_raw = confirmed_params.get("sample_data", "")
-
-    sample_data = []
-    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
-        try:
-            sample_data = json.loads(sample_data_raw)
-        except Exception:
-            pass
-    elif isinstance(sample_data_raw, list):
-        sample_data = sample_data_raw
-
-    user_msg = f"Build a transform formula for: {description}"
-    if new_field_hint:
-        user_msg += f"\nDesired output field name: {new_field_hint}"
-    if sample_data:
-        user_msg += f"\nUse this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
-
-    # Retrieve relevant RAG context (operation schema + examples) for this description
-    system_prompt = _FORMULA_SYSTEM_PROMPT
-    try:
-        rag_kb = get_rag_kb()
-        chunks = await rag_kb.async_search(description, top_k=2)
-        rag_context = rag_kb.format_context(chunks)
-        if rag_context:
-            system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
-    except Exception as rag_exc:
-        logger.debug("RAG search skipped in build_formula: %s", rag_exc)
-
-    try:
-        result = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=900,
-        )
-        _accumulate_usage(usage_acc, result.usage)
-        raw = extract_message_content(result.choices[0].message.content)
-        formula_config = json.loads(_extract_json(raw))
-        return "success", formula_config
-    except json.JSONDecodeError as exc:
-        return "error", f"LLM returned invalid JSON for formula config: {exc}"
-    except Exception as exc:
-        logger.error("LLM build formula error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_llm_build_formula_from_row(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict):
-    """LLM reads an existing FieldOperations row and generates an improved formula config."""
-    source_step_id = step.get("source_step_id", "read_field_mapping")
-    prior = prior_results.get(source_step_id, {})
-
-    if prior.get("status") != "success":
-        return "error", f"Source step '{source_step_id}' did not succeed — cannot analyse formula"
-
-    row_data = prior.get("value", {})
-    sample_data_raw = confirmed_params.get("sample_data", "")
-    sample_data = []
-    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
-        try:
-            sample_data = json.loads(sample_data_raw)
-        except Exception:
-            pass
-    elif isinstance(sample_data_raw, list):
-        sample_data = sample_data_raw
-
-    user_msg = (
-        f"Analyse and improve this existing FieldOperations formula row:\n"
-        f"{json.dumps(row_data, default=str)[:2000]}\n\n"
-        "Map the columns to the transform format:\n"
-        "  - NewFieldName → new_field_name\n"
-        "  - Operation    → operation_type\n"
-        "  - Inputs       → input_fields\n"
-        "  - All remaining columns → operation_params\n\n"
-    )
-    if sample_data:
-        user_msg += f"Use this sample data exactly: {json.dumps(sample_data[:5], default=str)}"
-    else:
-        user_msg += "Generate at least 3 realistic test rows that include all input field(s)."
-
-    # Build a focused RAG query from the row's Operation + Inputs columns
-    rows_list = row_data.get("rows", [row_data]) if isinstance(row_data, dict) and "rows" in row_data else [row_data]
-    first_row = rows_list[0] if rows_list else {}
-    op_type = str(first_row.get("Operation") or first_row.get("operation_type") or "transform")
-    rag_query = f"{op_type} transform operation"
-
-    system_prompt = _FORMULA_SYSTEM_PROMPT
-    try:
-        rag_kb = get_rag_kb()
-        chunks = await rag_kb.async_search(rag_query, top_k=2)
-        rag_context = rag_kb.format_context(chunks)
-        if rag_context:
-            system_prompt = rag_context + "\n\n" + _FORMULA_SYSTEM_PROMPT
-    except Exception as rag_exc:
-        logger.debug("RAG search skipped in build_formula_from_row: %s", rag_exc)
-
-    try:
-        result = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=900,
-        )
-        _accumulate_usage(usage_acc, result.usage)
-        raw = extract_message_content(result.choices[0].message.content)
-        formula_config = json.loads(_extract_json(raw))
-        return "success", formula_config
-    except json.JSONDecodeError as exc:
-        return "error", f"LLM returned invalid JSON when analysing formula: {exc}"
-    except Exception as exc:
-        logger.error("LLM analyse formula error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-async def _exec_transform_from_prior(step: dict, confirmed_params: dict, prior_results: dict):
-    """Run the transform engine using formula config stored by a prior llm_build_formula step."""
-    formula_step_id = step.get("formula_step_id", "build_formula")
-    prior = prior_results.get(formula_step_id, {})
-
-    if prior.get("status") != "success":
-        return "error", f"Formula step '{formula_step_id}' did not succeed — cannot run transform"
-
-    formula_config = prior.get("value", {})
-    if not isinstance(formula_config, dict):
-        return "error", f"Formula step result is not a dict: {type(formula_config)}"
-
-    merged = {**confirmed_params}
-    for key in ("operation_type", "new_field_name", "input_fields", "operation_params"):
-        if formula_config.get(key) is not None:
-            merged[key] = formula_config[key]
-
-    # Use sample_data from formula config if none was supplied by the user
-    if formula_config.get("sample_data") and not merged.get("sample_data"):
-        merged["sample_data"] = formula_config["sample_data"]
-
-    return await _exec_transform(merged, prior_results)
-
-
-async def _exec_read_config_row(step: dict, confirmed_params: dict, prior_results: dict):
-    """Read a specific row from a config parquet sheet by row number or NewFieldName."""
-    _ensure_api_root_on_path()
-    try:
-        import pandas as pd
-        from routers.config_search import get_available_types, get_file_path
-
-        lookup_type = (confirmed_params.get("lookup_type") or "new_field_name").strip()
-        lookup_value = (confirmed_params.get("lookup_value") or "").strip()
-        type_filter = (confirmed_params.get("control_type") or "").strip()
-        sheet_name = step.get("sheet", "FieldOperations")
-
-        if not lookup_value:
-            return "error", "lookup_value is required"
-
-        types_to_search = [type_filter] if type_filter else get_available_types()
-        found_rows = []
-
-        for type_name in types_to_search:
-            file_path = get_file_path(type_name, sheet_name)
-            if not file_path.exists():
-                continue
-            try:
-                df = pd.read_parquet(file_path)
-                if lookup_type == "row_number":
-                    try:
-                        row_idx = int(lookup_value) - 1  # convert 1-based to 0-based
-                        if 0 <= row_idx < len(df):
-                            row = df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict()
-                            row["_type"] = type_name
-                            row["_sheet"] = sheet_name
-                            row["_row_number"] = int(lookup_value)
-                            found_rows.append(row)
-                    except (ValueError, IndexError):
-                        pass
-                else:
-                    # Match by NewFieldName (try common column name variants)
-                    field_col = next(
-                        (c for c in df.columns if c.lower() in ("newfieldname", "new_field_name", "fieldname", "field_name", "outputfield", "output_field")),
-                        None,
-                    )
-                    if field_col:
-                        mask = df[field_col].astype(str).str.lower() == lookup_value.lower()
-                        for idx, row_data in df[mask].iterrows():
-                            row = row_data.where(row_data.notna(), other=None).to_dict()
-                            row["_type"] = type_name
-                            row["_sheet"] = sheet_name
-                            row["_row_number"] = idx + 1
-                            found_rows.append(row)
-            except Exception as inner_exc:
-                logger.warning("Could not read %s/%s: %s", type_name, sheet_name, inner_exc)
-                continue
-
-        if not found_rows:
-            return "error", f"No rows found matching {lookup_type}='{lookup_value}' in sheet '{sheet_name}'"
-
-        return "success", {"rows": found_rows, "total": len(found_rows), "sheet": sheet_name, "lookup": {lookup_type: lookup_value}}
-    except Exception as exc:
-        logger.error("Read config row error: %s", exc, exc_info=True)
-        return "error", str(exc)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def execute_step(step: dict, confirmed_params: dict, prior_results: dict, client, model: str, usage_acc: dict = None):
-    ft = step.get("function_type", "")
-    ua = usage_acc if usage_acc is not None else {}
-    if ft == "file_read":
-        return await _exec_read_file(confirmed_params, prior_results)
-    elif ft == "file_write":
-        return await _exec_write_file(confirmed_params, prior_results)
-    elif ft == "file_write_summary":
-        return await _exec_write_summary(confirmed_params, prior_results)
-    elif ft == "transform_execute":
-        return await _exec_transform(confirmed_params, prior_results)
-    elif ft == "transform_execute_from_prior":
-        return await _exec_transform_from_prior(step, confirmed_params, prior_results)
-    elif ft == "config_validate_start":
-        return await _exec_config_validate_start(confirmed_params, prior_results)
-    elif ft == "poll_until":
-        return await _exec_poll_until(confirmed_params, prior_results, step.get("poll_config", {}))
-    elif ft == "config_search":
-        return await _exec_config_search(confirmed_params, prior_results)
-    elif ft == "read_config_row":
-        return await _exec_read_config_row(step, confirmed_params, prior_results)
-    elif ft == "llm_build_formula":
-        return await _exec_llm_build_formula(step, confirmed_params, prior_results, client, model, ua)
-    elif ft == "llm_build_formula_from_row":
-        return await _exec_llm_build_formula_from_row(step, confirmed_params, prior_results, client, model, ua)
-    elif ft == "llm_summarize":
-        return "llm_stream", _exec_llm_summarize(step, confirmed_params, prior_results, client, model)
-    else:
-        return "error", f"Unknown function_type: {ft}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def execute_workflow_steps(workflow: dict, confirmed_params: dict, client, model: str, usage_acc: Dict[str, int] = None):
-    steps = workflow.get("steps", [])
-    prior_results: Dict[str, Any] = {}
-    errors = 0
-    final_content = ""
-    if usage_acc is None:
-        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-    for idx, step in enumerate(steps):
-        yield _sse({
-            "event": "step_start",
-            "step_id": step["id"],
-            "step_name": step["name"],
-            "step_index": idx,
-            "total_steps": len(steps),
-        })
-
-        status, result = await execute_step(step, confirmed_params, prior_results, client, model, usage_acc)
-
-        if status == "llm_stream":
-            gen = result
-            accumulated = ""
-            async for chunk_type, chunk_content in gen:
-                if chunk_type == "chunk":
-                    accumulated += chunk_content
-                    yield _sse({"event": "llm_chunk", "content": chunk_content})
-                elif chunk_type == "done":
-                    accumulated = chunk_content
-                    final_content = accumulated
-                elif chunk_type == "usage":
-                    _accumulate_usage(usage_acc, chunk_content)
-                elif chunk_type == "error":
-                    status = "error"
-                    result = chunk_content
-                    errors += 1
-                    break
-            if status == "llm_stream":
-                status = "success"
-                result = accumulated
-
-        if status == "error":
-            errors += 1
-
-        prior_results[step["id"]] = {"status": status, "value": result}
-
-        if isinstance(result, str):
-            preview = result[:300]
-        elif isinstance(result, (list, dict)):
-            preview = json.dumps(result, default=str)[:300]
-        else:
-            preview = str(result)[:300]
-
-        yield _sse({
-            "event": "step_result",
-            "step_id": step["id"],
-            "step_name": step["name"],
-            "status": status,
-            "result_preview": preview,
-        })
-
-    yield _sse({"event": "final", "content": final_content})
-    yield _sse({
-        "event": "done",
-        "needs_confirm": False,
-        "workflow_id": workflow["id"],
-        "total_steps_run": len(steps),
-        "errors": errors,
-        "usage": usage_acc,
-    })
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main SSE stream
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def stream_workflow_chat(request: WorkflowChatRequest):
-    client = get_openai_client()
-    try:
-        data = load_workflows()
-        workflows_list = data.get("workflows", [])
-        workflows_by_id = {w["id"]: w for w in workflows_list}
-
-        usage_acc: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-        # Phase 4 fast-path: confirmed re-send with all params
-        if request.workflow_id and request.confirmed_params is not None:
-            workflow = workflows_by_id.get(request.workflow_id)
-            if not workflow:
-                yield _sse({"event": "error", "error": f"Unknown workflow: {request.workflow_id}"})
-                return
-
-            yield _sse({
-                "event": "workflow_classified",
-                "workflow_id": workflow["id"],
-                "workflow_name": workflow["name"],
-                "description": workflow["description"],
-                "icon": workflow.get("icon", ""),
-                "steps": [{"id": s["id"], "name": s["name"]} for s in workflow["steps"]],
-                "confidence": 1.0,
-            })
-
-            async for chunk in execute_workflow_steps(workflow, request.confirmed_params, client, request.model, usage_acc):
-                yield chunk
-            return
-
-        # Phase 1 — intent classification
-        classification, classify_usage = await classify_intent(client, request.model, request.message, workflows_list)
-        _accumulate_usage(usage_acc, classify_usage)
-        workflow_id = classification.get("workflow_id")
-        confidence = float(classification.get("confidence") or 0.0)
-
-        if not workflow_id or workflow_id not in workflows_by_id or confidence < 0.3:
-            # No match — fallback plain LLM response enriched with RAG context
-            fallback_system = (
-                "You are a helpful assistant for ControlDash, a data orchestration and ETL "
-                "control platform. Help the user with questions about controls, transforms, "
-                "validations, and configurations."
-            )
-            try:
-                rag_kb = get_rag_kb()
-                chunks = await rag_kb.async_search(request.message, top_k=3)
-                rag_context = rag_kb.format_context(chunks)
-                if rag_context:
-                    fallback_system = rag_context + "\n\n" + fallback_system
-            except Exception as rag_exc:
-                logger.debug("RAG search skipped in fallback: %s", rag_exc)
-
-            result = await client.chat.completions.create(
-                model=request.model,
-                messages=[
-                    {"role": "system", "content": fallback_system},
-                    {"role": "user", "content": request.message},
-                ],
-                temperature=0.7,
-                max_tokens=1000,
-            )
-            _accumulate_usage(usage_acc, result.usage)
-            content = extract_message_content(result.choices[0].message.content)
-            yield _sse({"event": "content", "content": content})
-            yield _sse({"event": "done", "needs_confirm": False, "usage": usage_acc})
-            return
-
-        workflow = workflows_by_id[workflow_id]
-
-        yield _sse({
-            "event": "workflow_classified",
-            "workflow_id": workflow_id,
-            "workflow_name": workflow["name"],
-            "description": workflow["description"],
-            "icon": workflow.get("icon", ""),
-            "steps": [{"id": s["id"], "name": s["name"]} for s in workflow["steps"]],
-            "confidence": confidence,
-        })
-
-        # Phase 2 — param extraction
-        params_config = workflow.get("params", [])
-        extracted, extract_usage = await extract_params(client, request.model, request.message, params_config)
-        _accumulate_usage(usage_acc, extract_usage)
-
-        yield _sse({"event": "params_extracted", "extracted_params": extracted})
-
-        # Phase 3 — check for missing required params
-        missing = find_missing_params(params_config, extracted)
-
-        if missing:
-            yield _sse({
-                "event": "params_required",
-                "workflow_id": workflow_id,
-                "missing_params": missing,
-                "extracted_params": extracted,
-                "all_params": params_config,
-            })
-            yield _sse({"event": "done", "needs_confirm": True, "all_params_present": False, "usage": usage_acc})
-        else:
-            yield _sse({
-                "event": "done",
-                "needs_confirm": True,
-                "all_params_present": True,
-                "workflow_id": workflow_id,
-                "extracted_params": extracted,
-                "usage": usage_acc,
-            })
-
-    except Exception as exc:
-        logger.error("Workflow chat error: %s", exc, exc_info=True)
-        yield _sse({"event": "error", "error": str(exc)})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.post("/chat")
-async def chat(request: WorkflowChatRequest):
-    return StreamingResponse(
-        stream_workflow_chat(request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+def ensure_remediation_status(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    schema = lazy_df.collect_schema()
+    if "RemediationStatus" in schema:
+        return lazy_df
+    if "RemediationPlan" not in schema:
+        raise ValueError("Missing required column: RemediationPlan")
+    return lazy_df.with_columns(
+        [
+            pl.when(pl.col("RemediationPlan") == "No action required")
+            .then(pl.lit("Remediated"))
+            .otherwise(pl.lit("Unremediated"))
+            .alias("RemediationStatus")
+        ]
     )
 
 
-@router.get("/workflows")
-async def get_workflows():
-    try:
-        data = load_workflows()
-        workflows = data.get("workflows", [])
-        return {
-            "workflows": [
-                {
-                    "id": w["id"],
-                    "name": w["name"],
-                    "description": w["description"],
-                    "icon": w.get("icon", ""),
-                    "param_count": len(w.get("params", [])),
-                    "step_count": len(w.get("steps", [])),
-                    "params": w.get("params", []),
-                }
-                for w in workflows
-            ]
+def ensure_age_buckets(lazy_df: pl.LazyFrame, bucket_set: str = DEFAULT_BUCKET_SET) -> pl.LazyFrame:
+    schema = lazy_df.collect_schema()
+    if "ErrorAge" not in schema:
+        raise ValueError("Missing required column: ErrorAge")
+
+    selected_set = (bucket_set or DEFAULT_BUCKET_SET).upper()
+    age_col = pl.col("ErrorAge")
+    if selected_set == "EMIR":
+        expressions = [
+            (age_col <= 2).cast(pl.Int64).alias("0-2"),
+            ((age_col > 2) & (age_col <= 10)).cast(pl.Int64).alias("3-10"),
+            ((age_col > 10) & (age_col <= 30)).cast(pl.Int64).alias("11-30"),
+            ((age_col > 30) & (age_col <= 50)).cast(pl.Int64).alias("31-50"),
+        ]
+        return lazy_df.with_columns(expressions)
+
+    expressions = [
+        (age_col <= 3).cast(pl.Int64).alias("0-3"),
+        ((age_col > 3) & (age_col <= 7)).cast(pl.Int64).alias("3-7"),
+        ((age_col > 7) & (age_col <= 14)).cast(pl.Int64).alias("7-14"),
+        ((age_col > 14) & (age_col <= 30)).cast(pl.Int64).alias("14-30"),
+        ((age_col > 30) & (age_col <= 60)).cast(pl.Int64).alias("30-60"),
+    ]
+    return lazy_df.with_columns(expressions)
+
+
+def resolve_age_bucket_column_map(schema_names: set, bucket_set: str) -> Optional[Dict[str, str]]:
+    candidates = AGE_BUCKET_SET_COLUMN_CANDIDATES.get(bucket_set, {})
+    bucket_columns = AGE_BUCKETS_BY_SET.get(bucket_set, AGE_BUCKET_COLUMNS)
+    column_map: Dict[str, str] = {}
+    for bucket in bucket_columns:
+        physical = next((name for name in candidates.get(bucket, []) if name in schema_names), None)
+        if not physical:
+            return None
+        column_map[bucket] = physical
+    return column_map
+
+
+def get_available_bucket_sets(schema_names: set) -> List[str]:
+    available: List[str] = []
+    for bucket_set in AGE_BUCKETS_BY_SET.keys():
+        if resolve_age_bucket_column_map(schema_names, bucket_set):
+            available.append(bucket_set)
+    schema_lower = {name.lower() for name in schema_names}
+    if "errorage" in schema_lower:
+        for bucket_set in AGE_BUCKETS_BY_SET.keys():
+            if bucket_set not in available:
+                available.append(bucket_set)
+    return available
+
+
+def apply_age_bucket_set(lazy_df: pl.LazyFrame, bucket_set: str) -> Tuple[pl.LazyFrame, str, List[str]]:
+    schema = lazy_df.collect_schema()
+    schema_names = set(schema.names())
+    normalized_set = (bucket_set or DEFAULT_BUCKET_SET).upper()
+    available_sets = get_available_bucket_sets(schema_names)
+
+    selected_set = normalized_set if normalized_set in available_sets else DEFAULT_BUCKET_SET
+    if selected_set not in available_sets and available_sets:
+        selected_set = available_sets[0]
+
+    selected_buckets = AGE_BUCKETS_BY_SET.get(selected_set, AGE_BUCKET_COLUMNS)
+    column_map = resolve_age_bucket_column_map(schema_names, selected_set)
+    if column_map:
+        return (
+            lazy_df.with_columns([pl.col(column_map[b]).alias(b) for b in selected_buckets]),
+            selected_set,
+            selected_buckets,
+        )
+
+    schema_lower = {name.lower() for name in schema_names}
+    if "errorage" in schema_lower:
+        error_age_col_name = next((name for name in schema_names if name.lower() == "errorage"), "ErrorAge")
+        if error_age_col_name != "ErrorAge":
+            lazy_df = lazy_df.with_columns(pl.col(error_age_col_name).alias("ErrorAge"))
+        return ensure_age_buckets(lazy_df, selected_set), selected_set, selected_buckets
+
+    raise ValueError(f"No age bucket columns available for set: {bucket_set} (Available: {available_sets})")
+
+
+def get_default_initial_filters(filter_options: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    defaults: Dict[str, List[str]] = {}
+    for key, configured_values in DEFAULT_INITIAL_FILTERS.items():
+        available_values = set(filter_options.get(key, []))
+        defaults[key] = [v for v in configured_values if v in available_values]
+    return defaults
+
+
+def slugify(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower())
+    return text.strip("_") or "value"
+
+
+def ensure_business_date(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    schema_names = set(lazy_df.collect_schema().names())
+    business_date_col = next((name for name in schema_names if name.lower() == "businessdate"), None)
+    if not business_date_col:
+        business_date_col = next((name for name in schema_names if name.lower() == "businessdatefast5months"), None)
+    if not business_date_col:
+        raise ValueError("Missing required date column: BusinessDate or BusinessDateFast5Months")
+
+    return lazy_df.with_columns(
+        [
+            pl.col(business_date_col).cast(pl.Datetime, strict=False).alias("_business_ts"),
+        ]
+    ).with_columns(
+        [
+            pl.col("_business_ts").dt.date().alias("_business_date"),
+        ]
+    )
+
+
+def add_months(month_start: date, months: int) -> date:
+    year = month_start.year + ((month_start.month - 1 + months) // 12)
+    month = ((month_start.month - 1 + months) % 12) + 1
+    return date(year, month, 1)
+
+
+def first_day_of_month(value: date) -> date:
+    return value.replace(day=1)
+
+
+def first_day_of_previous_month(value: date) -> date:
+    current_month_start = first_day_of_month(value)
+    previous_month_end = current_month_start - timedelta(days=1)
+    return previous_month_end.replace(day=1)
+
+
+def last_day_of_previous_month(value: date) -> date:
+    current_month_start = first_day_of_month(value)
+    return current_month_start - timedelta(days=1)
+
+
+def build_month_windows(max_date: date, count: int) -> List[date]:
+    start = add_months(first_day_of_month(max_date), -(count - 1))
+    return [add_months(start, offset) for offset in range(count)]
+
+
+def build_day_windows(start_date: date, end_date: date) -> List[date]:
+    total_days = (end_date - start_date).days
+    return [start_date + timedelta(days=offset) for offset in range(total_days + 1)]
+
+
+def build_status_table(
+    counts: List[Dict[str, Any]],
+    periods: List[date],
+    statuses: List[str],
+    key_fn,
+    label_fn,
+) -> List[Dict[str, Any]]:
+    count_map = {
+        (row["period_key"], row["RemediationStatus"]): int(row["count"] or 0)
+        for row in counts
+    }
+    rows: List[Dict[str, Any]] = []
+    for period in periods:
+        period_key = key_fn(period)
+        status_counts = {status: count_map.get((period_key, status), 0) for status in statuses}
+        rows.append(
+            {
+                "period_key": period_key,
+                "period_label": label_fn(period),
+                "total_count": sum(status_counts.values()),
+                "status_counts": status_counts,
+            }
+        )
+    return rows
+
+
+def build_stacked_chart(
+    counts: List[Dict[str, Any]],
+    periods: List[date],
+    statuses: List[str],
+    plans: List[str],
+    key_fn,
+    label_fn,
+) -> Dict[str, Any]:
+    series = [
+        {
+            "key": f"plan__{slugify(plan)}",
+            "label": plan,
+            "plan": plan,
+            "stack_id": "plans",
         }
-    except Exception as exc:
-        logger.error("Error loading workflows: %s", exc)
-        return {"workflows": [], "error": str(exc)}
+        for plan in plans
+    ]
+    series_key_map = {item["plan"]: item["key"] for item in series}
+
+    row_order: List[str] = []
+    rows_by_period: Dict[str, Dict[str, Any]] = {}
+    for period in periods:
+        period_key = key_fn(period)
+        period_label = label_fn(period)
+        for status in statuses:
+            status_slug = slugify(status)
+            row_key = f"{period_key}__{status_slug}"
+            row_order.append(row_key)
+            row = {
+                "row_key": row_key,
+                "period_key": period_key,
+                "period_label": period_label,
+                "status": status,
+                "chart_label": f"{status}||{period_label}",
+                "total_count": 0,
+            }
+            for item in series:
+                row[item["key"]] = 0
+            rows_by_period[row_key] = row
+
+    for count_row in counts:
+        period_key = count_row["period_key"]
+        plan = str(count_row["RemediationPlan"])
+        status = str(count_row["RemediationStatus"])
+        count_value = int(count_row["count"] or 0)
+        row_key = f"{period_key}__{slugify(status)}"
+        row = rows_by_period.get(row_key)
+        if not row:
+            continue
+        row["total_count"] += count_value
+        series_key = series_key_map.get(plan)
+        if series_key:
+            row[series_key] += count_value
+
+    line_options = [{"key": "total_count", "label": "Total Count"}]
+    line_options.extend({"key": item["key"], "label": item["label"]} for item in series)
+
+    return {
+        "data": [rows_by_period[key] for key in row_order],
+        "series": series,
+        "line_options": line_options,
+    }
 
 
-@router.get("/health")
-async def health():
+def build_grouped_matrix_table(
+    lazy_df: pl.LazyFrame,
+    periods: List[date],
+    statuses: List[str],
+    group_by_columns: List[str],
+    start_date: date,
+    period_format: str,
+    label_fn,
+    end_date: Optional[date] = None,
+) -> Dict[str, Any]:
+    base_df = lazy_df.filter(pl.col("_business_date") >= pl.lit(start_date))
+    if end_date is not None:
+        base_df = base_df.filter(pl.col("_business_date") <= pl.lit(end_date))
+    base_df = base_df.with_columns(pl.col("_business_date").dt.strftime(period_format).alias("period_key"))
+
+    aggregation_columns = [*group_by_columns, "period_key", "RemediationStatus"] if group_by_columns else ["period_key", "RemediationStatus"]
+    counts = (
+        base_df
+        .group_by(aggregation_columns)
+        .agg(pl.len().alias("count"))
+        .sort(aggregation_columns)
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    period_columns = []
+    value_field_map: Dict[Tuple[str, str], str] = {}
+    for period in periods:
+        period_key = period.strftime(period_format)
+        children = []
+        for status in statuses:
+            field_key = f"{period_key}__{slugify(status)}"
+            value_field_map[(period_key, status)] = field_key
+            children.append(
+                {
+                    "field": field_key,
+                    "status": status,
+                    "headerName": status,
+                }
+            )
+        period_columns.append(
+            {
+                "period_key": period_key,
+                "period_label": label_fn(period),
+                "children": children,
+            }
+        )
+
+    rows_by_group: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    row_order: List[Tuple[str, ...]] = []
+    for count_row in counts:
+        group_key = tuple(str(count_row.get(column, "")) for column in group_by_columns) if group_by_columns else ("All Records",)
+        if group_key not in rows_by_group:
+            row = {column: value for column, value in zip(group_by_columns, group_key)}
+            if not group_by_columns:
+                row["Group"] = "All Records"
+            for field_key in value_field_map.values():
+                row[field_key] = 0
+            row["row_total"] = 0
+            rows_by_group[group_key] = row
+            row_order.append(group_key)
+
+        map_key = (count_row["period_key"], str(count_row["RemediationStatus"]))
+        field_key = value_field_map.get(map_key)
+        if not field_key:
+            continue
+        count_value = int(count_row["count"] or 0)
+        rows_by_group[group_key][field_key] += count_value
+        rows_by_group[group_key]["row_total"] += count_value
+
+    group_columns_payload = [
+        {
+            "field": column,
+            "headerName": DISPLAY_LABELS.get(column, column),
+        }
+        for column in group_by_columns
+    ] or [{"field": "Group", "headerName": "Group"}]
+
+    return {
+        "group_columns": group_columns_payload,
+        "period_columns": period_columns,
+        "rows": [rows_by_group[key] for key in row_order],
+    }
+
+
+def build_filter_options_result(file_path: str) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
+    schema_names = set(lazy_df.collect_schema().names())
+    available_bucket_sets = get_available_bucket_sets(schema_names)
+    default_bucket_set = DEFAULT_BUCKET_SET if DEFAULT_BUCKET_SET in available_bucket_sets else (
+        available_bucket_sets[0] if available_bucket_sets else DEFAULT_BUCKET_SET
+    )
+
+    filter_options: Dict[str, List[str]] = {}
+    for key, column_name in FILTER_COLUMNS.items():
+        try:
+            unique_values = (
+                lazy_df
+                .select(pl.col(column_name))
+                .unique()
+                .collect(streaming=True)
+                .to_series()
+                .to_list()
+            )
+            unique_values = sorted([v for v in unique_values if v is not None])
+            filter_options[key] = unique_values
+        except Exception:
+            filter_options[key] = []
+
+    parquet_file = pq.ParquetFile(file_path)
+    total_rows = parquet_file.metadata.num_rows
+
+    return {
+        "success": True,
+        "filter_options": filter_options,
+        "default_initial_filters": get_default_initial_filters(filter_options),
+        "bucket_sets": available_bucket_sets,
+        "default_bucket_set": default_bucket_set,
+        "total_records": total_rows,
+        "columns": list(FILTER_COLUMNS.keys()),
+        "age_buckets": AGE_BUCKETS_BY_SET.get(default_bucket_set, AGE_BUCKET_COLUMNS),
+        "age_buckets_by_set": AGE_BUCKETS_BY_SET,
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "execution_mode": "subprocess",
+        },
+    }
+
+
+def build_aggregation_result(file_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
+    lazy_df, active_bucket_set, active_age_buckets = apply_age_bucket_set(
+        lazy_df, request.get("bucket_set", DEFAULT_BUCKET_SET)
+    )
+
+    parquet_file = pq.ParquetFile(file_path)
+    total_records = parquet_file.metadata.num_rows
+
+    filters = request.get("filters") or {}
+    for filter_key, filter_values in filters.items():
+        if filter_values:
+            column_name = FILTER_COLUMNS.get(filter_key)
+            if column_name:
+                lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+
+    group_by_columns: List[str] = []
+    group_by = request.get("group_by")
+    if group_by:
+        for col in group_by:
+            actual_col = FILTER_COLUMNS.get(str(col).lower().replace(" ", "_"), col)
+            group_by_columns.append(actual_col)
+    else:
+        group_by_columns = ["Regulation", "AssetClass"]
+
+    include_remediation_split = bool(request.get("include_remediation_split", True))
+
+    if include_remediation_split:
+        agg_expressions = [pl.count().alias("total_count")]
+        for bucket in active_age_buckets:
+            agg_expressions.append(pl.col(bucket).sum().alias(f"total_{bucket}"))
+        for bucket in active_age_buckets:
+            agg_expressions.append(
+                pl.when(pl.col("RemediationStatus") == "Unremediated")
+                .then(pl.col(bucket))
+                .otherwise(0)
+                .sum()
+                .alias(f"unremediated_{bucket}")
+            )
+        agg_expressions.append(
+            pl.when(pl.col("RemediationStatus") == "Unremediated")
+            .then(1)
+            .otherwise(0)
+            .sum()
+            .alias("unremediated_count")
+        )
+
+        aggregated_df = (
+            lazy_df.group_by(group_by_columns).agg(agg_expressions).sort(group_by_columns).collect(streaming=True)
+        )
+        aggregations = aggregated_df.to_dicts()
+
+        for row in aggregations:
+            row["total_total"] = sum(row.get(f"total_{bucket}", 0) or 0 for bucket in active_age_buckets)
+            row["unremediated_total"] = sum(
+                row.get(f"unremediated_{bucket}", 0) or 0 for bucket in active_age_buckets
+            )
+
+        filtered_count = sum(row["total_count"] for row in aggregations)
+        unremediated_count = sum(row["unremediated_count"] for row in aggregations)
+
+        summary = {"total_count": filtered_count, "unremediated_count": unremediated_count, "total": {}, "unremediated": {}}
+        for bucket in active_age_buckets:
+            summary["total"][bucket] = sum(row.get(f"total_{bucket}", 0) or 0 for row in aggregations)
+            summary["unremediated"][bucket] = sum(
+                row.get(f"unremediated_{bucket}", 0) or 0 for row in aggregations
+            )
+        summary["total"]["total"] = sum(summary["total"].values())
+        summary["unremediated"]["total"] = sum(summary["unremediated"].values())
+    else:
+        agg_expressions = [pl.count().alias("count")]
+        for bucket in active_age_buckets:
+            agg_expressions.append(pl.col(bucket).sum().alias(bucket))
+
+        aggregated_df = (
+            lazy_df.group_by(group_by_columns).agg(agg_expressions).sort(group_by_columns).collect(streaming=True)
+        )
+        aggregations = aggregated_df.to_dicts()
+        for row in aggregations:
+            row["total"] = sum(row.get(bucket, 0) or 0 for bucket in active_age_buckets)
+
+        filtered_count = sum(row["count"] for row in aggregations)
+        summary = {"total": filtered_count}
+        for bucket in active_age_buckets:
+            summary[bucket] = sum(row.get(bucket, 0) or 0 for row in aggregations)
+
+    return {
+        "success": True,
+        "total_records": total_records,
+        "filtered_records": filtered_count,
+        "aggregations": aggregations,
+        "summary": summary,
+        "group_by": group_by_columns,
+        "age_buckets": active_age_buckets,
+        "bucket_set": active_bucket_set,
+        "include_remediation_split": include_remediation_split,
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "requested_bucket_set": request.get("bucket_set", DEFAULT_BUCKET_SET),
+            "active_bucket_set": active_bucket_set,
+            "available_bucket_sets": get_available_bucket_sets(set(parquet_file.schema.names)),
+            "error_age_present": "ErrorAge" in parquet_file.schema.names
+            or "errorage" in [n.lower() for n in parquet_file.schema.names],
+            "execution_mode": "subprocess",
+        },
+    }
+
+
+def build_details_result(file_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
+    lazy_df, active_bucket_set, active_age_buckets = apply_age_bucket_set(
+        lazy_df, request.get("bucket_set", DEFAULT_BUCKET_SET)
+    )
+
+    applied_filters: List[str] = []
+    filters = request.get("filters") or {}
+    for filter_key, filter_values in filters.items():
+        if filter_values:
+            column_name = FILTER_COLUMNS.get(filter_key)
+            if column_name:
+                lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+                applied_filters.append(f"{column_name} in {filter_values}")
+
+    bucket = request.get("bucket")
+    if bucket and bucket in active_age_buckets:
+        lazy_df = lazy_df.filter(pl.col(bucket).cast(pl.Int64) == 1)
+        applied_filters.append(f"age_bucket={bucket}")
+
+    if request.get("bucket_scope") == "unremediated":
+        lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
+        applied_filters.append("scope=unremediated")
+
+    search_term = (request.get("search_term") or "").strip()
+    search_column = request.get("search_column")
+    if search_term and search_column:
+        physical_col = FILTER_COLUMNS.get(search_column, search_column)
+        lazy_df = lazy_df.filter(
+            pl.col(physical_col).cast(pl.Utf8).str.to_lowercase().str.contains(search_term.lower(), literal=True)
+        )
+        applied_filters.append(f"search: {search_column} contains '{search_term}'")
+
+    count_df = lazy_df.select(pl.count()).collect(streaming=True)
+    total_filtered = count_df.item()
+
+    sort_column = request.get("sort_column")
+    sort_direction = (request.get("sort_direction") or "desc").lower()
+    descending = sort_direction == "desc"
+
+    if sort_column:
+        lazy_df = lazy_df.sort(sort_column, descending=descending)
+    else:
+        try:
+            lazy_df = lazy_df.sort("ErrorAge", descending=True)
+        except Exception:
+            pass
+
+    page = max(1, int(request.get("page", 1)))
+    page_size = max(1, int(request.get("page_size", 50)))
+    start_idx = (page - 1) * page_size
+
+    page_df = lazy_df.slice(start_idx, page_size).collect(streaming=True)
+    data = page_df.to_dicts()
+
+    total_pages = (total_filtered + page_size - 1) // page_size if total_filtered > 0 else 1
+    return {
+        "success": True,
+        "data": data,
+        "columns": page_df.columns,
+        "bucket_set": active_bucket_set,
+        "applied_filters": applied_filters,
+        "bucket": bucket,
+        "bucket_scope": request.get("bucket_scope"),
+        "pagination": {
+            "current_page": page,
+            "page_size": page_size,
+            "total_rows": total_filtered,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1,
+        },
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "execution_mode": "subprocess",
+        },
+    }
+
+
+def build_trend_result(file_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
     try:
-        data = load_workflows()
-        count = len(data.get("workflows", []))
-        return {"status": "ok", "workflow_count": count, "yaml_loaded": True}
-    except Exception as exc:
-        return {"status": "error", "yaml_loaded": False, "error": str(exc)}
+        lazy_df = ensure_business_date(lazy_df)
+    except ValueError as exc:
+        parquet_file = pq.ParquetFile(file_path)
+        return {
+            "success": True,
+            "total_records": parquet_file.metadata.num_rows,
+            "filtered_records": 0,
+            "max_business_date": None,
+            "statuses": [],
+            "remediation_plans": [],
+            "group_by": request.get("group_by") or [],
+            "summary": {"total_count": 0, "status_counts": {}},
+            "tables": {
+                "monthly_status_last_5": [],
+                "daily_status_last_5": [],
+                "daily_status_current_month": [],
+                "daily_status_last_month": [],
+            },
+            "grouped_tables": {
+                "monthly_status_last_5": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_last_5": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_current_month": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_last_month": {"group_columns": [], "period_columns": [], "rows": []},
+            },
+            "charts": {
+                "monthly_plan_status_last_5": {"data": [], "series": [], "line_options": []},
+                "daily_plan_status_last_30": {"data": [], "series": [], "line_options": []},
+            },
+            "retrieved_at": datetime.now().isoformat(),
+            "_debug_info": {"execution_mode": "subprocess", "warning": str(exc)},
+        }
+
+    parquet_file = pq.ParquetFile(file_path)
+    total_records = parquet_file.metadata.num_rows
+
+    filters = request.get("filters") or {}
+    for filter_key, filter_values in filters.items():
+        if filter_values:
+            column_name = FILTER_COLUMNS.get(filter_key)
+            if column_name:
+                lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+
+    lazy_df = lazy_df.filter(pl.col("_business_date").is_not_null())
+
+    filtered_stats = lazy_df.select(
+        [
+            pl.len().alias("filtered_records"),
+            pl.max("_business_date").alias("max_business_date"),
+        ]
+    ).collect(streaming=True).to_dicts()[0]
+
+    filtered_records = int(filtered_stats.get("filtered_records") or 0)
+    max_business_date = filtered_stats.get("max_business_date")
+
+    if not filtered_records or max_business_date is None:
+        return {
+            "success": True,
+            "total_records": total_records,
+            "filtered_records": 0,
+            "max_business_date": None,
+            "statuses": [],
+            "remediation_plans": [],
+            "group_by": request.get("group_by") or [],
+            "summary": {"total_count": 0, "status_counts": {}},
+            "tables": {
+                "monthly_status_last_5": [],
+                "daily_status_last_5": [],
+                "daily_status_current_month": [],
+                "daily_status_last_month": [],
+            },
+            "grouped_tables": {
+                "monthly_status_last_5": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_last_5": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_current_month": {"group_columns": [], "period_columns": [], "rows": []},
+                "daily_status_last_month": {"group_columns": [], "period_columns": [], "rows": []},
+            },
+            "charts": {
+                "monthly_plan_status_last_5": {"data": [], "series": [], "line_options": []},
+                "daily_plan_status_last_30": {"data": [], "series": [], "line_options": []},
+            },
+            "retrieved_at": datetime.now().isoformat(),
+            "_debug_info": {"execution_mode": "subprocess"},
+        }
+
+    max_date = max_business_date if isinstance(max_business_date, date) else max_business_date.date()
+
+    statuses = sorted(
+        str(value)
+        for value in lazy_df.select(pl.col("RemediationStatus").unique()).collect(streaming=True).to_series().to_list()
+        if value is not None
+    )
+    plans = sorted(
+        str(value)
+        for value in lazy_df.select(pl.col("RemediationPlan").unique()).collect(streaming=True).to_series().to_list()
+        if value is not None
+    )
+
+    monthly_periods = build_month_windows(max_date, 5)
+    monthly_start = monthly_periods[0]
+    daily_last_5_periods = build_day_windows(max_date - timedelta(days=4), max_date)
+    current_month_periods = build_day_windows(first_day_of_month(max_date), max_date)
+    last_month_start = first_day_of_previous_month(max_date)
+    last_month_end = last_day_of_previous_month(max_date)
+    last_month_periods = build_day_windows(last_month_start, last_month_end)
+    daily_last_30_periods = build_day_windows(max_date - timedelta(days=29), max_date)
+
+    group_by_columns: List[str] = []
+    for column in request.get("group_by") or []:
+        actual_col = FILTER_COLUMNS.get(str(column).lower().replace(" ", "_"), column)
+        group_by_columns.append(actual_col)
+
+    month_counts = (
+        lazy_df
+        .filter(pl.col("_business_date") >= pl.lit(monthly_start))
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m").alias("period_key"))
+        .group_by(["period_key", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort("period_key")
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    day_last_5_counts = (
+        lazy_df
+        .filter(pl.col("_business_date") >= pl.lit(daily_last_5_periods[0]))
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m-%d").alias("period_key"))
+        .group_by(["period_key", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort("period_key")
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    current_month_counts = (
+        lazy_df
+        .filter(pl.col("_business_date") >= pl.lit(current_month_periods[0]))
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m-%d").alias("period_key"))
+        .group_by(["period_key", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort("period_key")
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    last_month_counts = (
+        lazy_df
+        .filter(
+            (pl.col("_business_date") >= pl.lit(last_month_start))
+            & (pl.col("_business_date") <= pl.lit(last_month_end))
+        )
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m-%d").alias("period_key"))
+        .group_by(["period_key", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort("period_key")
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    monthly_chart_counts = (
+        lazy_df
+        .filter(pl.col("_business_date") >= pl.lit(monthly_start))
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m").alias("period_key"))
+        .group_by(["period_key", "RemediationPlan", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort(["period_key", "RemediationPlan", "RemediationStatus"])
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    daily_chart_counts = (
+        lazy_df
+        .filter(pl.col("_business_date") >= pl.lit(daily_last_30_periods[0]))
+        .with_columns(pl.col("_business_date").dt.strftime("%Y-%m-%d").alias("period_key"))
+        .group_by(["period_key", "RemediationPlan", "RemediationStatus"])
+        .agg(pl.len().alias("count"))
+        .sort(["period_key", "RemediationPlan", "RemediationStatus"])
+        .collect(streaming=True)
+        .to_dicts()
+    )
+
+    summary_rows = (
+        lazy_df
+        .group_by("RemediationStatus")
+        .agg(pl.len().alias("count"))
+        .collect(streaming=True)
+        .to_dicts()
+    )
+    summary_status_counts = {str(row["RemediationStatus"]): int(row["count"] or 0) for row in summary_rows}
+
+    return {
+        "success": True,
+        "total_records": total_records,
+        "filtered_records": filtered_records,
+        "max_business_date": max_date.isoformat(),
+        "statuses": statuses,
+        "remediation_plans": plans,
+        "group_by": group_by_columns,
+        "summary": {
+            "total_count": filtered_records,
+            "status_counts": summary_status_counts,
+        },
+        "tables": {
+            "monthly_status_last_5": build_status_table(
+                month_counts,
+                monthly_periods,
+                statuses,
+                lambda value: value.strftime("%Y-%m"),
+                lambda value: value.strftime("%b %Y"),
+            ),
+            "daily_status_last_5": build_status_table(
+                day_last_5_counts,
+                daily_last_5_periods,
+                statuses,
+                lambda value: value.strftime("%Y-%m-%d"),
+                lambda value: value.strftime("%d %b"),
+            ),
+            "daily_status_current_month": build_status_table(
+                current_month_counts,
+                current_month_periods,
+                statuses,
+                lambda value: value.strftime("%Y-%m-%d"),
+                lambda value: value.strftime("%d %b"),
+            ),
+            "daily_status_last_month": build_status_table(
+                last_month_counts,
+                last_month_periods,
+                statuses,
+                lambda value: value.strftime("%Y-%m-%d"),
+                lambda value: value.strftime("%d %b"),
+            ),
+        },
+        "grouped_tables": {
+            "monthly_status_last_5": build_grouped_matrix_table(
+                lazy_df,
+                monthly_periods,
+                statuses,
+                group_by_columns,
+                monthly_start,
+                "%Y-%m",
+                lambda value: value.strftime("%b %Y"),
+            ),
+            "daily_status_last_5": build_grouped_matrix_table(
+                lazy_df,
+                daily_last_5_periods,
+                statuses,
+                group_by_columns,
+                daily_last_5_periods[0],
+                "%Y-%m-%d",
+                lambda value: value.strftime("%d %b"),
+            ),
+            "daily_status_current_month": build_grouped_matrix_table(
+                lazy_df,
+                current_month_periods,
+                statuses,
+                group_by_columns,
+                current_month_periods[0],
+                "%Y-%m-%d",
+                lambda value: value.strftime("%d %b"),
+            ),
+            "daily_status_last_month": build_grouped_matrix_table(
+                lazy_df,
+                last_month_periods,
+                statuses,
+                group_by_columns,
+                last_month_start,
+                "%Y-%m-%d",
+                lambda value: value.strftime("%d %b"),
+                end_date=last_month_end,
+            ),
+        },
+        "charts": {
+            "monthly_plan_status_last_5": build_stacked_chart(
+                monthly_chart_counts,
+                monthly_periods,
+                statuses,
+                plans,
+                lambda value: value.strftime("%Y-%m"),
+                lambda value: value.strftime("%b %Y"),
+            ),
+            "daily_plan_status_last_30": build_stacked_chart(
+                daily_chart_counts,
+                daily_last_30_periods,
+                statuses,
+                plans,
+                lambda value: value.strftime("%Y-%m-%d"),
+                lambda value: value.strftime("%d %b"),
+            ),
+        },
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "execution_mode": "subprocess",
+            "max_business_date": max_date.isoformat(),
+        },
+    }
 
 
-?????????????????????????????????????????????????????????????????????
-    { Icon: Zap, text: 'Build a formula to extract the year from transaction_date' },
-    { Icon: Settings, text: 'Analyse the FieldOperations formula for extracted_year' },
+def main() -> int:
+    try:
+        payload = json.loads(input())
+        file_path = payload["file_path"]
+        mode = payload.get("mode", "aggregations")
+        request = payload.get("request", {})
+
+        if mode == "filter_options":
+            result = build_filter_options_result(file_path)
+        elif mode == "trends":
+            result = build_trend_result(file_path, request)
+        elif mode == "details":
+            result = build_details_result(file_path, request)
+        else:
+            result = build_aggregation_result(file_path, request)
+
+        print(json.dumps(result, default=str))
+        return 0
     except Exception as exc:
-        return {"status": "error", "yaml_loaded": False, "error": str(exc)}
+        error = {
+            "success": False,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        print(json.dumps(error), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+--------------------------------------------------------
+
+
+dashboard.js
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import HSBCLogo from '../../components/HSBCLogo';
+import { ModuleRegistry, ClientSideRowModelModule } from 'ag-grid-community';
+import 'ag-grid-community/styles/ag-grid.css';
+import 'ag-grid-community/styles/ag-theme-alpine.css';
+import { FaSync, FaDownload, FaChartBar, FaTable } from 'react-icons/fa';
+import { useUser } from '../../contexts/UserContext';
+import { BUCKET_SET_CONFIG } from './utils/bucketConfig';
+import { AVAILABLE_COLUMNS } from './utils/columnConfig';
+import { buildChartDisplayName } from './utils/chartDisplayUtils';
+import { useSupervisoryData } from './hooks/useSupervisoryData';
+
+// Components
+import SummaryCard from './components/SummaryCard';
+import ColumnDropZone from './components/ColumnDropZone';
+import FilterSidebar from './components/FilterSidebar';
+import ChartsSection from './components/ChartsSection';
+import SupervisoryGrid from './components/SupervisoryGrid';
+
+ModuleRegistry.registerModules([ClientSideRowModelModule]);
+
+export default function SupervisoryDashboard() {
+    const { currentUser } = useUser();
+    const dashboardLayoutRef = useRef(null);
+    const SIDEBAR_WIDTH_KEY = 'supervisory_dashboard_sidebar_width';
+
+    const {
+        filterOptions,
+        savedFilters,
+        selectedSavedFilterId,
+        savedFilterName,
+        setSavedFilterName,
+        isSavingFilter,
+        isDeletingFilter,
+        selectedBucketSet,
+        setSelectedBucketSet,
+        availableBucketSets,
+        activeAgeBuckets,
+        selectedColumns,
+        setSelectedColumns,
+        filters,
+        draftFilters,
+        draftBucketSet,
+        aggregations,
+        summary,
+        totalRecords,
+        filteredRecords,
+        isLoading,
+        error,
+        hasActiveFilters,
+        hasPendingFilterChanges,
+        forceRefresh,
+        handleFilterChange,
+        handleDraftBucketSetChange,
+        applyFilters,
+        clearAllFilters,
+        handleSavedFilterSelect,
+        handleSaveCurrentFilter,
+        handleDeleteSavedFilter
+    } = useSupervisoryData(currentUser);
+
+    // UI state
+    const [activeView, setActiveView] = useState('table');
+    const [showUnremediated, setShowUnremediated] = useState(true);
+    const [showTotal, setShowTotal] = useState(true);
+    const [chartGroupColumn, setChartGroupColumn] = useState(selectedColumns[0] || null);
+
+    // Keep chartGroupColumn in sync — reset if the chosen column is removed from selectedColumns
+    useEffect(() => {
+        if (selectedColumns.length === 0) {
+            setChartGroupColumn(null);
+        } else if (!chartGroupColumn || !selectedColumns.find(c => c.field === chartGroupColumn.field)) {
+            setChartGroupColumn(selectedColumns[0]);
+        }
+    }, [selectedColumns, chartGroupColumn]);
+    const [sidebarWidth, setSidebarWidth] = useState(() => {
+        if (typeof window === 'undefined') return 224;
+        const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
+        return Number.isFinite(stored) && stored > 0 ? stored : 224;
+    });
+    const isResizingSidebarRef = useRef(false);
+
+    const activeBucketVisuals = useMemo(() => {
+        const fallbackColors = ['#65A30D', '#CA8A04', '#EA580C', '#DC2626', '#991B1B'];
+        const fallbackChartColors = ['#7FB43A', '#D39A2A', '#EE7B38', '#E05555', '#B23A3A'];
+        const bucketSetConfig = BUCKET_SET_CONFIG[selectedBucketSet] || BUCKET_SET_CONFIG.CFTC;
+        const colors = {};
+        const chartColors = {};
+        const labels = {};
+
+        activeAgeBuckets.forEach((bucket, index) => {
+            colors[bucket] = bucketSetConfig.colors[bucket] || fallbackColors[index % fallbackColors.length];
+            chartColors[bucket] = bucketSetConfig.chartColors[bucket] || fallbackChartColors[index % fallbackChartColors.length];
+            labels[bucket] = bucketSetConfig.labels[bucket] || `${bucket}d`;
+        });
+
+        return { colors, chartColors, labels };
+    }, [selectedBucketSet, activeAgeBuckets]);
+
+    const SIDEBAR_MIN_WIDTH = 220;
+    const SIDEBAR_MAX_WIDTH = 520;
+
+    useEffect(() => {
+        const handleMouseMove = (event) => {
+            if (!isResizingSidebarRef.current) return;
+            const layoutRect = dashboardLayoutRef.current?.getBoundingClientRect();
+            if (!layoutRect) return;
+
+            const availableWidth = layoutRect.width;
+            const dynamicMax = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, availableWidth - 420));
+            const nextWidth = Math.max(
+                SIDEBAR_MIN_WIDTH,
+                Math.min(dynamicMax, event.clientX - layoutRect.left)
+            );
+            setSidebarWidth(nextWidth);
+        };
+
+        const handleMouseUp = () => {
+            if (!isResizingSidebarRef.current) return;
+            isResizingSidebarRef.current = false;
+            document.body.style.userSelect = '';
+            document.body.style.cursor = '';
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+        return () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth)));
+    }, [sidebarWidth, SIDEBAR_WIDTH_KEY]);
+
+    const handleSidebarResizeStart = useCallback((event) => {
+        event.preventDefault();
+        isResizingSidebarRef.current = true;
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'col-resize';
+    }, []);
+
+    // Chart data preparation
+    const chartData = useMemo(() => {
+        if (!chartGroupColumn || selectedColumns.length === 0) return [];
+        const groupCol = chartGroupColumn.field;
+        const grouped = {};
+
+        aggregations.forEach(row => {
+            const key = row[groupCol];
+            if (!grouped[key]) {
+                grouped[key] = {
+                    name: key,
+                    displayName: buildChartDisplayName(key, 18)
+                };
+                activeAgeBuckets.forEach(bucket => {
+                    grouped[key][`unremediated_${bucket}`] = 0;
+                    grouped[key][`total_${bucket}`] = 0;
+                });
+            }
+            activeAgeBuckets.forEach(bucket => {
+                grouped[key][`unremediated_${bucket}`] += row[`unremediated_${bucket}`] || 0;
+                grouped[key][`total_${bucket}`] += row[`total_${bucket}`] || 0;
+            });
+        });
+
+        return Object.values(grouped)
+            .sort((a, b) => {
+                const totalA = activeAgeBuckets.reduce((sum, k) => sum + (a[`unremediated_${k}`] || 0), 0);
+                const totalB = activeAgeBuckets.reduce((sum, k) => sum + (b[`unremediated_${k}`] || 0), 0);
+                return totalB - totalA;
+            })
+            .slice(0, 10);
+    }, [aggregations, chartGroupColumn, selectedColumns, activeAgeBuckets]);
+
+    // Export to CSV
+    const exportToCSV = useCallback(() => {
+        if (aggregations.length === 0) return;
+
+        const headers = [
+            ...selectedColumns.map(c => c.field),
+            ...activeAgeBuckets.map(b => `unremediated_${b}`),
+            'unremediated_total',
+            ...activeAgeBuckets.map(b => `total_${b}`),
+            'total_total'
+        ];
+        const csvContent = [
+            headers.join(','),
+            ...aggregations.map(row => headers.map(h => row[h] ?? '').join(','))
+        ].join('\n');
+
+        const blob = new Blob([csvContent], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `supervisory_dashboard_${new Date().toISOString().split('T')[0]}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }, [aggregations, selectedColumns, activeAgeBuckets]);
+
+    return (
+        <div className="min-h-screen supervisory-page-canvas flex flex-col">
+            {/* Header */}
+            <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between" style={{ height: '64px' }}>
+                <div className="flex items-center gap-4">
+                    <HSBCLogo height={40} />
+                    <div>
+                        <h1 className="text-lg font-semibold text-gray-900">SUPERVISORY DASHBOARD</h1>
+                        <p className="text-xs text-gray-500">Unremediated Controls by Age Bucket</p>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={forceRefresh}
+                        disabled={isLoading}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    >
+                        <FaSync className={isLoading ? 'animate-spin' : ''} />
+                        Refresh
+                    </button>
+                    <button
+                        onClick={exportToCSV}
+                        disabled={aggregations.length === 0}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-slate-700 text-white hover:bg-slate-800 rounded transition-colors disabled:opacity-50"
+                    >
+                        <FaDownload />
+                        Export
+                    </button>
+                </div>
+            </div>
+
+            {/* Main Content */}
+            <div className="flex flex-1 overflow-hidden" ref={dashboardLayoutRef}>
+                {/* Left Sidebar - Filters */}
+                <FilterSidebar
+                    sidebarWidth={sidebarWidth}
+                    handleSidebarResizeStart={handleSidebarResizeStart}
+                    hasActiveFilters={hasActiveFilters}
+                    clearAllFilters={clearAllFilters}
+                    savedFilters={savedFilters}
+                    selectedSavedFilterId={selectedSavedFilterId}
+                    handleSavedFilterSelect={handleSavedFilterSelect}
+                    savedFilterName={savedFilterName}
+                    setSavedFilterName={setSavedFilterName}
+                    handleSaveCurrentFilter={handleSaveCurrentFilter}
+                    handleDeleteSavedFilter={handleDeleteSavedFilter}
+                    isSavingFilter={isSavingFilter}
+                    isDeletingFilter={isDeletingFilter}
+                    draftBucketSet={draftBucketSet}
+                    handleDraftBucketSetChange={handleDraftBucketSetChange}
+                    availableBucketSets={availableBucketSets}
+                    filterOptions={filterOptions}
+                    draftFilters={draftFilters}
+                    handleFilterChange={handleFilterChange}
+                    applyFilters={applyFilters}
+                    hasPendingFilterChanges={hasPendingFilterChanges}
+                    isLoading={isLoading}
+                    totalRecords={totalRecords}
+                    filteredRecords={filteredRecords}
+                    currentUser={currentUser}
+                />
+
+                {/* Main Dashboard Area */}
+                <div className="flex-1 p-4 overflow-y-auto">
+                    {error && (
+                        <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
+                    )}
+
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div className="supervisory-summary-card supervisory-summary-unrem rounded-lg p-3 border">
+                            <div className="supervisory-summary-title supervisory-summary-title-unrem text-sm font-semibold mb-2">
+                                Unremediated <span className="supervisory-summary-subtitle supervisory-summary-subtitle-unrem text-xs font-normal">(Status: Pending Action)</span>
+                            </div>
+                            <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${activeAgeBuckets.length + 1}, minmax(0, 1fr))` }}>
+                                <SummaryCard title="Total" value={summary.unremediated?.total || 0} color="#DC2626" small />
+                                {activeAgeBuckets.map((bucket) => (
+                                    <SummaryCard
+                                        key={`unrem-${bucket}`}
+                                        title={activeBucketVisuals.labels[bucket]}
+                                        value={summary.unremediated?.[bucket] || 0}
+                                        color={activeBucketVisuals.colors[bucket]}
+                                        small
+                                    />
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="supervisory-summary-card supervisory-summary-total rounded-lg p-3 border">
+                            <div className="supervisory-summary-title supervisory-summary-title-total text-sm font-semibold mb-2">
+                                All Records <span className="supervisory-summary-subtitle supervisory-summary-subtitle-total text-xs font-normal">(All Remediation Status)</span>
+                            </div>
+                            <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${activeAgeBuckets.length + 1}, minmax(0, 1fr))` }}>
+                                <SummaryCard title="Total" value={summary.total?.total || 0} color="#2563EB" small />
+                                {activeAgeBuckets.map((bucket) => (
+                                    <SummaryCard
+                                        key={`total-${bucket}`}
+                                        title={activeBucketVisuals.labels[bucket]}
+                                        value={summary.total?.[bucket] || 0}
+                                        color={activeBucketVisuals.colors[bucket]}
+                                        small
+                                    />
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Column Drop Zone */}
+                    <ColumnDropZone
+                        selectedColumns={selectedColumns}
+                        availableColumns={AVAILABLE_COLUMNS}
+                        onColumnsChange={setSelectedColumns}
+                    />
+
+                    {/* View Toggle */}
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-1 bg-gray-100 rounded p-0.5">
+                            <button
+                                onClick={() => setActiveView('table')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${activeView === 'table' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'
+                                    }`}
+                            >
+                                <FaTable />
+                                Table
+                            </button>
+                            <button
+                                onClick={() => setActiveView('chart')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${activeView === 'chart' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'
+                                    }`}
+                            >
+                                <FaChartBar />
+                                Chart
+                            </button>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={showUnremediated}
+                                    onChange={(e) => setShowUnremediated(e.target.checked)}
+                                    className="w-3 h-3 supervisory-toggle-input-unrem"
+                                />
+                                <span className="font-medium supervisory-toggle-label-unrem">Unremediated</span>
+                            </label>
+                            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={showTotal}
+                                    onChange={(e) => setShowTotal(e.target.checked)}
+                                    className="w-3 h-3 supervisory-toggle-input-total"
+                                />
+                                <span className="font-medium supervisory-toggle-label-total">Total</span>
+                            </label>
+                            <span className="text-xs text-gray-500">{aggregations.length} groups</span>
+                        </div>
+                    </div>
+
+                    {/* Table View */}
+                    {activeView === 'table' && (
+                        <SupervisoryGrid
+                            aggregations={aggregations}
+                            selectedColumns={selectedColumns}
+                            activeAgeBuckets={activeAgeBuckets}
+                            activeBucketVisuals={activeBucketVisuals}
+                            showUnremediated={showUnremediated}
+                            showTotal={showTotal}
+                            isLoading={isLoading}
+                            filters={filters}
+                            selectedBucketSet={selectedBucketSet}
+                        />
+                    )}
+
+                    {/* Chart View */}
+                    {activeView === 'chart' && (
+                        <ChartsSection
+                            selectedColumns={selectedColumns}
+                            chartData={chartData}
+                            activeAgeBuckets={activeAgeBuckets}
+                            activeBucketVisuals={activeBucketVisuals}
+                            chartGroupColumn={chartGroupColumn}
+                            onChartGroupColumnChange={setChartGroupColumn}
+                        />
+                    )}
+                </div>
+            </div>
+
+            {/* Loading Overlay */}
+            {isLoading && (
+                <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-4 flex items-center gap-3 shadow-xl">
+                        <div className="w-6 h-6 border-3 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+                        <span className="text-gray-700 text-sm">Loading...</span>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+-------
+filtersidebar dashboard/componet
+
+import React from 'react';
+import { FaCheck, FaFilter } from 'react-icons/fa';
+import MultiSelectFilter from './MultiSelectFilter';
+import SavedFiltersPanel from './SavedFiltersPanel';
+
+const FilterSidebar = ({
+    sidebarWidth,
+    handleSidebarResizeStart,
+    hasActiveFilters,
+    clearAllFilters,
+    savedFilters,
+    selectedSavedFilterId,
+    handleSavedFilterSelect,
+    savedFilterName,
+    setSavedFilterName,
+    handleSaveCurrentFilter,
+    handleDeleteSavedFilter,
+    isSavingFilter,
+    isDeletingFilter,
+    draftBucketSet,
+    handleDraftBucketSetChange,
+    availableBucketSets,
+    filterOptions,
+    draftFilters,
+    handleFilterChange,
+    applyFilters,
+    hasPendingFilterChanges,
+    isLoading,
+    totalRecords,
+    filteredRecords,
+    currentUser
+}) => {
+    return (
+        <div
+            className="bg-white border-r border-gray-200 p-3 overflow-y-auto flex-shrink-0 relative supervisory-surface supervisory-sidebar"
+            style={{ width: `${sidebarWidth}px` }}
+        >
+            <div className="flex items-center justify-between mb-3 supervisory-sidebar-header">
+                <div className="flex items-center gap-1.5">
+                    <FaFilter className="text-gray-500" style={{ fontSize: '12px' }} />
+                    <span className="font-semibold text-gray-700 text-sm">Filters</span>
+                </div>
+                {hasActiveFilters && (
+                    <button onClick={clearAllFilters} className="text-xs supervisory-clear-btn">Clear</button>
+                )}
+            </div>
+
+            <SavedFiltersPanel
+                savedFilters={savedFilters}
+                selectedSavedFilterId={selectedSavedFilterId}
+                onSelect={handleSavedFilterSelect}
+                savedFilterName={savedFilterName}
+                onNameChange={(e) => setSavedFilterName(e.target.value)}
+                onSave={handleSaveCurrentFilter}
+                onDelete={handleDeleteSavedFilter}
+                isSaving={isSavingFilter}
+                isDeleting={isDeletingFilter}
+                currentUser={currentUser}
+            />
+
+            <div className="mb-3 supervisory-sidebar-card">
+                <label className="block text-xs font-medium text-gray-700 mb-1 supervisory-section-label">Age Bucket Set</label>
+                <select
+                    className="w-full px-2 py-1.5 border border-gray-300 rounded bg-white text-xs supervisory-field"
+                    value={draftBucketSet}
+                    onChange={(e) => handleDraftBucketSetChange(e.target.value)}
+                >
+                    {availableBucketSets.map(bucketSet => (
+                        <option key={bucketSet} value={bucketSet}>
+                            {bucketSet}
+                        </option>
+                    ))}
+                </select>
+            </div>
+
+            <div className="mb-3 supervisory-sidebar-card supervisory-filter-card">
+                <div className="text-[11px] uppercase tracking-wide supervisory-filter-card-title">Refine Data</div>
+                <MultiSelectFilter
+                    label="Regulation"
+                    options={filterOptions.regulation}
+                    selected={draftFilters.regulation}
+                    onChange={(values) => handleFilterChange('regulation', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Asset Class"
+                    options={filterOptions.asset_class}
+                    selected={draftFilters.asset_class}
+                    onChange={(values) => handleFilterChange('asset_class', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Control Type"
+                    options={filterOptions.control_type}
+                    selected={draftFilters.control_type}
+                    onChange={(values) => handleFilterChange('control_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Data Type"
+                    options={filterOptions.data_type}
+                    selected={draftFilters.data_type}
+                    onChange={(values) => handleFilterChange('data_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Sub-Control Type"
+                    options={filterOptions.sub_control_type}
+                    selected={draftFilters.sub_control_type}
+                    onChange={(values) => handleFilterChange('sub_control_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Remediation Status"
+                    options={filterOptions.remediation_status}
+                    selected={draftFilters.remediation_status}
+                    onChange={(values) => handleFilterChange('remediation_status', values)}
+                    placeholder="All"
+                />
+            </div>
+
+            <div className="mb-3">
+                {hasPendingFilterChanges && (
+                    <div className="mb-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                        Filter changes are not applied yet.
+                    </div>
+                )}
+                <button
+                    type="button"
+                    onClick={applyFilters}
+                    disabled={!hasPendingFilterChanges || isLoading}
+                    className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <FaCheck style={{ fontSize: '10px' }} />
+                    Apply Filters
+                </button>
+            </div>
+
+            {/* Stats */}
+            <div className="mt-4 pt-3 border-t border-gray-200 text-xs text-gray-600 supervisory-sidebar-stats">
+                <div className="flex justify-between mb-1">
+                    <span>Total:</span>
+                    <span className="font-medium">{totalRecords.toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between">
+                    <span>Filtered:</span>
+                    <span className="font-medium">{filteredRecords.toLocaleString()}</span>
+                </div>
+            </div>
+
+            <div
+                className="absolute top-0 right-0 h-full w-1 cursor-col-resize supervisory-sidebar-resizer"
+                onMouseDown={handleSidebarResizeStart}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize filters sidebar"
+            />
+        </div>
+    );
+};
+
+export default FilterSidebar;
+=-----------------------------------------------
+
+SavedFilterPanel.js dashbaord/component
+import React from 'react';
+import { FaTrash } from 'react-icons/fa';
+import { canDeleteSavedFilter } from '../utils/filterStateUtils';
+
+const SavedFiltersPanel = ({
+    savedFilters,
+    selectedSavedFilterId,
+    onSelect,
+    savedFilterName,
+    onNameChange,
+    onSave,
+    onDelete,
+    isSaving,
+    isDeleting,
+    currentUser
+}) => {
+    const selectedFilter = savedFilters.find((filter) => filter.id === selectedSavedFilterId);
+    const deleteAllowed = canDeleteSavedFilter(selectedFilter, currentUser);
+
+    return (
+        <div className="mb-3 supervisory-sidebar-card">
+            <label className="block text-xs font-medium text-gray-700 mb-1 supervisory-section-label">Saved Filters</label>
+            <div className="flex gap-2">
+                <select
+                    className="flex-1 min-w-0 px-2 py-1.5 border border-gray-300 rounded bg-white text-xs supervisory-field"
+                    value={selectedSavedFilterId}
+                    onChange={onSelect}
+                >
+                    <option value="">Select saved filter...</option>
+                    {savedFilters.map((filter) => (
+                        <option key={filter.id} value={filter.id}>
+                            {filter.name} ({filter.created_by_name || filter.created_by || 'user'})
+                        </option>
+                    ))}
+                </select>
+                <button
+                    type="button"
+                    onClick={onDelete}
+                    disabled={!deleteAllowed || isDeleting}
+                    title={
+                        deleteAllowed
+                            ? 'Delete selected filter'
+                            : selectedSavedFilterId
+                                ? 'You can only delete filters you created'
+                                : 'Select a saved filter to delete'
+                    }
+                    className="px-2 py-1.5 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                    aria-label="Delete saved filter"
+                >
+                    <FaTrash style={{ fontSize: '11px' }} />
+                </button>
+            </div>
+            <div className="flex gap-2 mt-2">
+                <input
+                    type="text"
+                    className="flex-1 px-2 py-1.5 border border-gray-300 rounded text-xs supervisory-field"
+                    placeholder="Save current as..."
+                    value={savedFilterName}
+                    onChange={onNameChange}
+                />
+                <button
+                    type="button"
+                    onClick={onSave}
+                    disabled={!savedFilterName.trim() || isSaving}
+                    className="px-2.5 py-1.5 text-xs bg-blue-600 text-white rounded disabled:opacity-50 supervisory-save-btn"
+                >
+                    Save
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default SavedFiltersPanel;
+------------------------
+usesupervisorydata.js 
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { ApiService } from '../../../services/api';
+import { BUCKET_SET_CONFIG, DEFAULT_BUCKET_SET_OPTIONS, DEFAULT_AGE_BUCKETS, buildBucketSummary } from '../utils/bucketConfig';
+import { AVAILABLE_COLUMNS } from '../utils/columnConfig';
+import { EMPTY_SUPERVISORY_FILTERS, buildInitialFilters, canDeleteSavedFilter, filtersEqual, hasAnyFilterValues, sanitizeFilters } from '../utils/filterStateUtils';
+import { cacheGet, cacheSet } from './useLocalCache';
+
+// Cache keys
+const CK_FILTER_OPTIONS = 'filterOptions';
+const CK_AGGREGATIONS = 'aggregations';
+const LS_SELECTED_COLUMNS = 'supervisory_selected_columns';
+
+export const useSupervisoryData = (currentUser) => {
+    const cachedFilterOptions = cacheGet(CK_FILTER_OPTIONS);
+    const cachedInitialFilters = cachedFilterOptions ? buildInitialFilters(cachedFilterOptions) : { ...EMPTY_SUPERVISORY_FILTERS };
+
+    // State
+    const [filterOptions, setFilterOptions] = useState(() =>
+        cachedFilterOptions?.filter_options ?? {
+            regulation: [], asset_class: [], control_type: [],
+            data_type: [], sub_control_type: [], remediation_status: []
+        }
+    );
+
+    const [savedFilters, setSavedFilters] = useState([]);
+    const [selectedSavedFilterId, setSelectedSavedFilterId] = useState('');
+    const [savedFilterName, setSavedFilterName] = useState('');
+    const [isSavingFilter, setIsSavingFilter] = useState(false);
+    const [isDeletingFilter, setIsDeletingFilter] = useState(false);
+    const [selectedBucketSet, setSelectedBucketSet] = useState(() =>
+        cachedFilterOptions?.default_bucket_set ?? 'CFTC'
+    );
+    const [availableBucketSets, setAvailableBucketSets] = useState(() =>
+        cachedFilterOptions?.bucket_sets ?? DEFAULT_BUCKET_SET_OPTIONS
+    );
+    const [activeAgeBuckets, setActiveAgeBuckets] = useState(() => {
+        if (cachedFilterOptions) {
+            const bs = cachedFilterOptions.default_bucket_set || 'CFTC';
+            return cachedFilterOptions.age_buckets_by_set?.[bs] || cachedFilterOptions.age_buckets || DEFAULT_AGE_BUCKETS;
+        }
+        return DEFAULT_AGE_BUCKETS;
+    });
+    const [selectedColumns, setSelectedColumns] = useState(() => {
+        try {
+            const stored = window.localStorage.getItem(LS_SELECTED_COLUMNS);
+            if (stored) {
+                const fields = JSON.parse(stored);
+                if (Array.isArray(fields) && fields.length > 0) {
+                    const cols = fields
+                        .map(f => AVAILABLE_COLUMNS.find(c => c.field === f))
+                        .filter(Boolean);
+                    if (cols.length > 0) return cols;
+                }
+            }
+        } catch { /* ignore */ }
+        return [
+            AVAILABLE_COLUMNS[0], AVAILABLE_COLUMNS[1], AVAILABLE_COLUMNS[2],
+            AVAILABLE_COLUMNS[6], AVAILABLE_COLUMNS[7], AVAILABLE_COLUMNS[8]
+        ];
+    });
+
+    const [filters, setFilters] = useState(cachedInitialFilters);
+    const [draftFilters, setDraftFilters] = useState(cachedInitialFilters);
+    const [draftBucketSet, setDraftBucketSet] = useState(() =>
+        cachedFilterOptions?.default_bucket_set ?? 'CFTC'
+    );
+
+    // Try to seed aggregation state from cache
+    const cachedAgg = cacheGet(CK_AGGREGATIONS);
+    const [aggregations, setAggregations] = useState(cachedAgg?.aggregations ?? []);
+    const [summary, setSummary] = useState(cachedAgg?.summary ?? {
+        total_count: 0, unremediated_count: 0,
+        total: buildBucketSummary(DEFAULT_AGE_BUCKETS),
+        unremediated: buildBucketSummary(DEFAULT_AGE_BUCKETS)
+    });
+    const [totalRecords, setTotalRecords] = useState(cachedAgg?.total_records ?? 0);
+    const [filteredRecords, setFilteredRecords] = useState(cachedAgg?.filtered_records ?? 0);
+
+    // Loading starts as false if we have cached data, true otherwise
+    const hasCachedAggregations = useRef(!!cachedAgg);
+    const [isLoading, setIsLoading] = useState(!hasCachedAggregations.current);
+    const [isInitialFiltersReady, setIsInitialFiltersReady] = useState(false);
+    const [error, setError] = useState(null);
+
+    const initialLoadDone = useRef(false);
+    const skipGroupByEffectRef = useRef(false);
+    const prevGroupByKeyRef = useRef(null);
+    const appliedQueryRef = useRef({ filters: cachedInitialFilters, selectedBucketSet: cachedFilterOptions?.default_bucket_set ?? 'CFTC', groupBy: [] });
+
+    // Derived State
+    const groupBy = useMemo(() => selectedColumns.map(c => c.field), [selectedColumns]);
+    appliedQueryRef.current = { filters, selectedBucketSet, groupBy };
+
+    // Persist selectedColumns to localStorage on every change
+    useEffect(() => {
+        try {
+            const fields = selectedColumns.map(c => c.field);
+            window.localStorage.setItem(LS_SELECTED_COLUMNS, JSON.stringify(fields));
+        } catch { /* ignore */ }
+    }, [selectedColumns]);
+    const hasActiveFilters = useMemo(
+        () => hasAnyFilterValues(draftFilters),
+        [draftFilters]
+    );
+
+    const hasPendingFilterChanges = useMemo(
+        () => !filtersEqual(draftFilters, filters) || draftBucketSet !== selectedBucketSet,
+        [draftFilters, filters, draftBucketSet, selectedBucketSet]
+    );
+
+    // ─── Helper: apply filter options response to state ──────────
+
+    const applyFilterOptionsResponse = useCallback((response) => {
+        setFilterOptions(response.filter_options);
+        setTotalRecords(response.total_records);
+        const bucketSets = Array.isArray(response.bucket_sets) && response.bucket_sets.length > 0
+            ? response.bucket_sets
+            : DEFAULT_BUCKET_SET_OPTIONS;
+        setAvailableBucketSets(bucketSets);
+
+        const defaultBucketSet = bucketSets.includes(response.default_bucket_set)
+            ? response.default_bucket_set
+            : bucketSets[0];
+
+        setSelectedBucketSet(defaultBucketSet);
+        setActiveAgeBuckets(
+            response.age_buckets_by_set?.[defaultBucketSet] ||
+            response.age_buckets ||
+            BUCKET_SET_CONFIG[defaultBucketSet]?.buckets ||
+            DEFAULT_AGE_BUCKETS
+        );
+
+        const sanitizedFilters = buildInitialFilters(response);
+        setFilters(sanitizedFilters);
+        setDraftFilters(sanitizedFilters);
+        setDraftBucketSet(defaultBucketSet);
+    }, []);
+
+    // ─── Helper: apply aggregation response to state ─────────────
+
+    const applyAggregationResponse = useCallback((response) => {
+        const activeBucketSet = response.bucket_set;
+
+        if (activeBucketSet) {
+            setSelectedBucketSet(activeBucketSet);
+            setDraftBucketSet(activeBucketSet);
+            setActiveAgeBuckets(
+                response.age_buckets ||
+                BUCKET_SET_CONFIG[activeBucketSet]?.buckets ||
+                DEFAULT_AGE_BUCKETS
+            );
+        } else {
+            // Fallback if backend doesn't provide it (shouldn't happen with our fix)
+            setActiveAgeBuckets(
+                response.age_buckets ||
+                DEFAULT_AGE_BUCKETS
+            );
+        }
+
+        setAggregations(response.aggregations || []);
+        setSummary(response.summary);
+        setFilteredRecords(response.filtered_records);
+        setTotalRecords(response.total_records);
+    }, []); // Stable: no dependencies on external state variables
+
+    // ─── Separate filter options load (fallback & refresh) ───────
+
+    const loadFilterOptions = useCallback(async () => {
+        try {
+            const response = await ApiService.getSupervisoryFilterOptions();
+            if (response.success) {
+                cacheSet(CK_FILTER_OPTIONS, response);
+                applyFilterOptionsResponse(response);
+            }
+        } catch (err) {
+            setError('Failed to load filter options');
+        } finally {
+            setIsInitialFiltersReady(true);
+        }
+    }, [applyFilterOptionsResponse]);
+
+    // ─── Aggregation load (for filter/groupBy changes) ───────────
+
+    const fetchAggregations = useCallback(async (nextFilters, nextBucketSet, nextGroupBy = groupBy) => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const response = await ApiService.getSupervisoryAggregations(nextFilters, nextGroupBy, nextBucketSet);
+            if (response.success) {
+                cacheSet(CK_AGGREGATIONS, response);
+                applyAggregationResponse(response);
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load aggregations');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [groupBy, applyAggregationResponse]);
+
+    const loadAggregations = useCallback(async () => {
+        await fetchAggregations(filters, selectedBucketSet, groupBy);
+    }, [fetchAggregations, filters, selectedBucketSet, groupBy]);
+
+    // ─── Combined initial load (single round-trip) ───────────────
+
+    const loadInitial = useCallback(async () => {
+        try {
+            const response = await ApiService.getSupervisoryInitialLoad();
+            if (response.success) {
+                cacheSet(CK_FILTER_OPTIONS, response);
+
+                applyFilterOptionsResponse(response);
+
+                if (response.default_aggregations?.success) {
+                    cacheSet(CK_AGGREGATIONS, response.default_aggregations);
+                    applyAggregationResponse(response.default_aggregations);
+                }
+
+                prevGroupByKeyRef.current = selectedColumns.map((column) => column.field).join('|');
+                initialLoadDone.current = true;
+            }
+        } catch (err) {
+            setError('Failed to load initial data');
+            try {
+                await loadFilterOptions();
+                const cached = cacheGet(CK_FILTER_OPTIONS);
+                if (cached) {
+                    const nextFilters = buildInitialFilters(cached);
+                    setFilters(nextFilters);
+                    setDraftFilters(nextFilters);
+                    prevGroupByKeyRef.current = selectedColumns.map((column) => column.field).join('|');
+                    initialLoadDone.current = true;
+                    await fetchAggregations(nextFilters, cached.default_bucket_set || selectedBucketSet, selectedColumns.map((column) => column.field));
+                }
+            } catch {
+                // already handled
+            }
+        } finally {
+            setIsInitialFiltersReady(true);
+            setIsLoading(false);
+        }
+    }, [applyFilterOptionsResponse, applyAggregationResponse, loadFilterOptions, fetchAggregations, selectedBucketSet, selectedColumns]);
+
+    const loadSavedFilters = useCallback(async () => {
+        try {
+            const response = await ApiService.getSupervisorySavedFilters();
+            if (response.success) {
+                setSavedFilters(response.filters || []);
+            }
+        } catch (err) {
+            console.error('Failed to load saved filters', err);
+        }
+    }, []);
+
+    // ─── Force Refresh (bypass cache, re-fetch everything) ───────
+
+    const forceRefresh = useCallback(() => {
+        loadFilterOptions();
+        loadAggregations();
+    }, [loadFilterOptions, loadAggregations]);
+
+    // ─── Effects ─────────────────────────────────────────────────
+
+    // On mount: use combined initial-load endpoint (1 round-trip)
+    useEffect(() => {
+        loadInitial();
+        loadSavedFilters();
+    }, [loadInitial, loadSavedFilters]);
+
+    const groupByKey = groupBy.join('|');
+
+    // When groupBy changes AFTER initial load → re-fetch aggregations with applied filters
+    useEffect(() => {
+        if (skipGroupByEffectRef.current) return;
+        if (!initialLoadDone.current || groupBy.length === 0) return;
+
+        const groupByChanged = prevGroupByKeyRef.current !== groupByKey;
+        prevGroupByKeyRef.current = groupByKey;
+        if (!groupByChanged) return;
+
+        const { filters: appliedFilters, selectedBucketSet: appliedBucketSet, groupBy: appliedGroupBy } = appliedQueryRef.current;
+        fetchAggregations(appliedFilters, appliedBucketSet, appliedGroupBy);
+    }, [groupByKey, fetchAggregations, groupBy.length]);
+
+    const handleFilterChange = (filterKey, values) => {
+        setDraftFilters(prev => ({ ...prev, [filterKey]: values }));
+    };
+
+    const handleDraftBucketSetChange = (bucketSet) => {
+        setDraftBucketSet(bucketSet);
+    };
+
+    const applyFilters = useCallback(async () => {
+        const nextFilters = sanitizeFilters(draftFilters);
+        const nextBucketSet = draftBucketSet;
+        initialLoadDone.current = true;
+        setFilters(nextFilters);
+        setSelectedBucketSet(nextBucketSet);
+        await fetchAggregations(nextFilters, nextBucketSet, groupBy);
+    }, [draftFilters, draftBucketSet, fetchAggregations, groupBy]);
+
+    const clearAllFilters = () => {
+        setDraftFilters({ ...EMPTY_SUPERVISORY_FILTERS });
+    };
+
+    const applySavedFilter = useCallback(async (saved) => {
+        if (!saved) return;
+        initialLoadDone.current = true;
+        const nextFilters = sanitizeFilters(saved.filters);
+
+        setFilters(nextFilters);
+        setDraftFilters(nextFilters);
+
+        let nextGroupBy = groupBy;
+        if (Array.isArray(saved.group_by) && saved.group_by.length > 0) {
+            const nextSelected = saved.group_by
+                .map(field => AVAILABLE_COLUMNS.find(col => col.field === field))
+                .filter(Boolean);
+            if (nextSelected.length > 0) {
+                skipGroupByEffectRef.current = true;
+                setSelectedColumns(nextSelected);
+                nextGroupBy = nextSelected.map(col => col.field);
+            }
+        }
+
+        await fetchAggregations(nextFilters, selectedBucketSet, nextGroupBy);
+        prevGroupByKeyRef.current = nextGroupBy.join('|');
+        skipGroupByEffectRef.current = false;
+    }, [fetchAggregations, groupBy, selectedBucketSet]);
+
+    const handleSavedFilterSelect = (e) => {
+        const value = e.target.value;
+        setSelectedSavedFilterId(value);
+        const selected = savedFilters.find(f => f.id === value);
+        applySavedFilter(selected);
+    };
+
+    const handleSaveCurrentFilter = async () => {
+        if (!savedFilterName.trim()) return;
+        setIsSavingFilter(true);
+        try {
+            const payload = {
+                name: savedFilterName.trim(),
+                filters: sanitizeFilters(draftFilters),
+                group_by: selectedColumns.map(col => col.field),
+                created_by: currentUser?.id || currentUser?.username || 'anonymous',
+                created_by_name: currentUser?.name || currentUser?.username || 'anonymous'
+            };
+            const response = await ApiService.saveSupervisoryFilter(payload);
+            if (response.success) {
+                setSavedFilters(prev => [response.filter, ...prev]);
+                setSavedFilterName('');
+                setSelectedSavedFilterId(response.filter.id);
+            }
+        } catch (err) {
+            console.error('Failed to save filter', err);
+        } finally {
+            setIsSavingFilter(false);
+        }
+    };
+
+    const handleDeleteSavedFilter = useCallback(async () => {
+        if (!selectedSavedFilterId) return;
+        const selected = savedFilters.find((filter) => filter.id === selectedSavedFilterId);
+        if (!selected) return;
+
+        if (!canDeleteSavedFilter(selected, currentUser)) return;
+
+        const confirmed = window.confirm(`Delete saved filter "${selected.name}"?`);
+        if (!confirmed) return;
+
+        setIsDeletingFilter(true);
+        try {
+            const response = await ApiService.deleteSupervisoryFilter(selectedSavedFilterId);
+            if (response.success) {
+                setSavedFilters((prev) => prev.filter((filter) => filter.id !== selectedSavedFilterId));
+                setSelectedSavedFilterId('');
+            }
+        } catch (err) {
+            console.error('Failed to delete filter', err);
+        } finally {
+            setIsDeletingFilter(false);
+        }
+    }, [currentUser, savedFilters, selectedSavedFilterId]);
+
+    return {
+        // State
+        filterOptions,
+        savedFilters,
+        selectedSavedFilterId,
+        savedFilterName,
+        setSavedFilterName,
+        isSavingFilter,
+        isDeletingFilter,
+        selectedBucketSet,
+        availableBucketSets,
+        activeAgeBuckets,
+        selectedColumns,
+        setSelectedColumns,
+        filters,
+        draftFilters,
+        draftBucketSet,
+        aggregations,
+        summary,
+        totalRecords,
+        filteredRecords,
+        isLoading,
+        error,
+        hasActiveFilters,
+        hasPendingFilterChanges,
+
+        // Actions
+        loadAggregations,
+        forceRefresh,
+        handleFilterChange,
+        handleDraftBucketSetChange,
+        applyFilters,
+        clearAllFilters,
+        handleSavedFilterSelect,
+        handleSaveCurrentFilter,
+        handleDeleteSavedFilter
+    };
+};
+-----------------------------------------
+
+filterstateutils.js
+
+export const EMPTY_SUPERVISORY_FILTERS = {
+    regulation: [],
+    asset_class: [],
+    control_type: [],
+    data_type: [],
+    sub_control_type: [],
+    remediation_status: []
+};
+
+export const sanitizeFilters = (filters, emptyFilters = EMPTY_SUPERVISORY_FILTERS) => {
+    const next = { ...emptyFilters, ...(filters || {}) };
+    Object.keys(next).forEach((key) => {
+        if (!Array.isArray(next[key])) {
+            next[key] = [];
+        }
+    });
+    return next;
+};
+
+export const filtersEqual = (left, right) => {
+    const keys = Object.keys(EMPTY_SUPERVISORY_FILTERS);
+    return keys.every((key) => {
+        const leftValues = left?.[key] || [];
+        const rightValues = right?.[key] || [];
+        if (leftValues.length !== rightValues.length) return false;
+        return leftValues.every((value, index) => value === rightValues[index]);
+    });
+};
+
+export const STARTUP_FILTER_KEYS = ['regulation', 'asset_class', 'data_type'];
+
+export const buildInitialFilters = (response) => {
+    const nextFilters = { ...EMPTY_SUPERVISORY_FILTERS };
+    const configuredDefaults = response?.default_initial_filters || {};
+    const filterOptions = response?.filter_options || {};
+
+    STARTUP_FILTER_KEYS.forEach((key) => {
+        const availableOptions = filterOptions[key] || [];
+        const validConfiguredDefaults = (configuredDefaults[key] || []).filter((value) => availableOptions.includes(value));
+        if (validConfiguredDefaults.length > 0) {
+            nextFilters[key] = validConfiguredDefaults;
+        } else if (availableOptions.length > 0) {
+            nextFilters[key] = [availableOptions[0]];
+        }
+    });
+
+    return sanitizeFilters(nextFilters);
+};
+
+export const hasAnyFilterValues = (filters) =>
+    Object.values(filters || {}).some((values) => Array.isArray(values) && values.length > 0);
+
+export const canDeleteSavedFilter = (filter, currentUser) => {
+    if (!filter || !currentUser) return false;
+    const creatorId = String(filter.created_by || '').trim();
+    if (!creatorId) return false;
+    const userKeys = [currentUser.id, currentUser.username]
+        .filter((value) => value !== undefined && value !== null)
+        .map((value) => String(value).trim());
+    return userKeys.includes(creatorId);
+};
+-------------------------------------
+page.js trends
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FaChartBar, FaChevronRight, FaDownload, FaSync, FaTable } from 'react-icons/fa';
+import { ModuleRegistry, ClientSideRowModelModule } from 'ag-grid-community';
+import 'ag-grid-community/styles/ag-grid.css';
+import 'ag-grid-community/styles/ag-theme-alpine.css';
+import HSBCLogo from '../../components/HSBCLogo';
+import { useUser } from '../../contexts/UserContext';
+import SummaryCard from '../supervisory-dashboard/components/SummaryCard';
+import ColumnDropZone from '../supervisory-dashboard/components/ColumnDropZone';
+import { AVAILABLE_COLUMNS } from '../supervisory-dashboard/utils/columnConfig';
+import { EMPTY_SUPERVISORY_FILTERS } from '../supervisory-dashboard/utils/filterStateUtils';
+import TrendFilterSidebar from './components/TrendFilterSidebar';
+import TrendPivotGrid from './components/TrendPivotGrid';
+import TrendChartsSection from './components/TrendChartsSection';
+import { useSupervisoryTrendData } from './hooks/useSupervisoryTrendData';
+
+ModuleRegistry.registerModules([ClientSideRowModelModule]);
+
+export default function SupervisoryTrendsPage() {
+    const { currentUser } = useUser();
+    const dashboardLayoutRef = useRef(null);
+    const SIDEBAR_WIDTH_KEY = 'supervisory_trends_sidebar_width';
+    const SIDEBAR_COLLAPSED_KEY = 'supervisory_trends_sidebar_collapsed';
+    const SIDEBAR_MIN_WIDTH = 220;
+    const SIDEBAR_MAX_WIDTH = 520;
+
+    const trendState = useSupervisoryTrendData(currentUser);
+    const {
+        filterOptions,
+        savedFilters,
+        selectedSavedFilterId,
+        savedFilterName,
+        setSavedFilterName,
+        isSavingFilter,
+        isDeletingFilter,
+        selectedColumns,
+        setSelectedColumns,
+        trendData,
+        totalRecords,
+        filteredRecords,
+        isLoading,
+        error,
+        hasActiveFilters,
+        hasPendingFilterChanges,
+        forceRefresh,
+        handleFilterChange,
+        applyFilters,
+        clearAllFilters,
+        handleSavedFilterSelect,
+        handleSaveCurrentFilter,
+        handleDeleteSavedFilter
+    } = trendState;
+    const draftFilters = trendState.draftFilters ?? EMPTY_SUPERVISORY_FILTERS;
+
+    const [activeView, setActiveView] = useState('table');
+    const [showRemediated, setShowRemediated] = useState(true);
+    const [showUnremediated, setShowUnremediated] = useState(true);
+    const [sidebarWidth, setSidebarWidth] = useState(() => {
+        if (typeof window === 'undefined') return 224;
+        const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
+        return Number.isFinite(stored) && stored > 0 ? stored : 224;
+    });
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+        if (typeof window === 'undefined') return false;
+        return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
+    });
+    const isResizingSidebarRef = useRef(false);
+
+    useEffect(() => {
+        const handleMouseMove = (event) => {
+            if (!isResizingSidebarRef.current) return;
+            const layoutRect = dashboardLayoutRef.current?.getBoundingClientRect();
+            if (!layoutRect) return;
+            const dynamicMax = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, layoutRect.width - 420));
+            const nextWidth = Math.max(
+                SIDEBAR_MIN_WIDTH,
+                Math.min(dynamicMax, event.clientX - layoutRect.left)
+            );
+            setSidebarWidth(nextWidth);
+        };
+
+        const handleMouseUp = () => {
+            if (!isResizingSidebarRef.current) return;
+            isResizingSidebarRef.current = false;
+            document.body.style.userSelect = '';
+            document.body.style.cursor = '';
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+        return () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth)));
+    }, [sidebarWidth]);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(isSidebarCollapsed));
+    }, [isSidebarCollapsed]);
+
+    const handleSidebarResizeStart = useCallback((event) => {
+        event.preventDefault();
+        isResizingSidebarRef.current = true;
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'col-resize';
+    }, []);
+
+    const hasLastMonthDataset = useMemo(
+        () => Boolean(trendData?.grouped_tables?.daily_status_last_month),
+        [trendData]
+    );
+    const statuses = useMemo(() => trendData?.statuses || [], [trendData]);
+    const maxBusinessDate = trendData?.max_business_date || null;
+    const summaryStatusCounts = useMemo(() => trendData?.summary?.status_counts || {}, [trendData]);
+
+    const summaryCards = useMemo(() => {
+        const entries = statuses.map((status) => ({
+            title: status,
+            value: summaryStatusCounts[status] || 0,
+            color: status.toLowerCase().includes('unrem') ? '#DC2626' : '#2563EB'
+        }));
+        return [
+            { title: 'Filtered Total', value: filteredRecords || 0, color: '#0F172A' },
+            ...entries
+        ];
+    }, [filteredRecords, statuses, summaryStatusCounts]);
+
+    const totalCardItems = useMemo(() => ([
+        { title: 'Total Records', value: totalRecords || 0, color: '#2563EB' },
+        { title: 'Filtered Records', value: filteredRecords || 0, color: '#1D4ED8' },
+        { title: 'Groups', value: trendData?.grouped_tables?.monthly_status_last_5?.rows?.length || 0, color: '#0F766E' }
+    ]), [filteredRecords, totalRecords, trendData]);
+
+    const exportToCSV = useCallback(() => {
+        if (!trendData) return;
+
+        const sections = [
+            { name: 'monthly_status_last_5', rows: trendData.tables?.monthly_status_last_5 || [] },
+            { name: 'daily_status_last_5', rows: trendData.tables?.daily_status_last_5 || [] },
+            { name: 'daily_status_current_month', rows: trendData.tables?.daily_status_current_month || [] },
+            { name: 'daily_status_last_month', rows: trendData.tables?.daily_status_last_month || [] }
+        ];
+
+        const csvParts = sections.map(({ name, rows }) => {
+            const header = ['period_key', 'period_label', ...statuses, 'total_count'];
+            const lines = rows.map((row) => [
+                row.period_key,
+                row.period_label,
+                ...statuses.map((status) => row.status_counts?.[status] || 0),
+                row.total_count || 0
+            ].join(','));
+            return [name, header.join(','), ...lines].join('\n');
+        });
+
+        const blob = new Blob([csvParts.join('\n\n')], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `supervisory_trends_${new Date().toISOString().split('T')[0]}.csv`;
+        anchor.click();
+        window.URL.revokeObjectURL(url);
+    }, [statuses, trendData]);
+
+    return (
+        <div className="min-h-screen supervisory-page-canvas flex flex-col">
+            <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between" style={{ height: '64px' }}>
+                <div className="flex items-center gap-4">
+                    <HSBCLogo height={40} />
+                    <div>
+                        <h1 className="text-lg font-semibold text-gray-900">SUPERVISORY TRENDS</h1>
+                        <p className="text-xs text-gray-500">Month and day remediation views with stacked trend charts</p>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={forceRefresh}
+                        disabled={isLoading}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    >
+                        <FaSync className={isLoading ? 'animate-spin' : ''} />
+                        Refresh
+                    </button>
+                    <button
+                        onClick={exportToCSV}
+                        disabled={!trendData}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-slate-700 text-white hover:bg-slate-800 rounded transition-colors disabled:opacity-50"
+                    >
+                        <FaDownload />
+                        Export
+                    </button>
+                </div>
+            </div>
+
+            <div className="flex flex-1 overflow-hidden" ref={dashboardLayoutRef}>
+                {!isSidebarCollapsed ? (
+                    <TrendFilterSidebar
+                        sidebarWidth={sidebarWidth}
+                        handleSidebarResizeStart={handleSidebarResizeStart}
+                        hasActiveFilters={hasActiveFilters}
+                        clearAllFilters={clearAllFilters}
+                        savedFilters={savedFilters}
+                        selectedSavedFilterId={selectedSavedFilterId}
+                        handleSavedFilterSelect={handleSavedFilterSelect}
+                        savedFilterName={savedFilterName}
+                        setSavedFilterName={setSavedFilterName}
+                        handleSaveCurrentFilter={handleSaveCurrentFilter}
+                        handleDeleteSavedFilter={handleDeleteSavedFilter}
+                        isSavingFilter={isSavingFilter}
+                        isDeletingFilter={isDeletingFilter}
+                        currentUser={currentUser}
+                        filterOptions={filterOptions}
+                        draftFilters={draftFilters}
+                        handleFilterChange={handleFilterChange}
+                        applyFilters={applyFilters}
+                        hasPendingFilterChanges={hasPendingFilterChanges}
+                        isLoading={isLoading}
+                        totalRecords={totalRecords}
+                        filteredRecords={filteredRecords}
+                        onCollapse={() => setIsSidebarCollapsed(true)}
+                    />
+                ) : (
+                    <div className="w-10 bg-white border-r border-gray-200 flex items-start justify-center pt-3">
+                        <button
+                            type="button"
+                            onClick={() => setIsSidebarCollapsed(false)}
+                            className="w-7 h-7 inline-flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                            aria-label="Expand filters"
+                            title="Expand filters"
+                        >
+                            <FaChevronRight style={{ fontSize: '11px' }} />
+                        </button>
+                    </div>
+                )}
+
+                <div className="flex-1 p-4 overflow-y-auto">
+                    {error && (
+                        <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div className="supervisory-summary-card supervisory-summary-unrem rounded-lg p-3 border">
+                            <div className="supervisory-summary-title supervisory-summary-title-unrem text-sm font-semibold mb-2">
+                                Remediation Status <span className="supervisory-summary-subtitle supervisory-summary-subtitle-unrem text-xs font-normal">(filtered scope)</span>
+                            </div>
+                            <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(summaryCards.length, 1)}, minmax(0, 1fr))` }}>
+                                {summaryCards.map((card) => (
+                                    <SummaryCard key={card.title} title={card.title} value={card.value} color={card.color} small />
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="supervisory-summary-card supervisory-summary-total rounded-lg p-3 border">
+                            <div className="supervisory-summary-title supervisory-summary-title-total text-sm font-semibold mb-2">
+                                Trend Scope <span className="supervisory-summary-subtitle supervisory-summary-subtitle-total text-xs font-normal">(current selection)</span>
+                            </div>
+                            <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(totalCardItems.length, 1)}, minmax(0, 1fr))` }}>
+                                {totalCardItems.map((card) => (
+                                    <SummaryCard key={card.title} title={card.title} value={card.value} color={card.color} small />
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+                    <ColumnDropZone
+                        selectedColumns={selectedColumns}
+                        availableColumns={AVAILABLE_COLUMNS}
+                        onColumnsChange={setSelectedColumns}
+                    />
+
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-1 bg-gray-100 rounded p-0.5">
+                            <button
+                                onClick={() => setActiveView('table')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${activeView === 'table' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'}`}
+                            >
+                                <FaTable />
+                                Tables
+                            </button>
+                            <button
+                                onClick={() => setActiveView('chart')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${activeView === 'chart' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'}`}
+                            >
+                                <FaChartBar />
+                                Charts
+                            </button>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            {activeView === 'table' && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowRemediated((prev) => !prev)}
+                                        className={`px-2.5 py-1 rounded text-xs font-medium border transition-colors ${
+                                            showRemediated
+                                                ? 'bg-blue-600 text-white border-blue-600'
+                                                : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                                        }`}
+                                    >
+                                        Remediated
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowUnremediated((prev) => !prev)}
+                                        className={`px-2.5 py-1 rounded text-xs font-medium border transition-colors ${
+                                            showUnremediated
+                                                ? 'bg-red-600 text-white border-red-600'
+                                                : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                                        }`}
+                                    >
+                                        Unremediated
+                                    </button>
+                                </>
+                            )}
+                            <span className="text-xs text-gray-500">
+                                As of {maxBusinessDate || 'n/a'}
+                            </span>
+                        </div>
+                    </div>
+
+                    {activeView === 'table' && !showRemediated && !showUnremediated && (
+                        <div className="mb-3 p-2 bg-amber-50 border border-amber-200 rounded text-amber-800 text-xs">
+                            Select at least one of Remediated or Unremediated to display table columns.
+                        </div>
+                    )}
+
+                    {activeView === 'table' && (
+                        <div className="space-y-4">
+                            <TrendPivotGrid
+                                title="Monthly Remediation Status"
+                                subtitle="Grouped view with month on the primary header and remediation status on the secondary header"
+                                table={trendData?.grouped_tables?.monthly_status_last_5}
+                                isLoading={isLoading}
+                                showRemediated={showRemediated}
+                                showUnremediated={showUnremediated}
+                            />
+                            <TrendPivotGrid
+                                title="Daily Remediation Status"
+                                subtitle="Grouped view for the last 5 business dates"
+                                table={trendData?.grouped_tables?.daily_status_last_5}
+                                isLoading={isLoading}
+                                showRemediated={showRemediated}
+                                showUnremediated={showUnremediated}
+                            />
+                            <TrendPivotGrid
+                                title="Current Month Daily Status"
+                                subtitle="Grouped view for all business dates in the current month"
+                                table={trendData?.grouped_tables?.daily_status_current_month}
+                                isLoading={isLoading}
+                                showRemediated={showRemediated}
+                                showUnremediated={showUnremediated}
+                            />
+                            <TrendPivotGrid
+                                title="Last Month Daily Status"
+                                subtitle="Every calendar day in the previous calendar month"
+                                table={trendData?.grouped_tables?.daily_status_last_month}
+                                staleDataset={!hasLastMonthDataset && Boolean(trendData)}
+                                isLoading={isLoading}
+                                showRemediated={showRemediated}
+                                showUnremediated={showUnremediated}
+                            />
+                        </div>
+                    )}
+
+                    {activeView === 'chart' && (
+                        <TrendChartsSection
+                            monthlyChart={trendData?.charts?.monthly_plan_status_last_5 || { data: [], series: [], line_options: [] }}
+                            dailyChart={trendData?.charts?.daily_plan_status_last_30 || { data: [], series: [], line_options: [] }}
+                        />
+                    )}
+                </div>
+            </div>
+
+            {isLoading && (
+                <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-4 flex items-center gap-3 shadow-xl">
+                        <div className="w-6 h-6 border-3 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+                        <span className="text-gray-700 text-sm">Loading...</span>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+--------------------------
+trendfiltersidebar.js
+import React from 'react';
+import { FaCheck, FaChevronLeft, FaFilter } from 'react-icons/fa';
+import MultiSelectFilter from '../../supervisory-dashboard/components/MultiSelectFilter';
+import SavedFiltersPanel from '../../supervisory-dashboard/components/SavedFiltersPanel';
+import { EMPTY_SUPERVISORY_FILTERS } from '../../supervisory-dashboard/utils/filterStateUtils';
+
+const TrendFilterSidebar = ({
+    sidebarWidth,
+    handleSidebarResizeStart,
+    hasActiveFilters,
+    clearAllFilters,
+    savedFilters,
+    selectedSavedFilterId,
+    handleSavedFilterSelect,
+    savedFilterName,
+    setSavedFilterName,
+    handleSaveCurrentFilter,
+    handleDeleteSavedFilter,
+    isSavingFilter,
+    isDeletingFilter,
+    currentUser,
+    filterOptions,
+    draftFilters = EMPTY_SUPERVISORY_FILTERS,
+    handleFilterChange,
+    applyFilters,
+    hasPendingFilterChanges,
+    isLoading,
+    totalRecords,
+    filteredRecords,
+    onCollapse
+}) => {
+    return (
+        <div
+            className="bg-white border-r border-gray-200 p-3 overflow-y-auto flex-shrink-0 relative supervisory-surface supervisory-sidebar"
+            style={{ width: `${sidebarWidth}px` }}
+        >
+            <div className="flex items-center justify-between mb-3 supervisory-sidebar-header">
+                <div className="flex items-center gap-1.5">
+                    <FaFilter className="text-gray-500" style={{ fontSize: '12px' }} />
+                    <span className="font-semibold text-gray-700 text-sm">Filters</span>
+                </div>
+                <div className="flex items-center gap-2">
+                    {hasActiveFilters && (
+                        <button onClick={clearAllFilters} className="text-xs supervisory-clear-btn">Clear</button>
+                    )}
+                    <button
+                        type="button"
+                        onClick={onCollapse}
+                        className="w-7 h-7 inline-flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                        aria-label="Collapse filters"
+                        title="Collapse filters"
+                    >
+                        <FaChevronLeft style={{ fontSize: '11px' }} />
+                    </button>
+                </div>
+            </div>
+
+            <SavedFiltersPanel
+                savedFilters={savedFilters}
+                selectedSavedFilterId={selectedSavedFilterId}
+                onSelect={handleSavedFilterSelect}
+                savedFilterName={savedFilterName}
+                onNameChange={(event) => setSavedFilterName(event.target.value)}
+                onSave={handleSaveCurrentFilter}
+                onDelete={handleDeleteSavedFilter}
+                isSaving={isSavingFilter}
+                isDeleting={isDeletingFilter}
+                currentUser={currentUser}
+            />
+
+            <div className="mb-3 supervisory-sidebar-card supervisory-filter-card">
+                <div className="text-[11px] uppercase tracking-wide supervisory-filter-card-title">Refine Data</div>
+                <MultiSelectFilter
+                    label="Regulation"
+                    options={filterOptions.regulation}
+                    selected={draftFilters.regulation}
+                    onChange={(values) => handleFilterChange('regulation', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Asset Class"
+                    options={filterOptions.asset_class}
+                    selected={draftFilters.asset_class}
+                    onChange={(values) => handleFilterChange('asset_class', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Control Type"
+                    options={filterOptions.control_type}
+                    selected={draftFilters.control_type}
+                    onChange={(values) => handleFilterChange('control_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Data Type"
+                    options={filterOptions.data_type}
+                    selected={draftFilters.data_type}
+                    onChange={(values) => handleFilterChange('data_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Sub-Control Type"
+                    options={filterOptions.sub_control_type}
+                    selected={draftFilters.sub_control_type}
+                    onChange={(values) => handleFilterChange('sub_control_type', values)}
+                    placeholder="All"
+                />
+                <MultiSelectFilter
+                    label="Remediation Status"
+                    options={filterOptions.remediation_status}
+                    selected={draftFilters.remediation_status}
+                    onChange={(values) => handleFilterChange('remediation_status', values)}
+                    placeholder="All"
+                />
+            </div>
+
+            <div className="mb-3">
+                {hasPendingFilterChanges && (
+                    <div className="mb-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                        Filter changes are not applied yet.
+                    </div>
+                )}
+                <button
+                    type="button"
+                    onClick={applyFilters}
+                    disabled={!hasPendingFilterChanges || isLoading}
+                    className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <FaCheck style={{ fontSize: '10px' }} />
+                    Apply Filters
+                </button>
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-gray-200 text-xs text-gray-600 supervisory-sidebar-stats">
+                <div className="flex justify-between mb-1">
+                    <span>Total:</span>
+                    <span className="font-medium">{totalRecords.toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between">
+                    <span>Filtered:</span>
+                    <span className="font-medium">{filteredRecords.toLocaleString()}</span>
+                </div>
+            </div>
+
+            <div
+                className="absolute top-0 right-0 h-full w-1 cursor-col-resize supervisory-sidebar-resizer"
+                onMouseDown={handleSidebarResizeStart}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize filters sidebar"
+            />
+        </div>
+    );
+};
+
+export default TrendFilterSidebar;
+-------------------------------
+trendpivotgrid
+
+import React, { useCallback, useMemo } from 'react';
+import { AgGridReact } from 'ag-grid-react';
+import { ROW_SPAN_CONFIG, addRowSpanMetadata } from '../../supervisory-dashboard/utils/agGridUtils';
+
+function formatStatusHeader(value) {
+    const normalized = String(value || '').toLowerCase();
+    if (normalized === 'unremediated') return 'UnRem';
+    if (normalized === 'remediated') return 'Rem';
+    return value;
+}
+
+const isUnremediatedStatus = (status) => String(status || '').toLowerCase().includes('unrem');
+
+const isRemediatedStatus = (status) => {
+    const normalized = String(status || '').toLowerCase();
+    return normalized.includes('remediated') && !normalized.includes('unrem');
+};
+
+const TrendPivotGrid = ({ title, subtitle, table, isLoading, showRemediated = true, showUnremediated = true, staleDataset = false }) => {
+    const rowDataWithSpans = useMemo(() => addRowSpanMetadata(table?.rows || []), [table]);
+
+    const isStatusVisible = useCallback((status) => {
+        if (isUnremediatedStatus(status)) return showUnremediated;
+        if (isRemediatedStatus(status)) return showRemediated;
+        return showRemediated || showUnremediated;
+    }, [showRemediated, showUnremediated]);
+
+    const getMergeBorderStyle = useCallback((field, data) => {
+        const state = data?._mergeState?.[field];
+        const c = '#64748b';
+        const t = '3px';
+        const base = {
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: '#f8fafc',
+            borderLeft: `${t} solid ${c}`,
+            borderRight: `${t} solid ${c}`,
+            borderTop: 'none',
+            borderBottom: 'none'
+        };
+        if (!state || state.length <= 1) {
+            base.borderTop = `${t} solid ${c}`;
+            base.borderBottom = `${t} solid ${c}`;
+        } else {
+            if (state.isStart) base.borderTop = `${t} solid ${c}`;
+            if (state.isEnd) base.borderBottom = `${t} solid ${c}`;
+        }
+        return base;
+    }, []);
+
+    const mergedCellRenderer = useCallback((params) => {
+        const field = params.colDef?.field;
+        const isMergedField = ROW_SPAN_CONFIG.some((cfg) => cfg.field === field);
+        const shouldDisplay = isMergedField
+            ? (params.data?._mergeDisplay?.[field] ?? true)
+            : true;
+
+        if (isMergedField) {
+            const borderStyle = getMergeBorderStyle(field, params.data);
+            if (!shouldDisplay) {
+                return <div style={borderStyle} />;
+            }
+            const displayValue = params.valueFormatted ?? params.value ?? '';
+            return (
+                <div style={borderStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', height: '100%', padding: '0 8px', fontWeight: 500 }}>
+                        <span className="supervisory-cell-value">{displayValue}</span>
+                    </div>
+                </div>
+            );
+        }
+
+        return <span>{params.valueFormatted ?? params.value ?? ''}</span>;
+    }, [getMergeBorderStyle]);
+
+    const columnDefs = useMemo(() => {
+        const groupColumns = (table?.group_columns || []).map((column) => ({
+            headerName: column.headerName,
+            field: column.field,
+            pinned: 'left',
+            width: 150,
+            minWidth: 90,
+            sortable: true,
+            filter: true,
+            headerClass: 'supervisory-header-groupby',
+            cellStyle: ROW_SPAN_CONFIG.some((cfg) => cfg.field === column.field)
+                ? undefined
+                : { fontWeight: 500 },
+            cellRenderer: mergedCellRenderer
+        }));
+
+        const periodColumns = (table?.period_columns || []).map((periodColumn) => {
+            const visibleChildren = (periodColumn.children || []).filter((child) => isStatusVisible(child.status));
+            if (visibleChildren.length === 0) return null;
+
+            return {
+                headerName: periodColumn.period_label,
+                headerClass: 'supervisory-header-total-group',
+                marryChildren: true,
+                children: visibleChildren.map((child) => ({
+                    headerName: formatStatusHeader(child.headerName),
+                    field: child.field,
+                    type: 'numericColumn',
+                    width: 104,
+                    minWidth: 40,
+                    sortable: true,
+                    headerClass: isUnremediatedStatus(child.status)
+                        ? 'supervisory-header-unrem'
+                        : 'supervisory-header-total',
+                    valueFormatter: (params) => (params.value || 0).toLocaleString(),
+                    cellStyle: (params) => ({
+                        textAlign: 'right',
+                        backgroundColor: (params.value || 0) > 0 ? '#f8fafc' : '#fdfdfd',
+                        color: (params.value || 0) > 0 ? '#0f172a' : '#94a3b8'
+                    })
+                }))
+            };
+        }).filter(Boolean);
+
+        return [
+            ...groupColumns,
+            ...periodColumns,
+            {
+                headerName: 'Row Total',
+                field: 'row_total',
+                pinned: 'right',
+                width: 110,
+                minWidth: 60,
+                sortable: true,
+                type: 'numericColumn',
+                headerClass: 'supervisory-header-total',
+                valueGetter: (params) => {
+                    const row = params.data;
+                    if (!row) return 0;
+                    return (table?.period_columns || []).reduce((sum, periodColumn) => {
+                        const periodSum = (periodColumn.children || []).reduce((childSum, child) => {
+                            if (!isStatusVisible(child.status)) return childSum;
+                            return childSum + (row[child.field] || 0);
+                        }, 0);
+                        return sum + periodSum;
+                    }, 0);
+                },
+                valueFormatter: (params) => (params.value || 0).toLocaleString(),
+                cellStyle: { textAlign: 'right', fontWeight: 'bold', backgroundColor: '#eff6ff' }
+            }
+        ];
+    }, [isStatusVisible, mergedCellRenderer, table]);
+
+    const defaultColDef = useMemo(() => ({
+        resizable: true
+    }), []);
+
+    const periodCount = table?.period_columns?.length || 0;
+    const rowCount = table?.rows?.length || 0;
+    const hasStatusColumns = columnDefs.some((col) => col.children?.length > 0);
+    const isMissingTable = !table || staleDataset;
+    const isEmptyTable = periodCount === 0 || rowCount === 0 || !hasStatusColumns;
+
+    return (
+        <div className="supervisory-elevated supervisory-surface rounded-lg border border-gray-200 overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-200 bg-white">
+                <h3 className="text-sm font-semibold text-gray-900">{title}</h3>
+                <p className="text-xs text-gray-500">{subtitle}</p>
+                {periodCount > 0 && (
+                    <p className="text-[11px] text-gray-400 mt-0.5">{periodCount} days · {rowCount} groups</p>
+                )}
+            </div>
+            {isEmptyTable && !isLoading ? (
+                <div className="px-4 py-10 text-center text-sm text-gray-500">
+                    No data for this period with the current filters.
+                    {(isMissingTable || staleDataset) && (
+                        <div className="text-xs text-amber-700 mt-2">
+                            Click Refresh to load the latest trend tables (including last month).
+                        </div>
+                    )}
+                </div>
+            ) : (
+                <div className="ag-theme-alpine" style={{ height: '420px', width: '100%' }}>
+                    <AgGridReact
+                        rowData={rowDataWithSpans}
+                        columnDefs={columnDefs}
+                        defaultColDef={defaultColDef}
+                        theme="legacy"
+                        animateRows={true}
+                        suppressCellFocus={true}
+                        overlayLoadingTemplate={'<span class="ag-overlay-loading-center">Loading...</span>'}
+                        overlayNoRowsTemplate={'<span class="ag-overlay-no-rows-center">No data to display</span>'}
+                        loading={isLoading}
+                        suppressRowTransform={true}
+                        suppressRowVirtualisation={true}
+                        suppressColumnVirtualisation={true}
+                    />
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default TrendPivotGrid;
+-------------------------------
+usesuperviserytrend data
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiService } from '../../../services/api';
+import { cacheClear, cacheGet, cacheSet } from '../../supervisory-dashboard/hooks/useLocalCache';
+import { AVAILABLE_COLUMNS } from '../../supervisory-dashboard/utils/columnConfig';
+import {
+    EMPTY_SUPERVISORY_FILTERS,
+    buildInitialFilters,
+    canDeleteSavedFilter,
+    filtersEqual,
+    hasAnyFilterValues,
+    sanitizeFilters
+} from '../../supervisory-dashboard/utils/filterStateUtils';
+
+const CK_FILTER_OPTIONS = 'supervisory_trends_v3_filter_options';
+const CK_TRENDS = 'supervisory_trends_v3_data';
+const CK_APPLIED_FILTERS = 'supervisory_trends_v3_applied_filters';
+const LS_SELECTED_COLUMNS = 'supervisory_trends_selected_columns';
+
+const isValidTrendCache = (data) =>
+    Boolean(data?.grouped_tables?.daily_status_last_month);
+
+export const useSupervisoryTrendData = (currentUser) => {
+    const cachedFilters = cacheGet(CK_FILTER_OPTIONS);
+    const cachedAppliedFilters = cacheGet(CK_APPLIED_FILTERS);
+    const rawCachedTrends = cacheGet(CK_TRENDS);
+    const cachedTrends = isValidTrendCache(rawCachedTrends) ? rawCachedTrends : null;
+    const cachedInitialFilters = cachedAppliedFilters
+        ? sanitizeFilters(cachedAppliedFilters)
+        : cachedFilters
+            ? buildInitialFilters(cachedFilters)
+            : { ...EMPTY_SUPERVISORY_FILTERS };
+
+    const [filterOptions, setFilterOptions] = useState(
+        cachedFilters?.filter_options ?? EMPTY_SUPERVISORY_FILTERS
+    );
+    const [filters, setFilters] = useState(cachedInitialFilters);
+    const [draftFilters, setDraftFilters] = useState(cachedInitialFilters);
+    const [savedFilters, setSavedFilters] = useState([]);
+    const [selectedSavedFilterId, setSelectedSavedFilterId] = useState('');
+    const [savedFilterName, setSavedFilterName] = useState('');
+    const [isSavingFilter, setIsSavingFilter] = useState(false);
+    const [isDeletingFilter, setIsDeletingFilter] = useState(false);
+    const [selectedColumns, setSelectedColumns] = useState(() => {
+        try {
+            const stored = window.localStorage.getItem(LS_SELECTED_COLUMNS);
+            if (stored) {
+                const fields = JSON.parse(stored);
+                if (Array.isArray(fields) && fields.length > 0) {
+                    const cols = fields
+                        .map((field) => AVAILABLE_COLUMNS.find((column) => column.field === field))
+                        .filter(Boolean);
+                    if (cols.length > 0) return cols;
+                }
+            }
+        } catch {
+            // ignore localStorage parse failures
+        }
+        return [AVAILABLE_COLUMNS[0], AVAILABLE_COLUMNS[1], AVAILABLE_COLUMNS[2]];
+    });
+    const [trendData, setTrendData] = useState(cachedTrends ?? null);
+    const [totalRecords, setTotalRecords] = useState(cachedFilters?.total_records ?? cachedTrends?.total_records ?? 0);
+    const [filteredRecords, setFilteredRecords] = useState(cachedTrends?.filtered_records ?? 0);
+    const [isLoading, setIsLoading] = useState(!cachedTrends);
+    const [error, setError] = useState(null);
+
+    const initialLoadDone = useRef(false);
+    const initialLoadStarted = useRef(false);
+    const skipColumnEffectRef = useRef(false);
+    const prevColumnKeyRef = useRef(null);
+    const selectedColumnsRef = useRef(selectedColumns);
+    const appliedQueryRef = useRef({ filters: cachedInitialFilters, selectedColumns: [] });
+    selectedColumnsRef.current = selectedColumns;
+    appliedQueryRef.current = { filters, selectedColumns };
+
+    const selectedColumnKey = selectedColumns.map((column) => column.field).join('|');
+
+    const hasActiveFilters = useMemo(
+        () => hasAnyFilterValues(draftFilters),
+        [draftFilters]
+    );
+
+    const hasPendingFilterChanges = useMemo(
+        () => !filtersEqual(draftFilters, filters),
+        [draftFilters, filters]
+    );
+
+    const buildInitialFiltersFromResponse = useCallback((response) => buildInitialFilters(response), []);
+
+    const applyFilterOptions = useCallback((response) => {
+        setFilterOptions(response.filter_options || EMPTY_SUPERVISORY_FILTERS);
+        setTotalRecords(response.total_records || 0);
+        cacheSet(CK_FILTER_OPTIONS, response);
+    }, []);
+
+    const applyTrendResponse = useCallback((response) => {
+        setTrendData(response);
+        setFilteredRecords(response.filtered_records || 0);
+        setTotalRecords(response.total_records || 0);
+        cacheSet(CK_TRENDS, response);
+    }, []);
+
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(
+                LS_SELECTED_COLUMNS,
+                JSON.stringify(selectedColumns.map((column) => column.field))
+            );
+        } catch {
+            // ignore localStorage write failures
+        }
+    }, [selectedColumns]);
+
+    const persistAppliedFilters = useCallback((nextFilters) => {
+        cacheSet(CK_APPLIED_FILTERS, sanitizeFilters(nextFilters));
+    }, []);
+
+    const fetchTrends = useCallback(async (nextFilters, nextSelectedColumns = selectedColumnsRef.current) => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const response = await ApiService.getSupervisoryTrends(
+                nextFilters,
+                nextSelectedColumns.map((column) => column.field)
+            );
+            if (response.success) {
+                applyTrendResponse(response);
+            } else {
+                setError(response.message || 'Failed to load trend analytics');
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load trend analytics');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [applyTrendResponse]);
+
+    const loadSavedFilters = useCallback(async () => {
+        try {
+            const response = await ApiService.getSupervisorySavedFilters();
+            if (response.success) {
+                setSavedFilters(response.filters || []);
+            }
+        } catch (err) {
+            console.error('Failed to load saved filters', err);
+        }
+    }, []);
+
+    const loadInitial = useCallback(async () => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const response = await ApiService.getSupervisoryFilterOptions();
+            if (!response.success) {
+                setError(response.message || 'Failed to load filter options');
+                return;
+            }
+
+            applyFilterOptions(response);
+
+            const cachedApplied = cacheGet(CK_APPLIED_FILTERS);
+            const nextFilters = cachedApplied
+                ? sanitizeFilters(cachedApplied)
+                : buildInitialFiltersFromResponse(response);
+
+            setFilters(nextFilters);
+            setDraftFilters(nextFilters);
+
+            const trendResponse = await ApiService.getSupervisoryTrends(
+                nextFilters,
+                selectedColumnsRef.current.map((column) => column.field)
+            );
+            if (trendResponse.success) {
+                applyTrendResponse(trendResponse);
+            } else {
+                setError(trendResponse.message || 'Failed to load trend analytics');
+            }
+
+            prevColumnKeyRef.current = selectedColumnsRef.current
+                .map((column) => column.field)
+                .join('|');
+            initialLoadDone.current = true;
+        } catch (err) {
+            setError(err.message || 'Failed to load trend analytics');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [applyFilterOptions, applyTrendResponse, buildInitialFiltersFromResponse]);
+
+    useEffect(() => {
+        if (initialLoadStarted.current) return;
+        initialLoadStarted.current = true;
+        loadInitial();
+        loadSavedFilters();
+    }, [loadInitial, loadSavedFilters]);
+
+    useEffect(() => {
+        if (skipColumnEffectRef.current) return;
+        if (!initialLoadDone.current) return;
+
+        const columnsChanged = prevColumnKeyRef.current !== selectedColumnKey;
+        prevColumnKeyRef.current = selectedColumnKey;
+        if (!columnsChanged) return;
+
+        const { filters: appliedFilters, selectedColumns: appliedColumns } = appliedQueryRef.current;
+        fetchTrends(appliedFilters, appliedColumns);
+    }, [selectedColumnKey, fetchTrends]);
+
+    const handleFilterChange = useCallback((filterKey, values) => {
+        setDraftFilters((prev) => ({ ...prev, [filterKey]: values }));
+    }, []);
+
+    const applyFilters = useCallback(async () => {
+        const nextFilters = sanitizeFilters(draftFilters);
+        initialLoadDone.current = true;
+        setFilters(nextFilters);
+        persistAppliedFilters(nextFilters);
+        await fetchTrends(nextFilters, selectedColumnsRef.current);
+    }, [draftFilters, fetchTrends, persistAppliedFilters]);
+
+    const clearAllFilters = useCallback(() => {
+        setDraftFilters({ ...EMPTY_SUPERVISORY_FILTERS });
+    }, []);
+
+    const applySavedFilter = useCallback(async (saved) => {
+        if (!saved) return;
+        initialLoadDone.current = true;
+        const nextFilters = sanitizeFilters(saved.filters);
+        setFilters(nextFilters);
+        setDraftFilters(nextFilters);
+        persistAppliedFilters(nextFilters);
+
+        let nextSelectedColumns = selectedColumnsRef.current;
+        if (Array.isArray(saved.group_by) && saved.group_by.length > 0) {
+            const resolvedColumns = saved.group_by
+                .map((field) => AVAILABLE_COLUMNS.find((column) => column.field === field))
+                .filter(Boolean);
+            if (resolvedColumns.length > 0) {
+                skipColumnEffectRef.current = true;
+                setSelectedColumns(resolvedColumns);
+                nextSelectedColumns = resolvedColumns;
+                selectedColumnsRef.current = resolvedColumns;
+            }
+        }
+
+        await fetchTrends(nextFilters, nextSelectedColumns);
+        prevColumnKeyRef.current = nextSelectedColumns.map((column) => column.field).join('|');
+        skipColumnEffectRef.current = false;
+    }, [fetchTrends, persistAppliedFilters]);
+
+    const handleSavedFilterSelect = useCallback((event) => {
+        const value = event.target.value;
+        setSelectedSavedFilterId(value);
+        const selected = savedFilters.find((item) => item.id === value);
+        applySavedFilter(selected);
+    }, [applySavedFilter, savedFilters]);
+
+    const handleSaveCurrentFilter = useCallback(async () => {
+        if (!savedFilterName.trim()) return;
+        setIsSavingFilter(true);
+        try {
+            const response = await ApiService.saveSupervisoryFilter({
+                name: savedFilterName.trim(),
+                filters: sanitizeFilters(draftFilters),
+                group_by: selectedColumns.map((column) => column.field),
+                created_by: currentUser?.id || currentUser?.username || 'anonymous',
+                created_by_name: currentUser?.name || currentUser?.username || 'anonymous'
+            });
+            if (response.success) {
+                setSavedFilters((prev) => [response.filter, ...prev]);
+                setSavedFilterName('');
+                setSelectedSavedFilterId(response.filter.id);
+            }
+        } catch (err) {
+            console.error('Failed to save trend filter', err);
+        } finally {
+            setIsSavingFilter(false);
+        }
+    }, [currentUser, draftFilters, savedFilterName, selectedColumns]);
+
+    const handleDeleteSavedFilter = useCallback(async () => {
+        if (!selectedSavedFilterId) return;
+        const selected = savedFilters.find((filter) => filter.id === selectedSavedFilterId);
+        if (!selected || !canDeleteSavedFilter(selected, currentUser)) return;
+
+        const confirmed = window.confirm(`Delete saved filter "${selected.name}"?`);
+        if (!confirmed) return;
+
+        setIsDeletingFilter(true);
+        try {
+            const response = await ApiService.deleteSupervisoryFilter(selectedSavedFilterId);
+            if (response.success) {
+                setSavedFilters((prev) => prev.filter((filter) => filter.id !== selectedSavedFilterId));
+                setSelectedSavedFilterId('');
+            }
+        } catch (err) {
+            console.error('Failed to delete trend filter', err);
+        } finally {
+            setIsDeletingFilter(false);
+        }
+    }, [currentUser, savedFilters, selectedSavedFilterId]);
+
+    const forceRefresh = useCallback(async () => {
+        cacheClear(CK_TRENDS);
+        cacheClear(CK_FILTER_OPTIONS);
+        setIsLoading(true);
+        setError(null);
+        try {
+            const response = await ApiService.getSupervisoryFilterOptions();
+            if (!response.success) {
+                setError(response.message || 'Failed to load filter options');
+                return;
+            }
+
+            applyFilterOptions(response);
+
+            const { filters: appliedFilters, selectedColumns: appliedColumns } = appliedQueryRef.current;
+            const trendResponse = await ApiService.getSupervisoryTrends(
+                appliedFilters,
+                appliedColumns.map((column) => column.field)
+            );
+            if (trendResponse.success) {
+                applyTrendResponse(trendResponse);
+            } else {
+                setError(trendResponse.message || 'Failed to load trend analytics');
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load trend analytics');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [applyFilterOptions, applyTrendResponse]);
+
+    return {
+        filterOptions,
+        filters,
+        draftFilters,
+        savedFilters,
+        selectedSavedFilterId,
+        savedFilterName,
+        setSavedFilterName,
+        isSavingFilter,
+        isDeletingFilter,
+        selectedColumns,
+        setSelectedColumns,
+        trendData,
+        totalRecords,
+        filteredRecords,
+        isLoading,
+        error,
+        hasActiveFilters,
+        hasPendingFilterChanges,
+        forceRefresh,
+        handleFilterChange,
+        applyFilters,
+        clearAllFilters,
+        handleSavedFilterSelect,
+        handleSaveCurrentFilter,
+        handleDeleteSavedFilter
+    };
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
