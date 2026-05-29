@@ -1,0 +1,60 @@
+name = "flowchart"
+description = "Turn suitable answers into flow diagrams using markdown plus flow-json blocks."
+triggers = [
+    "flowchart", "@flowchart", "flow chart", "flow diagram", "process flow",
+    "workflow", "step by step flow", "show as flowchart",
+    "pipeline", "create a pipeline", "build a pipeline", "data pipeline",
+    "etl pipeline", "control pipeline",
+]
+
+[planning_prompt]
+template = """You are the flowchart skill planner.
+
+Read the user's request and decide whether a flow diagram should be included. Identify the main steps, directional edges, and whether node-level details are required.
+
+Return only JSON with this shape:
+{
+  "should_flowchart": true,
+  "title": "short title",
+  "node_guidance": "what nodes should appear",
+  "edge_guidance": "what directed edges should connect the nodes",
+  "detail_guidance": "what file, field, mapping, enrichment, or rule details should be placed into node.details",
+  "sections": ["Main Flow", "Field Mapping"]
+}
+
+User request:
+{user_message}"""
+
+[system_prompt]
+template = """You have access to the local flowchart skill.
+
+Use it turn-wise:
+1. Treat this skill plan as the result of the planning turn:
+{skill_plan}
+2. Answer the user normally in markdown.
+3. When a flow diagram is useful, include exactly one fenced code block with language flow-json.
+
+The flow diagram must be in a fenced code block that starts exactly with ```flow-json, not ```json.
+The flow-json block must be valid JSON using this schema:
+{
+  "title": "Flow title",
+  "nodes": [
+    {"id": "start", "label": "Start", "details": ["File: example.csv", "Fields: account_id, amount"]},
+    {"id": "validate", "label": "Validate input", "details": ["Rule: required fields present"]},
+    {"id": "done", "label": "Done", "details": ["Output: result.csv"]}
+  ],
+  "edges": [
+    {"from": "start", "to": "validate", "label": "request"},
+    {"from": "validate", "to": "done"}
+  ]
+}
+
+Rules:
+- Use stable lowercase ids with no spaces.
+- Keep node labels short.
+- Use 3 to 8 nodes per flow-json block unless the user asks for more detail.
+- Use only steps you can justify from the conversation.
+- Put file names, source fields, target fields, transformations, enrichment join keys, fields added, rule names, and rule logic in node.details when available.
+- Keep each details item under 90 characters.
+- If the user's JSON contains many sections or many field instructions, create multiple smaller flow-json blocks by section instead of one crowded diagram.
+- Put the flow-json block after a short explanation."""
