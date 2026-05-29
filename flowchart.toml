@@ -22,6 +22,7 @@ Return only JSON with this shape:
   "sections": ["Main Flow", "Field Mapping"]
 }
 
+
 User request:
 {user_message}"""
 
@@ -58,3 +59,864 @@ Rules:
 - Keep each details item under 90 characters.
 - If the user's JSON contains many sections or many field instructions, create multiple smaller flow-json blocks by section instead of one crowded diagram.
 - Put the flow-json block after a short explanation."""
+
+
+---------------
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import Logo from '../../components/Logo';
+import { ApiService } from '../../services/api';
+import FileMonitoringGrid from './components/FileMonitoringGrid';
+import {
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    CartesianGrid,
+    Tooltip,
+    Legend,
+    ResponsiveContainer
+} from 'recharts';
+
+const getTodayDate = () => {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
+const matchesHierarchyFilters = (file, activeFilters, excludeKey = null) => {
+    const checks = [
+        ['regulation', activeFilters.regulation],
+        ['asset_class', activeFilters.asset_class],
+        ['sub_control_name', activeFilters.sub_control_name],
+        ['control_name', activeFilters.control_name],
+    ];
+
+    return checks.every(([key, value]) => {
+        if (key === excludeKey || !value) return true;
+        return file[key] === value;
+    });
+};
+
+const matchesSidebarFilters = (file, activeFilters) => {
+    if (!matchesHierarchyFilters(file, activeFilters)) return false;
+    if (activeFilters.frequency && file.frequency !== activeFilters.frequency) return false;
+    if (activeFilters.status &&
+        (file.status || '').toLowerCase() !== activeFilters.status.toLowerCase()) {
+        return false;
+    }
+    return true;
+};
+
+const uniqueSortedValues = (items, selector) => (
+    [...new Set(items.map(selector).filter(Boolean))].sort()
+);
+
+const EMPTY_DISPLAY_SUMMARY = {
+    filteredCount: 0,
+    stats: { total: 0, received: 0, notReceived: 0, receiptRate: 0 },
+    chartData: [],
+};
+
+export default function FileMonitoringDashboard({ fileType = 'input' }) {
+    const gridRef = useRef(null);
+    const [fileStatuses, setFileStatuses] = useState([]);
+    const [totalRecordCount, setTotalRecordCount] = useState(0);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [hierarchy, setHierarchy] = useState({
+        regulations: [],
+        asset_classes: [],
+        sub_control_names: [],
+        control_names: [],
+        frequencies: [],
+        statuses: ['received', 'not_received']
+    });
+
+    const [filters, setFilters] = useState({
+        monitoring_date: getTodayDate(),
+        regulation: '',
+        asset_class: '',
+        sub_control_name: '',
+        control_name: '',
+        frequency: '',
+        status: ''
+    });
+
+    const [chartCategory, setChartCategory] = useState('regulation');
+    const [displaySummary, setDisplaySummary] = useState(EMPTY_DISPLAY_SUMMARY);
+
+    const [visibleColumns, setVisibleColumns] = useState({
+        display_name: true,
+        status: true,
+        arrival_time: true,
+        regulation: false,
+        asset_class: false,
+        sub_control_name: false,
+        control_name: false,
+        frequency: false,
+        note: true
+    });
+    const [showColumnSelector, setShowColumnSelector] = useState(false);
+
+    const dashboardTitle = fileType === 'input'
+        ? 'Input File Monitoring'
+        : 'Output File Monitoring';
+
+    const arrivalLabel = fileType === 'input' ? 'Arrival Time' : 'Production Time';
+
+    const loadHierarchy = useCallback(async () => {
+        try {
+            const data = await ApiService.getFileMonitoringHierarchy(fileType);
+            setHierarchy(data);
+        } catch (err) {
+            // hierarchy load failure is non-fatal
+        }
+    }, [fileType]);
+
+    const loadFileStatuses = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const data = await ApiService.getFileMonitoringStatus({
+                file_type: fileType,
+                monitoring_date: filters.monitoring_date
+            });
+            setFileStatuses(data.file_statuses || []);
+            setTotalRecordCount(data.total_count ?? (data.file_statuses || []).length);
+        } catch (err) {
+            setError(err.message || 'Failed to load file monitoring status');
+        } finally {
+            setLoading(false);
+        }
+    }, [fileType, filters.monitoring_date]);
+
+    useEffect(() => {
+        loadHierarchy();
+    }, [loadHierarchy]);
+
+    useEffect(() => {
+        loadFileStatuses();
+    }, [loadFileStatuses]);
+
+    const handleFilterChange = (key, value) => {
+        setFilters(prev => {
+            const newFilters = { ...prev, [key]: value };
+            if (key === 'regulation') {
+                newFilters.asset_class = '';
+                newFilters.sub_control_name = '';
+                newFilters.control_name = '';
+                newFilters.frequency = '';
+            } else if (key === 'asset_class') {
+                newFilters.sub_control_name = '';
+                newFilters.control_name = '';
+                newFilters.frequency = '';
+            } else if (key === 'sub_control_name') {
+                newFilters.control_name = '';
+                newFilters.frequency = '';
+            } else if (key === 'control_name') {
+                newFilters.frequency = '';
+            }
+            return newFilters;
+        });
+    };
+
+    const handleDisplaySummary = useCallback((summary) => {
+        setDisplaySummary(summary);
+    }, []);
+
+    const clearFilters = () => {
+        setFilters({
+            monitoring_date: getTodayDate(),
+            regulation: '',
+            asset_class: '',
+            sub_control_name: '',
+            control_name: '',
+            frequency: '',
+            status: ''
+        });
+        gridRef.current?.clearFilters();
+    };
+
+    // Cascade filter options from loaded data, respecting upstream sidebar selections
+    const filteredAssetClasses = useMemo(() => {
+        if (!filters.regulation) return hierarchy.asset_classes;
+        return uniqueSortedValues(
+            fileStatuses.filter(f => f.regulation === filters.regulation),
+            f => f.asset_class
+        );
+    }, [filters.regulation, fileStatuses, hierarchy.asset_classes]);
+
+    const filteredSubControlNames = useMemo(() => {
+        if (!filters.regulation && !filters.asset_class) return hierarchy.sub_control_names;
+        return uniqueSortedValues(
+            fileStatuses.filter(f =>
+                matchesHierarchyFilters(f, filters, 'sub_control_name')
+            ),
+            f => f.sub_control_name
+        );
+    }, [filters, fileStatuses, hierarchy.sub_control_names]);
+
+    const filteredControlNames = useMemo(() => {
+        if (!filters.regulation && !filters.asset_class && !filters.sub_control_name) {
+            return hierarchy.control_names;
+        }
+        return uniqueSortedValues(
+            fileStatuses.filter(f =>
+                matchesHierarchyFilters(f, filters, 'control_name')
+            ),
+            f => f.control_name
+        );
+    }, [filters, fileStatuses, hierarchy.control_names]);
+
+    const filteredFrequencies = useMemo(() => {
+        const hasHierarchyFilter = filters.regulation || filters.asset_class ||
+            filters.sub_control_name || filters.control_name;
+        if (!hasHierarchyFilter) return hierarchy.frequencies;
+        return uniqueSortedValues(
+            fileStatuses.filter(f => matchesHierarchyFilters(f, filters, 'frequency')),
+            f => f.frequency
+        );
+    }, [filters, fileStatuses, hierarchy.frequencies]);
+
+    const sidebarFilteredRows = useMemo(() => (
+        fileStatuses.filter(f => matchesSidebarFilters(f, filters))
+    ), [fileStatuses, filters]);
+
+    const { stats, chartData, filteredCount } = displaySummary;
+
+    const getCategoryLabel = (cat) => {
+        const labels = {
+            regulation: 'Regulation',
+            asset_class: 'Asset Class',
+            sub_control_name: 'Sub-Control Name',
+            control_name: 'Control Name'
+        };
+        return labels[cat] || cat;
+    };
+
+    const columnLabels = {
+        display_name: 'File Name',
+        status: 'Status',
+        arrival_time: arrivalLabel,
+        regulation: 'Regulation',
+        asset_class: 'Asset Class',
+        sub_control_name: 'Sub-Control Name',
+        control_name: 'Control Name',
+        frequency: 'Frequency',
+        note: 'Note'
+    };
+
+    return (
+        <div className="min-h-screen" style={{ backgroundColor: 'white' }}>
+            <div className="flex flex-col h-screen">
+                {/* Header */}
+                <div
+                    className="border-b px-8 py-4 relative overflow-hidden"
+                    style={{
+                        backgroundColor: 'white',
+                        borderBottom: '3px solid #db0011',
+                        height: '80px',
+                        boxShadow: '0 2px 8px rgba(219,0,17,0.1)'
+                    }}
+                >
+                    <div className="flex items-center justify-between h-full relative z-10">
+                        <div className="flex items-center flex-shrink-0">
+                            <Logo height={64} className="mr-4" />
+                        </div>
+                        <div className="flex-1 flex justify-center">
+                            <h1 className="text-2xl font-bold text-center" style={{ color: '#db0011' }}>
+                                {dashboardTitle}
+                            </h1>
+                        </div>
+                        <div className="flex-shrink-0 w-32"></div>
+                    </div>
+                </div>
+
+                {/* Main Content */}
+                <div className="flex-1 flex overflow-hidden relative" style={{ backgroundColor: '#f5f5f5' }}>
+                    {/* Left Sidebar - Filters */}
+                    <div className="w-80 bg-white border-r border-gray-200 overflow-y-auto shadow-lg">
+                        <div className="p-6">
+                            <div className="flex items-center justify-between mb-6">
+                                <h2 className="text-lg font-semibold text-gray-800">Filters</h2>
+                                <button
+                                    onClick={clearFilters}
+                                    className="px-3 py-1.5 text-sm text-white rounded transition-colors"
+                                    style={{ backgroundColor: '#db0011' }}
+                                    onMouseOver={(e) => e.target.style.backgroundColor = '#a00010'}
+                                    onMouseOut={(e) => e.target.style.backgroundColor = '#db0011'}
+                                >
+                                    Clear All
+                                </button>
+                            </div>
+
+                            <div className="space-y-4">
+                                {/* Monitoring Date */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Monitoring Date
+                                    </label>
+                                    <input
+                                        type="date"
+                                        value={filters.monitoring_date}
+                                        onChange={(e) => handleFilterChange('monitoring_date', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    />
+                                </div>
+
+                                {/* Regulation */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Regulation
+                                    </label>
+                                    <select
+                                        value={filters.regulation}
+                                        onChange={(e) => handleFilterChange('regulation', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {hierarchy.regulations.map((r) => (
+                                            <option key={r} value={r}>{r}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Asset Class */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Asset Class
+                                    </label>
+                                    <select
+                                        value={filters.asset_class}
+                                        onChange={(e) => handleFilterChange('asset_class', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredAssetClasses.map((ac) => (
+                                            <option key={ac} value={ac}>{ac}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Sub-Control Name */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Sub-Control Name
+                                    </label>
+                                    <select
+                                        value={filters.sub_control_name}
+                                        onChange={(e) => handleFilterChange('sub_control_name', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredSubControlNames.map((sc) => (
+                                            <option key={sc} value={sc}>{sc}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Control Name */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Control Name
+                                    </label>
+                                    <select
+                                        value={filters.control_name}
+                                        onChange={(e) => handleFilterChange('control_name', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredControlNames.map((cn) => (
+                                            <option key={cn} value={cn}>{cn}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Frequency */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Frequency
+                                    </label>
+                                    <select
+                                        value={filters.frequency}
+                                        onChange={(e) => handleFilterChange('frequency', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredFrequencies.map((freq) => (
+                                            <option key={freq} value={freq}>{freq}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Status */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Status
+                                    </label>
+                                    <select
+                                        value={filters.status}
+                                        onChange={(e) => handleFilterChange('status', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        <option value="received">Received</option>
+                                        <option value="not_received">Not Received</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Right Content Area */}
+                    <div className="flex-1 overflow-y-auto relative">
+                        <div className="p-6 relative z-10">
+
+                            {/* Loading State */}
+                            {loading && (
+                                <div className="flex items-center justify-center h-64">
+                                    <div className="text-gray-500 text-lg">Loading file monitoring data...</div>
+                                </div>
+                            )}
+
+                            {/* Error State */}
+                            {error && !loading && (
+                                <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-red-600 font-medium">Error: {error}</span>
+                                        <button
+                                            onClick={loadFileStatuses}
+                                            className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700"
+                                        >
+                                            Retry
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Statistics Cards */}
+                            {!error && !loading && (
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Total Files</div>
+                                        <div className="text-2xl font-bold text-gray-800 mt-1">{stats.total}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4 border-green-500">
+                                        <div className="text-sm text-gray-600 font-medium">Received</div>
+                                        <div className="text-2xl font-bold text-green-600 mt-1">{stats.received}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Not Received</div>
+                                        <div className="text-2xl font-bold mt-1" style={{ color: '#db0011' }}>{stats.notReceived}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: stats.receiptRate >= 80 ? '#10b981' : '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Receipt Rate</div>
+                                        <div className="text-2xl font-bold mt-1" style={{ color: stats.receiptRate >= 80 ? '#10b981' : '#db0011' }}>
+                                            {stats.receiptRate}%
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Chart Section */}
+                            {!error && !loading && chartData.length > 0 && (
+                                <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+                                    <div className="flex items-center justify-between mb-4">
+                                        <h2 className="text-lg font-semibold text-gray-800">
+                                            Status Distribution by {getCategoryLabel(chartCategory)}
+                                        </h2>
+                                        <select
+                                            value={chartCategory}
+                                            onChange={(e) => setChartCategory(e.target.value)}
+                                            className="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                        >
+                                            <option value="regulation">Regulation</option>
+                                            <option value="asset_class">Asset Class</option>
+                                            <option value="sub_control_name">Sub-Control Name</option>
+                                            <option value="control_name">Control Name</option>
+                                        </select>
+                                    </div>
+                                    <ResponsiveContainer width="100%" height={350}>
+                                        <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                            <XAxis
+                                                dataKey="name"
+                                                angle={-45}
+                                                textAnchor="end"
+                                                height={100}
+                                                tick={{ fontSize: 12 }}
+                                            />
+                                            <YAxis tick={{ fontSize: 12 }} />
+                                            <Tooltip
+                                                contentStyle={{
+                                                    backgroundColor: 'rgba(255,255,255,0.95)',
+                                                    border: '1px solid #e5e7eb',
+                                                    borderRadius: '6px'
+                                                }}
+                                            />
+                                            <Legend />
+                                            <Bar dataKey="Received" stackId="a" fill="#10b981" name="Received" />
+                                            <Bar dataKey="Not Received" stackId="a" fill="#ef4444" name="Not Received" />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            )}
+
+                            {/* Data Table */}
+                            {!error && !loading && (
+                                <div className="bg-white rounded-lg shadow-md overflow-hidden">
+                                    <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+                                        <h2 className="text-lg font-semibold text-gray-800">
+                                            File Status ({totalRecordCount} total, {filteredCount} filtered)
+                                        </h2>
+                                        <div className="flex items-center gap-3">
+                                            {/* Column Selector */}
+                                            <div className="relative">
+                                                <button
+                                                    onClick={() => setShowColumnSelector(!showColumnSelector)}
+                                                    className="px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors"
+                                                >
+                                                    Columns
+                                                </button>
+                                                {showColumnSelector && (
+                                                    <>
+                                                        <div className="fixed inset-0 z-40" onClick={() => setShowColumnSelector(false)}></div>
+                                                        <div className="absolute right-0 mt-2 w-56 bg-white border border-gray-300 rounded-lg shadow-lg z-50 p-4">
+                                                            <div className="text-sm font-semibold text-gray-700 mb-3">Select Columns</div>
+                                                            <div className="space-y-2">
+                                                                {Object.entries(visibleColumns).map(([key, value]) => (
+                                                                    <label key={key} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={value}
+                                                                            onChange={(e) => setVisibleColumns(prev => ({ ...prev, [key]: e.target.checked }))}
+                                                                            className="rounded border-gray-300"
+                                                                        />
+                                                                        <span className="text-sm text-gray-700">{columnLabels[key] || key}</span>
+                                                                    </label>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    </>
+                                                )}
+                                            </div>
+
+                                            {/* Refresh */}
+                                            <button
+                                                onClick={loadFileStatuses}
+                                                className="px-3 py-1.5 text-sm text-white rounded transition-colors"
+                                                style={{ backgroundColor: '#db0011' }}
+                                                onMouseOver={(e) => e.target.style.backgroundColor = '#a00010'}
+                                                onMouseOut={(e) => e.target.style.backgroundColor = '#db0011'}
+                                            >
+                                                Refresh
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <FileMonitoringGrid
+                                        ref={gridRef}
+                                        rowData={sidebarFilteredRows}
+                                        arrivalLabel={arrivalLabel}
+                                        visibleColumns={visibleColumns}
+                                        chartCategory={chartCategory}
+                                        onDisplaySummary={handleDisplaySummary}
+                                    />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+--------------------------------------
+import React, { useMemo, useCallback, useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { AgGridReact } from 'ag-grid-react';
+import { ModuleRegistry, AllCommunityModule } from 'ag-grid-community';
+import 'ag-grid-community/styles/ag-grid.css';
+import 'ag-grid-community/styles/ag-theme-alpine.css';
+
+ModuleRegistry.registerModules([AllCommunityModule]);
+
+const STATUS_STYLES = {
+    received: 'bg-green-100 text-green-800 border-green-300',
+    not_received: 'bg-red-100 text-red-800 border-red-300',
+};
+
+const STATUS_LABELS = {
+    received: 'Received',
+    not_received: 'Not Received',
+};
+
+const StatusCellRenderer = ({ value }) => {
+    const status = value || '';
+    const style = STATUS_STYLES[status] || 'bg-gray-100 text-gray-800 border-gray-300';
+    const label = STATUS_LABELS[status] || status || 'Unknown';
+    const icon = status === 'received' ? '\u2713' : status === 'not_received' ? '\u2717' : '\u25CB';
+
+    return (
+        <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border ${style}`}>
+            <span>{icon}</span>
+            {label}
+        </span>
+    );
+};
+
+const FileNameCellRenderer = ({ data }) => {
+    if (!data) return null;
+    return (
+        <div className="py-1 leading-tight">
+            <div className="truncate font-medium text-gray-900" title={data.display_name}>
+                {data.display_name}
+            </div>
+            <div className="truncate text-xs text-gray-400" title={data.file_name}>
+                {data.file_name}
+            </div>
+        </div>
+    );
+};
+
+const formatDateTime = (isoString) => {
+    if (!isoString) return '-';
+    try {
+        const d = new Date(isoString);
+        return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch {
+        return isoString;
+    }
+};
+
+const dashIfEmpty = (params) => {
+    const value = params.value;
+    return value === null || value === undefined || value === '' ? '-' : value;
+};
+
+const FileMonitoringGrid = forwardRef(({
+    rowData,
+    arrivalLabel,
+    visibleColumns,
+    chartCategory,
+    onDisplaySummary,
+}, ref) => {
+    const gridRef = useRef(null);
+
+    useImperativeHandle(ref, () => ({
+        clearFilters: () => {
+            gridRef.current?.api?.setFilterModel(null);
+        },
+    }));
+
+    const emitSummary = useCallback(() => {
+        const api = gridRef.current?.api;
+        if (!api || !onDisplaySummary) return;
+
+        let received = 0;
+        let notReceived = 0;
+        let total = 0;
+        const groups = {};
+
+        api.forEachNodeAfterFilter((node) => {
+            const file = node.data;
+            if (!file) return;
+
+            total += 1;
+            if (file.status === 'received') received += 1;
+            else if (file.status === 'not_received') notReceived += 1;
+
+            const key = file[chartCategory] || 'Unknown';
+            if (!groups[key]) {
+                groups[key] = { Received: 0, 'Not Received': 0 };
+            }
+            if (file.status === 'received') groups[key].Received += 1;
+            else groups[key]['Not Received'] += 1;
+        });
+
+        const receiptRate = total > 0 ? Number(((received / total) * 100).toFixed(1)) : 0;
+        const chartData = Object.entries(groups)
+            .map(([name, counts]) => ({
+                name,
+                Received: counts.Received,
+                'Not Received': counts['Not Received'],
+                total: counts.Received + counts['Not Received'],
+            }))
+            .sort((a, b) => b.total - a.total);
+
+        onDisplaySummary({
+            filteredCount: total,
+            stats: { total, received, notReceived, receiptRate },
+            chartData,
+        });
+    }, [chartCategory, onDisplaySummary]);
+
+    useEffect(() => {
+        emitSummary();
+    }, [rowData, chartCategory, emitSummary]);
+
+    const columnDefs = useMemo(() => [
+        {
+            field: 'display_name',
+            headerName: 'File Name',
+            hide: !visibleColumns.display_name,
+            flex: 2,
+            minWidth: 220,
+            cellRenderer: FileNameCellRenderer,
+            headerClass: 'file-monitoring-header',
+            filter: 'agTextColumnFilter',
+            filterValueGetter: (params) =>
+                `${params.data?.display_name || ''} ${params.data?.file_name || ''}`,
+            filterParams: {
+                filterOptions: ['contains'],
+                defaultOption: 'contains',
+                debounceMs: 300,
+            },
+        },
+        {
+            field: 'status',
+            headerName: 'Status',
+            hide: !visibleColumns.status,
+            width: 150,
+            cellRenderer: StatusCellRenderer,
+            headerClass: 'file-monitoring-header',
+            filter: 'agSetColumnFilter',
+            filterParams: {
+                values: ['received', 'not_received'],
+                valueFormatter: (params) => STATUS_LABELS[params.value] || params.value,
+            },
+        },
+        {
+            field: 'arrival_time',
+            headerName: arrivalLabel,
+            hide: !visibleColumns.arrival_time,
+            width: 130,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: (params) => formatDateTime(params.value),
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'regulation',
+            headerName: 'Regulation',
+            hide: !visibleColumns.regulation,
+            width: 140,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'asset_class',
+            headerName: 'Asset Class',
+            hide: !visibleColumns.asset_class,
+            width: 130,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'sub_control_name',
+            headerName: 'Sub-Control',
+            hide: !visibleColumns.sub_control_name,
+            width: 180,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'control_name',
+            headerName: 'Control Name',
+            hide: !visibleColumns.control_name,
+            width: 220,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'frequency',
+            headerName: 'Frequency',
+            hide: !visibleColumns.frequency,
+            width: 110,
+            headerClass: 'file-monitoring-header',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-700',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+        {
+            field: 'note',
+            headerName: 'Note',
+            hide: !visibleColumns.note,
+            flex: 1,
+            minWidth: 160,
+            headerClass: 'file-monitoring-header',
+            tooltipField: 'note',
+            valueFormatter: dashIfEmpty,
+            cellClass: 'text-gray-500',
+            filter: 'agTextColumnFilter',
+            filterParams: { debounceMs: 300 },
+        },
+    ], [arrivalLabel, visibleColumns]);
+
+    const defaultColDef = useMemo(() => ({
+        resizable: true,
+        sortable: true,
+        filter: true,
+        floatingFilter: true,
+        suppressHeaderMenuButton: true,
+        headerClass: 'file-monitoring-header',
+    }), []);
+
+    const onGridReady = useCallback(() => {
+        emitSummary();
+    }, [emitSummary]);
+
+    const onFilterChanged = useCallback(() => {
+        emitSummary();
+    }, [emitSummary]);
+
+    return (
+        <div
+            className="ag-theme-alpine file-monitoring-grid-theme"
+            style={{ height: 'calc(100vh - 420px)', width: '100%' }}
+        >
+            <AgGridReact
+                ref={gridRef}
+                rowData={rowData}
+                columnDefs={columnDefs}
+                defaultColDef={defaultColDef}
+                theme="legacy"
+                rowHeight={52}
+                headerHeight={42}
+                floatingFiltersHeight={40}
+                animateRows
+                pagination
+                paginationPageSize={50}
+                paginationPageSizeSelector={[25, 50, 100]}
+                suppressCellFocus
+                getRowId={(params) => params.data.file_id}
+                overlayNoRowsTemplate='<span class="ag-overlay-no-rows-center">No file status records found for the selected filters.</span>'
+                onGridReady={onGridReady}
+                onFilterChanged={onFilterChanged}
+                onRowDataUpdated={emitSummary}
+            />
+        </div>
+    );
+});
+
+FileMonitoringGrid.displayName = 'FileMonitoringGrid';
+
+export default FileMonitoringGrid;
+
+
+
