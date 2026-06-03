@@ -381,3 +381,633 @@ async def _exec_rewrite_excel_config_row(step: dict, confirmed_params: dict, pri
           4. Show the generated test cases and before/after validator results
           5. State whether the Excel workbook was modified, including file path, sheet, row number, and changed columns when applicable
           6. Flag any issues found in the original or edge cases to watch
+
+"""
+Combo chart builder — any number of bar + line series.
+
+Single true combo chart: bar series on left axis, line series on right axis.
+Uses pptx.oxml.OxmlElement throughout — no raw XML strings.
+
+Usage
+-----
+from similar_graph import add_combo_chart
+
+add_combo_chart(
+    categories=["D1", "D2", "D3", "D4", "D5"],
+    bar_series=[
+        {"label": "A", "values": [20, 40, 9, 12, 30]},
+        {"label": "B", "values": [10, 20, 30, 20, 10]},
+    ],
+    line_series=[
+        {"label": "X (Right)", "values": [1, 3, 8, 3, 6]},
+        {"label": "Y (Right)", "values": [1, 2, 3, 6, 3]},
+    ],
+    bar_axis={"min": 0, "max": 45, "unit": 5},
+    line_axis={"min": 0, "max": 9,  "unit": 1},
+)
+
+# Slot into an existing shape / placeholder:
+#   shape = slide.shapes["MyBox"]     # by name
+#   shape = slide.placeholders[1]     # by index
+#   add_combo_chart(..., left=shape.left, top=shape.top,
+#                        width=shape.width, height=shape.height)
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import TypedDict
+
+from lxml import etree
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
+from pptx.oxml.ns import qn
+from pptx.util import Inches, Pt
+
+# ── Default colour palettes ───────────────────────────────────────────────────
+
+# HSBC brand palette — HSBC Red is the hero colour, supported by neutral
+# greys / charcoal and a few approved accent tints.
+_HSBC_RED        = RGBColor(0xDB, 0x00, 0x11)   # HSBC Red (primary)
+_HSBC_DARK_GREY  = RGBColor(0x53, 0x59, 0x5A)   # charcoal grey
+_HSBC_MID_GREY   = RGBColor(0x8C, 0x8C, 0x8C)   # mid grey
+_HSBC_LIGHT_GREY = RGBColor(0xBF, 0xBF, 0xBF)   # light grey
+_HSBC_DARK_RED   = RGBColor(0xA8, 0x00, 0x0D)   # deep red accent
+_HSBC_BLACK      = RGBColor(0x1C, 0x1C, 0x1C)   # near-black
+
+_BAR_COLORS: list[RGBColor] = [
+    _HSBC_RED,
+    _HSBC_DARK_GREY,
+    _HSBC_MID_GREY,
+    _HSBC_DARK_RED,
+    _HSBC_LIGHT_GREY,
+    _HSBC_BLACK,
+]
+
+_LINE_COLORS: list[RGBColor] = [
+    _HSBC_BLACK,
+    _HSBC_RED,
+    _HSBC_DARK_GREY,
+    _HSBC_MID_GREY,
+    _HSBC_DARK_RED,
+    _HSBC_LIGHT_GREY,
+]
+
+
+# ── Type hints ────────────────────────────────────────────────────────────────
+
+class SeriesSpec(TypedDict, total=False):
+    label: str
+    values: list[float]
+    color: RGBColor          # optional — falls back to palette
+
+
+class AxisSpec(TypedDict, total=False):
+    min: float
+    max: float
+    unit: float
+
+
+# ── OxmlElement helpers ───────────────────────────────────────────────────────
+
+def _el(tag: str, **attribs) -> etree._Element:
+    """Create a namespaced lxml element with optional attributes."""
+    e = etree.Element(qn(tag))
+    for k, v in attribs.items():
+        e.set(k, str(v))
+    return e
+
+
+def _child(parent, tag: str, **attribs) -> etree._Element:
+    """Create a namespaced lxml element, append to parent, return it."""
+    e = _el(tag, **attribs)
+    parent.append(e)
+    return e
+
+
+def _rgb_hex(color: RGBColor) -> str:
+    return "%02X%02X%02X" % (color[0], color[1], color[2])
+
+
+# ── Axis-ID reader ────────────────────────────────────────────────────────────
+
+def _read_ax_ids(chart) -> tuple[int, int]:
+    """Return (cat_ax_id, primary_val_ax_id) from a freshly created chart."""
+    pa     = chart._element.find(qn("c:chart")).find(qn("c:plotArea"))
+    cat_id = int(pa.find(qn("c:catAx")).find(qn("c:axId")).get("val"))
+    val_id = int(pa.find(qn("c:valAx")).find(qn("c:axId")).get("val"))
+    return cat_id, val_id
+
+
+# ── Line series builder ───────────────────────────────────────────────────────
+
+def _make_line_series(
+    ser_idx: int,
+    spec: SeriesSpec,
+    categories: list[str],
+    color: RGBColor,
+) -> etree._Element:
+    """
+    Build a complete c:ser element for a line chart series.
+    All child elements created via _el/_child — no raw XML strings.
+    """
+    ser = _el("c:ser")
+    _child(ser, "c:idx",   val=ser_idx)
+    _child(ser, "c:order", val=ser_idx)
+
+    # series name
+    tx     = _child(ser, "c:tx")
+    strRef = _child(tx,     "c:strRef")
+    _child(strRef, "c:f")                       # empty formula reference
+    cache  = _child(strRef, "c:strCache")
+    _child(cache, "c:ptCount", val=1)
+    pt = _child(cache, "c:pt", idx=0)
+    _child(pt, "c:v").text = spec["label"]
+
+    # line colour and width
+    spPr = _child(ser, "c:spPr")
+    ln   = _child(spPr, "a:ln", w=str(int(Pt(2.25))))
+    sf   = _child(ln,   "a:solidFill")
+    _child(sf, "a:srgbClr", val=_rgb_hex(color))
+
+    # no markers
+    marker = _child(ser, "c:marker")
+    _child(marker, "c:symbol", val="none")
+
+    # categories
+    cat      = _child(ser, "c:cat")
+    strRef_c = _child(cat, "c:strRef")
+    _child(strRef_c, "c:f")
+    cache_c  = _child(strRef_c, "c:strCache")
+    _child(cache_c, "c:ptCount", val=len(categories))
+    for j, name in enumerate(categories):
+        p = _child(cache_c, "c:pt", idx=j)
+        _child(p, "c:v").text = str(name)
+
+    # values
+    val_el  = _child(ser, "c:val")
+    numRef  = _child(val_el, "c:numRef")
+    _child(numRef, "c:f")
+    cache_n = _child(numRef, "c:numCache")
+    _child(cache_n, "c:formatCode").text = "General"
+    _child(cache_n, "c:ptCount", val=len(spec["values"]))
+    for j, v in enumerate(spec["values"]):
+        p = _child(cache_n, "c:pt", idx=j)
+        _child(p, "c:v").text = str(v)
+
+    return ser
+
+
+# ── Line chart block ──────────────────────────────────────────────────────────
+
+def _append_line_chart(
+    plot_area,
+    categories: list[str],
+    line_specs: list[SeriesSpec],
+    colors: list[RGBColor],
+    cat_ax_id: int,
+    sec_ax_id: int,
+    bar_count: int,
+) -> None:
+    """Append a c:lineChart block to an existing plotArea."""
+    lc = _el("c:lineChart")
+    _child(lc, "c:grouping",  val="standard")
+    _child(lc, "c:varyColors", val="0")
+
+    for i, (spec, color) in enumerate(zip(line_specs, colors)):
+        lc.append(_make_line_series(bar_count + i, spec, categories, color))
+
+    # reference the shared category axis and the new secondary value axis
+    _child(lc, "c:axId", val=cat_ax_id)
+    _child(lc, "c:axId", val=sec_ax_id)
+
+    plot_area.append(lc)
+
+
+# ── Secondary value axis ──────────────────────────────────────────────────────
+
+def _add_secondary_val_axis(
+    plot_area,
+    sec_ax_id: int,
+    cat_ax_id: int,
+    axis_spec: AxisSpec,
+) -> None:
+    """
+    Append a secondary (right-side) c:valAx to the plotArea.
+    Children written in schema-correct order:
+      axId → scaling → delete → axPos → numFmt → tickLblPos
+      → crossAx → crosses → crossBetween → majorUnit?
+    """
+    vax = _el("c:valAx")
+    _child(vax, "c:axId", val=sec_ax_id)
+
+    scaling = _child(vax, "c:scaling")
+    _child(scaling, "c:orientation", val="minMax")
+    if "max" in axis_spec:
+        _child(scaling, "c:max", val=axis_spec["max"])
+    if "min" in axis_spec:
+        _child(scaling, "c:min", val=axis_spec["min"])
+
+    _child(vax, "c:delete",     val="0")
+    _child(vax, "c:axPos",      val="r")
+    _child(vax, "c:numFmt",     formatCode="General", sourceLinked="1")
+    _child(vax, "c:tickLblPos", val="nextTo")
+    _child(vax, "c:crossAx",    val=cat_ax_id)
+    _child(vax, "c:crosses",    val="max")          # axis line on right edge
+    _child(vax, "c:crossBetween", val="between")
+
+    if "unit" in axis_spec:
+        _child(vax, "c:majorUnit", val=axis_spec["unit"])
+
+    plot_area.append(vax)
+
+
+# ── Data table (optional, shown under the plot area) ──────────────────────────
+
+def _add_data_table(plot_area, font_pt: float | None = None) -> None:
+    """
+    Append a c:dTable to the plotArea so the underlying values are printed
+    as a grid beneath the chart (like the STP%/Industry%/Rejection rows in
+    the reference slides). Must be appended after all axis elements.
+    """
+    dt = _el("c:dTable")
+    _child(dt, "c:showHorzBorder", val="1")
+    _child(dt, "c:showVertBorder", val="1")
+    _child(dt, "c:showOutline",    val="1")
+    _child(dt, "c:showKeys",       val="1")
+
+    if font_pt is not None:
+        txPr = _child(dt, "c:txPr")
+        _child(txPr, "a:bodyPr")
+        _child(txPr, "a:lstStyle")
+        p   = _child(txPr, "a:p")
+        pPr = _child(p,    "a:pPr")
+        _child(pPr, "a:defRPr").set("sz", str(int(font_pt * 100)))
+        _child(p, "a:endParaRPr")
+
+    plot_area.append(dt)
+
+
+# ── Constant line-series centering ─────────────────────────────────────────────
+
+def _center_line_axis(line_series: list[SeriesSpec]) -> AxisSpec:
+    """
+    When every line value is identical (e.g. FTE = 59 across all months),
+    return a symmetric {min, max} so the flat line sits in the vertical
+    middle of the plot. Returns {} when values vary (no centering).
+    """
+    all_vals = [v for s in line_series for v in s["values"]]
+    if not all_vals:
+        return {}
+    lo, hi = min(all_vals), max(all_vals)
+    if lo != hi:
+        return {}                       # values vary — leave axis to autoscale
+    v = lo
+    span = abs(v) if v != 0 else 1      # half-range on each side of the value
+    return {"min": v - span, "max": v + span}
+
+
+# ── Bar data-label position ───────────────────────────────────────────────────
+
+def _set_label_inside_end(series) -> None:
+    """
+    Set data label position to inside-end using OxmlElement.
+    Called after series.data_labels.show_value = True so the dLbls
+    element already exists; we insert c:dLblPos before c:showLegendKey.
+    """
+    dLbls    = series.data_labels._element
+    show_key = dLbls.find(qn("c:showLegendKey"))
+    pos      = _el("c:dLblPos", val="inEnd")
+    if show_key is not None:
+        show_key.addprevious(pos)
+    else:
+        dLbls.append(pos)
+
+
+# ── Legend font helper ────────────────────────────────────────────────────────
+
+def _set_legend_font_size(legend, size_pt: float) -> None:
+    """Inject c:txPr into the legend element to set font size."""
+    leg_el  = legend._element
+    txPr    = leg_el.find(qn("c:txPr"))
+    if txPr is None:
+        txPr = _child(leg_el, "c:txPr")
+    else:
+        txPr.clear()
+
+    _child(txPr, "a:bodyPr")
+    _child(txPr, "a:lstStyle")
+    p     = _child(txPr, "a:p")
+    pPr   = _child(p,    "a:pPr")
+    defRPr = _child(pPr, "a:defRPr")
+    defRPr.set("sz", str(int(size_pt * 100)))   # hundredths of a point
+
+
+# ── PDF conversion ───────────────────────────────────────────────────────────
+
+def convert_to_pdf(pptx_path: str | Path) -> Path:
+    """
+    Convert a .pptx file to PDF using the installed PowerPoint application.
+    Requires Microsoft Office on Windows.
+
+    Returns the path of the generated .pdf file.
+    """
+    pptx_path = Path(pptx_path).resolve()
+    pdf_path  = pptx_path.with_suffix(".pdf")
+
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ppt  = New-Object -ComObject PowerPoint.Application
+$ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoTrue
+$deck = $ppt.Presentations.Open('{pptx_path}', $false, $false, $false)
+$deck.SaveAs('{pdf_path}', 32)
+$deck.Close()
+$ppt.Quit()
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) | Out-Null
+"""
+    result = subprocess.run(
+        ["powershell", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PDF conversion failed:\n{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return pdf_path
+
+
+# ── Core chart builder (shared by both public functions) ─────────────────────
+
+def _build_chart_on_slide(
+    slide,
+    left: int, top: int, width: int, height: int,
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+    data_table: bool = False,
+    data_table_font_pt: float | None = None,
+) -> None:
+    """Add a combo chart to an existing slide at the given EMU position/size."""
+    bar_axis  = bar_axis  or {}
+    # Auto-center a flat (constant) line series unless the caller fixed the axis.
+    if line_series and not line_axis:
+        line_axis = _center_line_axis(line_series)
+    line_axis = line_axis or {}
+
+    # ── Step 1: Bar chart via python-pptx API ─────────────────────────────────
+    bar_data = CategoryChartData()
+    bar_data.categories = categories
+    if bar_series:
+        for s in bar_series:
+            bar_data.add_series(s["label"], s["values"])
+    else:
+        bar_data.add_series("_", [0] * len(categories))
+
+    chart_shape = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, bar_data
+    )
+    chart = chart_shape.chart
+
+    chart.has_title  = False
+    chart.has_legend = True
+    chart.legend.position          = XL_LEGEND_POSITION.BOTTOM
+    chart.legend.include_in_layout = False
+
+    chart.value_axis.minimum_scale = bar_axis.get("min", 0)
+    if "max"  in bar_axis: chart.value_axis.maximum_scale = bar_axis["max"]
+    if "unit" in bar_axis: chart.value_axis.major_unit    = bar_axis["unit"]
+    chart.value_axis.has_major_gridlines    = True
+    chart.value_axis.tick_label_position    = XL_TICK_LABEL_POSITION.LOW
+    chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+    chart.plots[0].gap_width = 150
+
+    if bar_series:
+        for i, s in enumerate(bar_series):
+            color = s.get("color") or _BAR_COLORS[i % len(_BAR_COLORS)]
+            ser   = chart.series[i]
+            ser.format.fill.solid()
+            ser.format.fill.fore_color.rgb = color
+            ser.format.line.width = 0
+            ser.data_labels.show_value = True
+            _set_label_inside_end(ser)
+
+    # ── Step 2: Line chart + secondary axis ───────────────────────────────────
+    if line_series:
+        cat_ax_id, pri_val_id = _read_ax_ids(chart)
+        sec_ax_id = pri_val_id + 1
+
+        plot_area = (
+            chart._element
+            .find(qn("c:chart"))
+            .find(qn("c:plotArea"))
+        )
+        line_colors = [
+            s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
+            for i, s in enumerate(line_series)
+        ]
+        _append_line_chart(
+            plot_area, categories, line_series, line_colors,
+            cat_ax_id, sec_ax_id,
+            bar_count=len(bar_series),
+        )
+        _add_secondary_val_axis(plot_area, sec_ax_id, cat_ax_id, line_axis)
+
+    # ── Step 3: Font sizes ────────────────────────────────────────────────────
+    if data_label_font_pt is not None and bar_series:
+        for ser in chart.series:
+            ser.data_labels.font.size = Pt(data_label_font_pt)
+
+    if axis_font_pt is not None:
+        chart.value_axis.tick_labels.font.size    = Pt(axis_font_pt)
+        chart.category_axis.tick_labels.font.size = Pt(axis_font_pt)
+
+    if legend_font_pt is not None:
+        _set_legend_font_size(chart.legend, legend_font_pt)
+
+    # ── Step 4: Optional data table beneath the plot ──────────────────────────
+    if data_table:
+        plot_area = (
+            chart._element
+            .find(qn("c:chart"))
+            .find(qn("c:plotArea"))
+        )
+        _add_data_table(plot_area, data_table_font_pt)
+
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def add_combo_chart(
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    output_path: str | Path = "similar_graph.pptx",
+    *,
+    left: int | None = None,
+    top: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+    data_table: bool = False,
+    data_table_font_pt: float | None = None,
+    convert_pdf: bool = False,
+) -> Path:
+    """
+    Build a true combo chart (single chart object, secondary right axis)
+    and save to a new .pptx file.
+
+    Parameters
+    ----------
+    categories        : x-axis labels
+    bar_series        : [{label, values, color?}]  clustered columns, left axis
+    line_series       : [{label, values, color?}]  lines, right axis
+    bar_axis          : {min?, max?, unit?} left Y axis
+    line_axis         : {min?, max?, unit?} right Y axis
+    output_path       : destination .pptx path
+    left/top/width/height : position in EMUs — pass shape.left/top/width/height
+                            to slot the chart into an existing shape/placeholder
+    data_label_font_pt : font size in points for bar value labels  (e.g. 7)
+    axis_font_pt       : font size in points for both axis tick labels (e.g. 8)
+    legend_font_pt     : font size in points for the legend text (e.g. 8)
+    data_table         : if True, print the series values as a grid beneath
+                         the chart (optional — off by default)
+    data_table_font_pt : font size in points for the data table text
+    convert_pdf        : if True, also export a .pdf next to the .pptx
+                         (requires Microsoft Office on Windows)
+    """
+    if not bar_series and not line_series:
+        raise ValueError("Provide at least one bar or line series.")
+
+    _left   = left   if left   is not None else Inches(0.55)
+    _top    = top    if top    is not None else Inches(0.35)
+    _width  = width  if width  is not None else Inches(8.65)
+    _height = height if height is not None else Inches(5.65)
+
+    prs   = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    _build_chart_on_slide(
+        slide, _left, _top, _width, _height,
+        categories, bar_series, line_series,
+        bar_axis, line_axis,
+        data_label_font_pt, axis_font_pt, legend_font_pt,
+        data_table, data_table_font_pt,
+    )
+
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(output_path)
+
+    if convert_pdf:
+        pdf_path = convert_to_pdf(output_path)
+        print(f"PDF:  {pdf_path}")
+
+    return output_path
+
+
+def insert_chart_into_shape(
+    pptx_path: str | Path,
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    shape_index: int = 0,
+    output_path: str | Path | None = None,
+    *,
+    remove_shape: bool = True,
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+    data_table: bool = False,
+    data_table_font_pt: float | None = None,
+    slide_index: int = 0,
+    convert_pdf: bool = False,
+) -> Path:
+    """
+    Open an existing .pptx, find a shape by index, and place the combo chart
+    exactly inside it.
+
+    Parameters
+    ----------
+    pptx_path    : path to the existing .pptx file
+    categories / bar_series / line_series / bar_axis / line_axis : same as add_combo_chart
+    shape_index  : 0-based index of the shape whose bounds to use (default 0)
+    output_path  : where to save the result; defaults to pptx_path with '_chart' suffix
+    remove_shape : if True (default), delete the placeholder shape after inserting chart
+    slide_index  : which slide to insert on (default 0)
+    data_label_font_pt / axis_font_pt / legend_font_pt / convert_pdf : same as add_combo_chart
+    """
+    pptx_path = Path(pptx_path).resolve()
+    prs       = Presentation(pptx_path)
+    slide     = prs.slides[slide_index]
+
+    target = slide.shapes[shape_index]
+    left, top, width, height = target.left, target.top, target.width, target.height
+    print(f"Using shape {shape_index!r} ({target.name!r}): "
+          f"{width/914400:.3f}in × {height/914400:.3f}in "
+          f"at ({left/914400:.3f}in, {top/914400:.3f}in)")
+
+    if remove_shape:
+        sp = target._element
+        sp.getparent().remove(sp)
+
+    _build_chart_on_slide(
+        slide, left, top, width, height,
+        categories, bar_series, line_series,
+        bar_axis, line_axis,
+        data_label_font_pt, axis_font_pt, legend_font_pt,
+        data_table, data_table_font_pt,
+    )
+
+    if output_path is None:
+        output_path = pptx_path.with_stem(pptx_path.stem + "_chart")
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(output_path)
+
+    if convert_pdf:
+        pdf_path = convert_to_pdf(output_path)
+        print(f"PDF:  {pdf_path}")
+
+    return output_path
+
+
+# ── Demo ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Insert chart into the box inside presentation1.pptx
+    out = insert_chart_into_shape(
+        pptx_path="D:/office/config-assistant/presentation1.pptx",
+        categories=["Feb-2026", "Mar-2026", "Apr-2026"],
+        bar_series=[
+            {"label": "Submission Volume", "values": [95887065, 109476068, 103392573]},
+            {"label": "Break Volume",      "values": [7073302,  8697047,   13339621]},
+        ],
+        line_series=[
+            # Flat line (same value every month) — auto-centered vertically
+            {"label": "FTE", "values": [59, 59, 59]},
+        ],
+        bar_axis={"min": 0, "max": 120000000, "unit": 20000000},
+        # line_axis omitted on purpose → flat FTE line sits in the middle
+        shape_index=0,
+        data_label_font_pt=6,
+        axis_font_pt=6,
+        legend_font_pt=10,
+        data_table=True,        # ← optional value grid beneath the chart
+        data_table_font_pt=7,
+        convert_pdf=True,
+    )
+    print(f"Saved: {out}")
+
