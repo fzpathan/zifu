@@ -32,6 +32,7 @@ Respond with valid JSON only — no markdown, no text outside the JSON:
   "new_field_name": "snake_case_output_name",
   "input_fields": "col1" or "col1,col2",
   "operation_params": { ... },
+  "dataset_name": "SRC" or "SRC,TGT" or null,
   "sample_data": [ { "col1": "val1" }, ... ],
   "explanation": "one-line plain-English description of what this formula does"
 }
@@ -40,6 +41,7 @@ Rules:
 - sample_data must have at least 3 rows containing ALL input field(s) with realistic values
 - new_field_name must be snake_case
 - operation_params must only include keys valid for the chosen operation_type
+- dataset_name is optional; use comma-separated values when the formula applies to multiple datasets (e.g. SRC,TGT)
 - If user supplies sample_data, use those rows exactly; otherwise generate realistic test rows"""
 
 _ROW_BUILDER_SYSTEM_PROMPT = """You are a ControlDash FieldOperations sheet expert.
