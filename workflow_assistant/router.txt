@@ -14,6 +14,7 @@ from .core import (
     execute_workflow_steps,
     extract_params,
     find_missing_params,
+    normalize_extracted_params,
 )
 from .utils import accumulate_usage, get_openai_client, load_workflows, sse
 
@@ -120,11 +121,12 @@ async def stream_workflow_chat(request: WorkflowChatRequest):
         params_config = workflow.get("params", [])
         extracted, extract_usage = await extract_params(client, request.model, request.message, params_config)
         accumulate_usage(usage_acc, extract_usage)
+        extracted = normalize_extracted_params(workflow, extracted, request.message)
 
         yield sse({"event": "params_extracted", "extracted_params": extracted})
 
         # Phase 3 — check for missing required params
-        missing = find_missing_params(params_config, extracted)
+        missing = find_missing_params(workflow, extracted)
 
         if missing:
             yield sse({
