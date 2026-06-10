@@ -1,0 +1,384 @@
+"""
+Executors for the input_files workflow:
+  llm_build_input_files, search_data_file, profile_data_file, write_input_files_rows
+"""
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from ..registry import executor
+from ..utils import accumulate_usage, extract_json, find_column, secure_path
+
+logger = logging.getLogger(__name__)
+
+_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "input_files_schema.yaml"
+_DATASET_SPLIT_RE = re.compile(r"[,;|]")
+
+
+def _load_input_files_schema() -> dict:
+    import yaml
+    with open(_SCHEMA_PATH, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def _parse_dataset_names(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+    return [part.strip() for part in _DATASET_SPLIT_RE.split(text) if part.strip()]
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_schema_prompt(schema: dict, sheet_columns: Optional[List[str]] = None) -> str:
+    lines = [f"Target sheet: {schema.get('sheet_name', 'InputFiles')}"]
+    notes = (schema.get("llm_system_prompt_notes") or "").strip()
+    if notes:
+        lines.append(f"Domain notes:\n{notes}")
+    lines.append("Column schema:")
+    for col in schema.get("columns", []):
+        req = "required" if col.get("required") else "optional"
+        opts = f", options={col['options']}" if col.get("options") else ""
+        lines.append(
+            f"  - {col['column']} (param key: {col['key']}, {req}, {col.get('type', 'text')}{opts}): "
+            f"{col.get('description', '')}"
+        )
+    if sheet_columns:
+        lines.append(f"Actual columns in the config workbook InputFiles sheet: {sheet_columns}")
+    return "\n".join(lines)
+
+
+def _row_from_params(confirmed_params: dict, dataset_name: Optional[str] = None) -> dict:
+    schema = _load_input_files_schema()
+    key_to_column = {c["key"]: c["column"] for c in schema.get("columns", [])}
+    mapping = {
+        "dataset_name": dataset_name or confirmed_params.get("dataset_name"),
+        "file_name": confirmed_params.get("file_name"),
+        "file_directory": confirmed_params.get("file_directory"),
+        "file_type": confirmed_params.get("file_type"),
+        "file_date_format": confirmed_params.get("file_date_format"),
+        "file_date_selection": confirmed_params.get("file_date_selection"),
+        "skip_top_row": confirmed_params.get("skip_top_row"),
+        "skip_bottom_row": confirmed_params.get("skip_bottom_row"),
+    }
+    row = {}
+    for key, value in mapping.items():
+        column = key_to_column.get(key)
+        if column and value is not None and str(value).strip() != "":
+            row[column] = value
+    return row
+
+
+def _expand_rows_by_dataset(confirmed_params: dict, base_rows: List[dict]) -> List[dict]:
+    dataset_names = _parse_dataset_names(confirmed_params.get("dataset_name"))
+    if not dataset_names:
+        return base_rows if base_rows else [_row_from_params(confirmed_params)]
+
+    schema = _load_input_files_schema()
+    dataset_col = next(
+        (c["column"] for c in schema.get("columns", []) if c["key"] == "dataset_name"),
+        "DatasetName",
+    )
+
+    if len(base_rows) == 1 and len(dataset_names) > 1:
+        template = dict(base_rows[0])
+        return [{**template, dataset_col: name} for name in dataset_names]
+
+    if not base_rows:
+        return [_row_from_params(confirmed_params, name) for name in dataset_names]
+
+    return base_rows
+
+
+_INPUT_FILES_BUILDER_PROMPT_TEMPLATE = """You are a ControlDash InputFiles configuration expert.
+
+{schema_prompt}
+
+Your tasks:
+1. Validate and normalise the user's InputFiles parameters against the schema above.
+2. Generate a Python-regex pattern (file_regex) that locates files in file_directory matching file_name and file_date_format.
+   - Translate date tokens like YYYYMMDD, yyyyMMdd, DD-MM-YYYY into the correct regex digit patterns.
+   - Anchor the pattern appropriately (^ ... $) and escape literal dots.
+3. Produce one InputFiles row per dataset when multiple dataset names are supplied.
+4. Map param keys to the schema column names exactly.
+
+Respond with valid JSON only — no markdown, no text outside the JSON:
+{{
+  "file_regex": "<regex pattern string>",
+  "rows": [
+    {{
+      "<ColumnName>": "<value>",
+      ...
+    }}
+  ],
+  "explanation": "one-line summary of the regex and row config"
+}}
+
+Rules:
+- Every row must include DatasetName, FileName, FileDirectory, FileType, FileDateFormat, FileDateSelection.
+- Include SkipTopRow and SkipBottomRow only when provided (omit or null otherwise).
+- Include FileRegex on each row using the same generated pattern.
+- file_regex at the top level must match the per-row FileRegex value."""
+
+
+def _extract_message_content(content) -> str:
+    from ...ai_assistant import extract_message_content
+    return extract_message_content(content)
+
+
+@executor("llm_build_input_files")
+async def _exec_llm_build_input_files(step, confirmed_params, prior_results, **ctx):
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    schema = _load_input_files_schema()
+
+    structure = prior_results.get("read_sheet_structure", {}).get("value", {})
+    sheet_columns = structure.get("columns") if isinstance(structure, dict) else None
+    schema_prompt = _build_schema_prompt(schema, sheet_columns)
+
+    user_lines = [
+        "Build InputFiles config row(s) and file_regex from these parameters:",
+        json.dumps(
+            {
+                k: confirmed_params.get(k)
+                for k in (
+                    "config_path", "dataset_name", "file_name", "file_directory",
+                    "file_type", "file_date_format", "file_date_selection",
+                    "skip_top_row", "skip_bottom_row", "input_files_description",
+                )
+                if confirmed_params.get(k) is not None
+            },
+            default=str,
+        ),
+    ]
+    description = (confirmed_params.get("input_files_description") or "").strip()
+    if description:
+        user_lines.append(f"Additional context: {description}")
+
+    system_prompt = _INPUT_FILES_BUILDER_PROMPT_TEMPLATE.format(schema_prompt=schema_prompt)
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "\n".join(user_lines)},
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        parsed = json.loads(extract_json(raw))
+        rows = parsed.get("rows") or []
+        if not isinstance(rows, list):
+            rows = [rows]
+        rows = _expand_rows_by_dataset(confirmed_params, rows)
+        parsed["rows"] = rows
+        if not parsed.get("file_regex") and rows:
+            regex_col = find_column(list(rows[0].keys()), ["FileRegex", "file_regex", "File Regex"])
+            if regex_col:
+                parsed["file_regex"] = rows[0].get(regex_col)
+        return "success", parsed
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for InputFiles config: {exc}"
+    except Exception as exc:
+        logger.error("LLM build input files error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("search_data_file")
+async def _exec_search_data_file(step, confirmed_params, prior_results, **ctx):
+    """
+    Locate data files under file_directory using the generated regex.
+
+    TODO: Replace interim glob+re implementation with the dedicated inbuilt
+    search_data_file() function when it is available.
+    """
+    build = prior_results.get("build_input_files_config", {})
+    build_value = build.get("value", {}) if build.get("status") == "success" else {}
+    file_regex = (build_value.get("file_regex") or "").strip()
+    file_directory = (confirmed_params.get("file_directory") or "").strip()
+
+    if not file_directory:
+        return "error", "file_directory is required to search for data files"
+    if not file_regex:
+        return "error", "file_regex was not generated — run build_input_files_config first"
+
+    try:
+        directory = secure_path(file_directory)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    if not directory.exists() or not directory.is_dir():
+        return "error", f"Directory not found: {file_directory}"
+
+    try:
+        pattern = re.compile(file_regex)
+    except re.error as exc:
+        return "error", f"Invalid file_regex '{file_regex}': {exc}"
+
+    matches = []
+    for candidate in sorted(directory.iterdir()):
+        if not candidate.is_file():
+            continue
+        if pattern.search(candidate.name):
+            matches.append({
+                "file_name": candidate.name,
+                "file_path": str(candidate.resolve()),
+                "size_bytes": candidate.stat().st_size,
+            })
+
+    result = {
+        "search_method": "interim_glob_regex",
+        "todo": "Replace with inbuilt search_data_file() when implemented",
+        "file_directory": str(directory),
+        "file_regex": file_regex,
+        "match_count": len(matches),
+        "matches": matches[:50],
+        "selected_file": matches[-1] if matches else None,
+    }
+
+    if not matches:
+        return "error", (
+            f"No files matched regex '{file_regex}' in {file_directory}. "
+            "TODO: inbuilt search will support LATEST/EXACT date selection."
+        )
+
+    return "success", result
+
+
+@executor("profile_data_file")
+async def _exec_profile_data_file(step, confirmed_params, prior_results, **ctx):
+    import pandas as pd
+
+    search = prior_results.get("search_data_file", {})
+    search_value = search.get("value", {}) if search.get("status") == "success" else {}
+    selected = search_value.get("selected_file") or {}
+    file_path = (selected.get("file_path") or "").strip()
+
+    if not file_path:
+        return "error", "No file selected from search step — cannot profile"
+
+    try:
+        path = secure_path(file_path)
+    except ValueError as exc:
+        return "error", str(exc)
+
+    if not path.exists():
+        return "error", f"File not found: {file_path}"
+
+    skip_top = _int_or_none(confirmed_params.get("skip_top_row")) or 0
+    skip_bottom = _int_or_none(confirmed_params.get("skip_bottom_row")) or 0
+    file_type = (confirmed_params.get("file_type") or path.suffix.lstrip(".")).upper()
+
+    try:
+        suffix = path.suffix.lower()
+        if file_type in ("CSV", "TXT") or suffix == ".csv":
+            df = pd.read_csv(path, dtype=str, skiprows=skip_top if skip_top else None)
+        elif file_type in ("XLSX", "XLS") or suffix in (".xlsx", ".xls"):
+            df = pd.read_excel(path, dtype=str, skiprows=skip_top if skip_top else None)
+        elif file_type == "PARQUET" or suffix == ".parquet":
+            df = pd.read_parquet(path)
+            if skip_top:
+                df = df.iloc[skip_top:]
+        else:
+            return "error", f"Profiling not yet supported for file type: {file_type}"
+
+        if skip_bottom > 0 and len(df) > skip_bottom:
+            df = df.iloc[:-skip_bottom]
+
+        df = df.head(5000)
+        columns = list(df.columns)
+        null_counts = {col: int(df[col].isna().sum() + (df[col] == "").sum()) for col in columns}
+        sample_rows = df.head(5).where(df.head(5).notna(), other=None).to_dict(orient="records")
+
+        column_profiles = []
+        for col in columns:
+            series = df[col].replace("", pd.NA)
+            non_null = series.dropna()
+            profile = {
+                "column": col,
+                "dtype": str(df[col].dtype),
+                "null_count": null_counts.get(col, 0),
+                "distinct_count": int(non_null.nunique()),
+                "sample_values": [str(v) for v in non_null.head(3).tolist()],
+            }
+            column_profiles.append(profile)
+
+        return "success", {
+            "file_path": str(path),
+            "file_type": file_type,
+            "row_count": len(df),
+            "column_count": len(columns),
+            "columns": columns,
+            "skip_top_row": skip_top,
+            "skip_bottom_row": skip_bottom,
+            "file_date_format": confirmed_params.get("file_date_format"),
+            "file_date_selection": confirmed_params.get("file_date_selection"),
+            "column_profiles": column_profiles,
+            "sample_rows": sample_rows,
+        }
+    except Exception as exc:
+        logger.error("Profile data file error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+@executor("write_input_files_rows")
+async def _exec_write_input_files_rows(step, confirmed_params, prior_results, **ctx):
+    import pandas as pd
+
+    output_path = (confirmed_params.get("output_file_path") or "").strip()
+    if not output_path:
+        return "skipped", "No output_file_path specified"
+
+    build = prior_results.get("build_input_files_config", {})
+    build_value = build.get("value", {}) if build.get("status") == "success" else {}
+    rows = build_value.get("rows") or []
+    if not rows:
+        return "error", "No InputFiles rows available to write"
+
+    try:
+        path = secure_path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(rows)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            df.to_csv(path, index=False)
+        else:
+            if suffix not in (".xlsx", ".xls"):
+                path = path.with_suffix(".xlsx")
+            df.to_excel(path, index=False)
+
+        dataset_names = _parse_dataset_names(confirmed_params.get("dataset_name"))
+        return "success", {
+            "written_to": str(path),
+            "rows": len(df),
+            "columns": list(df.columns),
+            "dataset_names": dataset_names or None,
+            "rows_per_dataset": len(dataset_names) if dataset_names else len(df),
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("Write input files rows error: %s", exc, exc_info=True)
+        return "error", str(exc)
