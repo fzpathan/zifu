@@ -12,6 +12,15 @@ logger = logging.getLogger(__name__)
 
 @executor("transform_execute")
 async def _exec_transform(step, confirmed_params, prior_results, **ctx):
+    build = prior_results.get("build_formula", {})
+    if build.get("status") == "success":
+        return await _exec_transform_from_prior(
+            {**step, "formula_step_id": "build_formula"},
+            confirmed_params,
+            prior_results,
+            **ctx,
+        )
+
     ensure_api_root_on_path()
     try:
         import pandas as pd
@@ -85,7 +94,7 @@ async def _exec_transform_from_prior(step, confirmed_params, prior_results, **ct
         return "error", f"Formula step result is not a dict: {type(formula_config)}"
 
     merged = {**confirmed_params}
-    for key in ("operation_type", "new_field_name", "input_fields", "operation_params"):
+    for key in ("operation_type", "new_field_name", "input_fields", "operation_params", "dataset_name"):
         if formula_config.get(key) is not None:
             merged[key] = formula_config[key]
 
