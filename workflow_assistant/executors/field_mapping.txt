@@ -50,7 +50,12 @@ def _formula_updates_for_columns(formula_config: dict, columns: List[str]) -> di
 @executor("locate_excel_file")
 async def _exec_locate_excel_file(step, confirmed_params, prior_results, **ctx):
     """Resolve and verify a user-supplied Excel file path within the secure workspace."""
-    file_path = (confirmed_params.get("file_path") or confirmed_params.get("config_file_path") or "").strip()
+    file_path = (
+        confirmed_params.get("file_path")
+        or confirmed_params.get("config_file_path")
+        or confirmed_params.get("config_path")
+        or ""
+    ).strip()
     if not file_path:
         return "error", "file_path is required"
 
@@ -304,6 +309,7 @@ async def _exec_read_excel_sheet_structure(step, confirmed_params, prior_results
     file_path = (
         locate_value.get("file_path")
         or confirmed_params.get("file_path")
+        or confirmed_params.get("config_path")
         or confirmed_params.get("file_input")
         or ""
     ).strip()
