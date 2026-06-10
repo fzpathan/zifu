@@ -1,0 +1,94 @@
+# InputFiles sheet schema for the input_files workflow assistant.
+# Used by llm_build_input_files to align generated rows to config columns.
+# Extend llm_system_prompt_notes when business rules are finalised.
+
+version: "1.0"
+sheet_name: InputFiles
+
+# Placeholder — replace/extend with full domain rules when ready.
+llm_system_prompt_notes: |
+  TODO: Add control-specific InputFiles business rules here (QA vs COMP differences,
+  allowed FileType values, FileDateSelection semantics, directory conventions, etc.).
+
+columns:
+  - key: dataset_name
+    column: DatasetName
+    type: text
+    required: true
+    description: "Dataset this file feeds (e.g. SRC, TGT). Multiple datasets become separate rows."
+    example: "SRC"
+
+  - key: file_name
+    column: FileName
+    type: text
+    required: true
+    description: "File name or name pattern (may include date tokens like YYYYMMDD)."
+    example: "transactions_YYYYMMDD.csv"
+
+  - key: file_directory
+    column: FileDirectory
+    type: text
+    required: true
+    description: "Directory path where the file is expected (absolute path on server)."
+    example: "/opt/data/inbound/transactions"
+
+  - key: file_type
+    column: FileType
+    type: select
+    required: true
+    options:
+      - CSV
+      - XLSX
+      - XLS
+      - TXT
+      - PARQUET
+      - ZIP
+    description: "Physical file format."
+    example: "CSV"
+
+  - key: file_date_format
+    column: FileDateFormat
+    type: text
+    required: true
+    description: "strftime-style date format embedded in the file name (e.g. %Y%m%d, yyyyMMdd)."
+    example: "%Y%m%d"
+
+  - key: file_date_selection
+    column: FileDateSelection
+    type: select
+    required: true
+    options:
+      - LATEST
+      - EXACT
+      - OFFSET
+      - RANGE
+    description: "How to pick the file when multiple dated files exist in the directory."
+    example: "LATEST"
+
+  - key: skip_top_row
+    column: SkipTopRow
+    type: number
+    required: false
+    description: "Number of rows to skip after the header when reading the data file."
+    example: "0"
+
+  - key: skip_bottom_row
+    column: SkipBottomRow
+    type: number
+    required: false
+    description: "Number of rows to skip from the bottom when reading the data file."
+    example: "0"
+
+  - key: file_regex
+    column: FileRegex
+    type: text
+    required: false
+    description: "Generated regex pattern used to locate files in file_directory (LLM-produced)."
+    example: "^transactions_\\d{8}\\.csv$"
+
+  - key: file_path
+    column: FilePath
+    type: text
+    required: false
+    description: "Resolved full path after search (populated by search step, not user input)."
+    example: "/opt/data/inbound/transactions/transactions_20240315.csv"
