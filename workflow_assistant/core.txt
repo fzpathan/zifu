@@ -11,10 +11,28 @@ from .utils import accumulate_usage, eval_condition, sse
 
 logger = logging.getLogger(__name__)
 
-_CLASSIFICATION_PROMPT = """You are a workflow router. Given the user message and the list of available workflows, identify the single best matching workflow.
+_LEGACY_WORKFLOW_ALIASES = {
+    "formula_builder": "transform_validation",
+}
+
+_DISAMBIGUATION_RULES = """Hard routing rules (must follow):
+- transform_validation: build/test transforms on sample data only — NOT config Excel sheets, NOT control runs.
+- config_validation: validate config Excel and report errors only — NOT when user asks to fix/apply/repair.
+- config_validation_fix: ONLY when user explicitly asks to fix, apply, repair, or apply corrections.
+- config_search: search parquet/indexed config data — NOT Excel validation or FieldOperations edits.
+- field_mapping_analyser: read/analyse/append/update FieldOperations rows in a config Excel workbook — NOT standalone transform tests, NOT control runs.
+- config_update_and_run: config formula change AND user mentions running/executing/triggering a control.
+- input_files: define/search/profile an InputFiles data file entry (dataset, directory, date format, regex) — NOT transform tests or config validation."""
+
+_CLASSIFICATION_PROMPT = """You are a workflow router. Given the user message, keyword scores, and available workflows, pick the single best match.
+
+{disambiguation_rules}
 
 Available workflows:
 {workflows_summary}
+
+Keyword pre-scores (higher = more keyword phrase matches in the message; use as a hint, not the only signal):
+{keyword_scores}
 
 User message: "{message}"
 
@@ -23,7 +41,9 @@ Respond with JSON only (no markdown fences):
 
 Rules:
 - workflow_id must exactly match one of the available ids, or be null if nothing matches
-- confidence: 0.0-1.0. Use null if confidence < 0.35."""
+- confidence: 0.0-1.0. Use null workflow_id if confidence < 0.35
+- Prefer the workflow whose use_when/not_when rules best fit the message
+- When two workflows seem similar, apply the hard routing rules above"""
 
 _EXTRACTION_PROMPT = """Extract the following parameter values from the user message.
 
@@ -46,20 +66,145 @@ def _extract_message_content(content) -> str:
     return extract_message_content(content)
 
 
-async def classify_intent(client, model: str, message: str, workflows: list) -> tuple:
-    parts = []
+def _text_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _phrase_matches_message(phrase: str, msg: str) -> bool:
+    phrase = phrase.lower().strip()
+    if not phrase:
+        return False
+    if phrase in msg:
+        return True
+    words = phrase.split()
+    if len(words) == 1:
+        return bool(re.search(rf"\b{re.escape(words[0])}\b", msg))
+    idx = 0
+    for word in words:
+        match = re.search(rf"\b{re.escape(word)}", msg[idx:])
+        if not match:
+            return False
+        idx += match.end()
+    return True
+
+
+def score_keyword_matches(message: str, workflows: list) -> Dict[str, Dict[str, Any]]:
+    msg = message.lower()
+    scores: Dict[str, Dict[str, Any]] = {}
     for w in workflows:
         ic = w.get("intent_classification", {})
-        examples = ic.get("examples", [])[:5]
-        keywords = ic.get("keywords", [])[:10]
-        parts.append(
-            f"- id: {w['id']}\n  name: {w['name']}\n"
-            f"  description: {w['description']}\n"
-            f"  examples: {examples}\n"
-            f"  keywords: {keywords}"
-        )
+        score = 0
+        matched: List[str] = []
+        penalized: List[str] = []
+
+        for kw in ic.get("keywords", []):
+            kw_l = kw.lower().strip()
+            if kw_l and _phrase_matches_message(kw_l, msg):
+                score += max(1, len(kw_l.split())) * 2
+                matched.append(kw)
+
+        for neg in ic.get("negative_examples", []):
+            neg_l = neg.lower().strip()
+            if neg_l and _phrase_matches_message(neg_l, msg):
+                score -= 6
+                penalized.append(neg)
+
+        scores[w["id"]] = {
+            "score": score,
+            "matched_keywords": matched,
+            "penalized_by": penalized,
+        }
+    return scores
+
+
+def _format_workflow_summary(w: dict) -> str:
+    ic = w.get("intent_classification", {})
+    examples = ic.get("examples", [])
+    keywords = ic.get("keywords", [])
+    negative = ic.get("negative_examples", [])
+    lines = [
+        f"- id: {w['id']}",
+        f"  name: {w['name']}",
+        f"  description: {w['description']}",
+    ]
+    if ic.get("use_when"):
+        lines.append(f"  use_when: {ic['use_when']}")
+    if ic.get("not_when"):
+        lines.append(f"  not_when: {ic['not_when']}")
+    lines.append(f"  examples: {examples}")
+    if negative:
+        lines.append(f"  negative_examples: {negative}")
+    lines.append(f"  keywords: {keywords}")
+    return "\n".join(lines)
+
+
+def _format_keyword_scores(scores: Dict[str, Dict[str, Any]]) -> str:
+    ranked = sorted(scores.items(), key=lambda item: item[1]["score"], reverse=True)
+    lines = []
+    for wf_id, data in ranked:
+        detail = f"{wf_id}: score={data['score']}"
+        if data["matched_keywords"]:
+            detail += f", matched={data['matched_keywords']}"
+        if data["penalized_by"]:
+            detail += f", penalized_by={data['penalized_by']}"
+        lines.append(detail)
+    return "\n".join(lines) if lines else "(no keyword matches)"
+
+
+def _resolve_workflow_id(workflow_id: Optional[str]) -> Optional[str]:
+    if not workflow_id:
+        return None
+    return _LEGACY_WORKFLOW_ALIASES.get(workflow_id, workflow_id)
+
+
+def normalize_extracted_params(workflow: dict, extracted: dict, message: str = "") -> dict:
+    """Infer defaults and normalize param values after LLM extraction."""
+    normalized = dict(extracted or {})
+    wf_id = workflow.get("id")
+    msg_lower = (message or "").lower()
+
+    if wf_id == "transform_validation":
+        explicit_keys = ("operation_type", "new_field_name", "input_fields")
+        has_explicit = all(_text_present(normalized.get(k)) for k in explicit_keys)
+        has_description = _text_present(normalized.get("formula_description"))
+        input_format = (normalized.get("input_format") or "").strip().lower()
+
+        if not input_format:
+            if has_explicit and not has_description:
+                input_format = "explicit"
+            elif has_description and str(normalized.get("formula_description", "")).strip().startswith("{"):
+                input_format = "formula_json"
+            else:
+                input_format = "generated"
+            normalized["input_format"] = input_format
+        elif input_format == "formula_json" and not has_description:
+            pass
+        elif input_format == "explicit" and not has_explicit and has_description:
+            normalized["input_format"] = "generated"
+
+    if wf_id == "field_mapping_analyser":
+        action = (normalized.get("action") or "").strip().lower()
+        if not action:
+            add_words = ("add", "append", "insert", "new row", "new field")
+            normalized["action"] = "add_new" if any(w in msg_lower for w in add_words) else "analyse"
+
+    if wf_id == "input_files" and not _text_present(normalized.get("sheet_name")):
+        normalized["sheet_name"] = "InputFiles"
+
+    return normalized
+
+
+async def classify_intent(client, model: str, message: str, workflows: list) -> tuple:
+    keyword_scores = score_keyword_matches(message, workflows)
+    parts = [_format_workflow_summary(w) for w in workflows]
     prompt = _CLASSIFICATION_PROMPT.format(
-        workflows_summary="\n".join(parts),
+        disambiguation_rules=_DISAMBIGUATION_RULES,
+        workflows_summary="\n\n".join(parts),
+        keyword_scores=_format_keyword_scores(keyword_scores),
         message=message,
     )
     result = await client.chat.completions.create(
@@ -70,7 +215,21 @@ async def classify_intent(client, model: str, message: str, workflows: list) -> 
     )
     raw = _extract_message_content(result.choices[0].message.content)
     try:
-        return json.loads(_extract_json(raw)), result.usage
+        parsed = json.loads(_extract_json(raw))
+        parsed["workflow_id"] = _resolve_workflow_id(parsed.get("workflow_id"))
+        llm_confidence = float(parsed.get("confidence") or 0.0)
+
+        wf_id = parsed.get("workflow_id")
+        if wf_id and wf_id in keyword_scores:
+            kw_score = keyword_scores[wf_id]["score"]
+            top_score = max((d["score"] for d in keyword_scores.values()), default=0)
+            if kw_score > 0 and top_score > 0:
+                if kw_score >= top_score:
+                    parsed["confidence"] = min(1.0, max(llm_confidence, 0.55))
+                elif kw_score < top_score - 2:
+                    parsed["confidence"] = min(llm_confidence, 0.45)
+
+        return parsed, result.usage
     except Exception:
         return {"workflow_id": None, "confidence": 0.0}, result.usage
 
@@ -94,7 +253,7 @@ async def extract_params(client, model: str, message: str, params: list) -> tupl
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=700,
     )
     raw = _extract_message_content(result.choices[0].message.content)
     try:
@@ -103,7 +262,53 @@ async def extract_params(client, model: str, message: str, params: list) -> tupl
         return {p["key"]: None for p in params}, result.usage
 
 
-def find_missing_params(params: list, extracted: dict) -> list:
+def find_missing_params(workflow: dict, extracted: dict) -> list:
+    wf_id = workflow.get("id")
+    params = workflow.get("params", [])
+
+    if wf_id == "transform_validation":
+        input_format = (extracted.get("input_format") or "generated").strip().lower()
+        if input_format == "explicit":
+            missing = []
+            for key in ("operation_type", "new_field_name", "input_fields"):
+                if not _text_present(extracted.get(key)):
+                    param = next((p for p in params if p["key"] == key), None)
+                    if param:
+                        missing.append(param)
+            return missing
+        if not _text_present(extracted.get("formula_description")):
+            param = next((p for p in params if p["key"] == "formula_description"), None)
+            return [param] if param else []
+        return []
+
+    if wf_id == "field_mapping_analyser":
+        action = (extracted.get("action") or "analyse").strip().lower()
+        missing = []
+        for p in params:
+            if not p.get("required", False):
+                continue
+            key = p["key"]
+            if key == "action":
+                continue
+            if action == "analyse" and key in ("formula_input", "input_format"):
+                continue
+            if action == "add_new" and key in ("lookup_type", "lookup_value", "apply_changes"):
+                continue
+            val = extracted.get(key)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(p)
+        if action == "analyse":
+            if not _text_present(extracted.get("lookup_value")):
+                param = next((p for p in params if p["key"] == "lookup_value"), None)
+                if param and param not in missing:
+                    missing.append(param)
+        elif action == "add_new":
+            if not _text_present(extracted.get("formula_input")):
+                param = next((p for p in params if p["key"] == "formula_input"), None)
+                if param and param not in missing:
+                    missing.append(param)
+        return missing
+
     missing = []
     for p in params:
         if p.get("required", False):
@@ -138,7 +343,6 @@ async def execute_workflow_steps(
             "total_steps": len(steps),
         })
 
-        # Evaluate optional condition — skip step if condition is false
         condition = step.get("condition")
         if condition and not eval_condition(condition, confirmed_params):
             prior_results[step_id] = {"status": "skipped", "value": f"Condition not met: {condition}"}
