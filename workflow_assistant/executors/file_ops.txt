@@ -1,12 +1,121 @@
 """
 Executors: file_read, file_write, file_write_summary
 """
+import json
 import logging
+import re
+from typing import Any, Dict, List, Optional
 
 from ..registry import executor
 from ..utils import secure_path
 
 logger = logging.getLogger(__name__)
+
+_DATASET_SPLIT_RE = re.compile(r"[,;|]")
+
+
+def _parse_dataset_names(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+    return [part.strip() for part in _DATASET_SPLIT_RE.split(text) if part.strip()]
+
+
+def _parse_operation_params(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _resolve_transform_config(confirmed_params: dict, prior_results: dict) -> dict:
+    build = prior_results.get("build_formula", {})
+    formula = build.get("value", {}) if build.get("status") == "success" else {}
+    if not isinstance(formula, dict):
+        formula = {}
+
+    op_params = _parse_operation_params(
+        confirmed_params.get("operation_params") or formula.get("operation_params")
+    )
+
+    dataset_raw = confirmed_params.get("dataset_name")
+    if dataset_raw is None or (isinstance(dataset_raw, str) and not dataset_raw.strip()):
+        dataset_raw = formula.get("dataset_name")
+
+    return {
+        "operation_type": confirmed_params.get("operation_type") or formula.get("operation_type", ""),
+        "new_field_name": confirmed_params.get("new_field_name") or formula.get("new_field_name", ""),
+        "input_fields": confirmed_params.get("input_fields") or formula.get("input_fields", ""),
+        "operation_params": op_params,
+        "dataset_name": dataset_raw,
+    }
+
+
+def _serialize_mapping_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return json.dumps(value)
+    return value
+
+
+def _build_field_operations_row(config: dict, dataset_name: Optional[str] = None) -> dict:
+    op_params = config.get("operation_params") or {}
+    row = {
+        "DatasetName": dataset_name,
+        "NewFieldName": config.get("new_field_name"),
+        "Operation": config.get("operation_type"),
+        "Inputs": config.get("input_fields"),
+        "separator": op_params.get("separator"),
+        "component": op_params.get("component"),
+        "mapping": _serialize_mapping_value(op_params.get("mapping")),
+        "formulastring": op_params.get("formulastring"),
+        "condition": op_params.get("condition"),
+        "true_value": op_params.get("true_value"),
+        "false_value": op_params.get("false_value"),
+        "types": op_params.get("types"),
+        "comparator": op_params.get("comparator"),
+        "value": op_params.get("value"),
+        "operation": op_params.get("operation"),
+        "decimal_places": op_params.get("decimal_places"),
+        "delimiter": op_params.get("delimiter"),
+        "index": op_params.get("index"),
+        "pattern": op_params.get("pattern"),
+        "replacement": op_params.get("replacement"),
+        "use_regex": op_params.get("use_regex"),
+    }
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def _field_operations_rows_for_write(config: dict, dataset_names: List[str]) -> List[dict]:
+    if not dataset_names:
+        return [_build_field_operations_row(config)]
+    return [_build_field_operations_row(config, dataset_name) for dataset_name in dataset_names]
+
+
+def _resolve_write_mode(step: dict, confirmed_params: dict, dataset_names: List[str]) -> str:
+    write_mode = (
+        step.get("write_mode")
+        or confirmed_params.get("output_write_mode")
+        or "auto"
+    ).strip().lower()
+    if write_mode == "auto":
+        return "field_operations" if dataset_names else "results"
+    return write_mode
 
 
 @executor("file_read")
@@ -54,14 +163,33 @@ async def _exec_write_file(step, confirmed_params, prior_results, **ctx):
     except ValueError as exc:
         return "error", str(exc)
 
-    transform_result = prior_results.get("execute_transform", {}).get("value")
-    if not transform_result or isinstance(transform_result, str):
-        return "error", "No transform results available to write"
+    config = _resolve_transform_config(confirmed_params, prior_results)
+    dataset_names = _parse_dataset_names(confirmed_params.get("dataset_name"))
+    if not dataset_names:
+        dataset_names = _parse_dataset_names(config.get("dataset_name"))
+
+    write_mode = _resolve_write_mode(step, confirmed_params, dataset_names)
 
     try:
         path = secure_out
         path.parent.mkdir(parents=True, exist_ok=True)
-        df = pd.DataFrame(transform_result if isinstance(transform_result, list) else [transform_result])
+
+        if write_mode == "field_operations":
+            if not dataset_names:
+                return "error", "dataset_name is required when writing FieldOperations rows"
+            if not config.get("operation_type") or not config.get("new_field_name"):
+                return "error", "Operation type and new field name are required to write FieldOperations rows"
+
+            rows = _field_operations_rows_for_write(config, dataset_names)
+            df = pd.DataFrame(rows)
+            write_kind = "field_operations"
+        else:
+            transform_result = prior_results.get("execute_transform", {}).get("value")
+            if not transform_result or isinstance(transform_result, str):
+                return "error", "No transform results available to write"
+            df = pd.DataFrame(transform_result if isinstance(transform_result, list) else [transform_result])
+            write_kind = "results"
+
         suffix = path.suffix.lower()
         if suffix == ".csv":
             df.to_csv(path, index=False)
@@ -69,7 +197,18 @@ async def _exec_write_file(step, confirmed_params, prior_results, **ctx):
             if suffix not in (".xlsx", ".xls"):
                 path = path.with_suffix(".xlsx")
             df.to_excel(path, index=False)
-        return "success", {"written_to": str(path), "rows": len(df), "columns": list(df.columns)}
+
+        result = {
+            "written_to": str(path),
+            "rows": len(df),
+            "columns": list(df.columns),
+            "write_mode": write_kind,
+        }
+        if write_kind == "field_operations":
+            result["dataset_names"] = dataset_names
+            result["rows_per_dataset"] = len(dataset_names)
+
+        return "success", result
     except Exception as exc:
         logger.error("Write file error: %s", exc, exc_info=True)
         return "error", str(exc)
