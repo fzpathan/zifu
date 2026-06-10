@@ -22,7 +22,8 @@ _DISAMBIGUATION_RULES = """Hard routing rules (must follow):
 - config_search: search parquet/indexed config data — NOT Excel validation or FieldOperations edits.
 - field_mapping_analyser: read/analyse/append/update FieldOperations rows in a config Excel workbook — NOT standalone transform tests, NOT control runs.
 - config_update_and_run: config formula change AND user mentions running/executing/triggering a control.
-- input_files: define/search/profile an InputFiles data file entry (dataset, directory, date format, regex) — NOT transform tests or config validation."""
+- input_files: define/search/profile an InputFiles data file entry (dataset, directory, date format, regex) — NOT transform tests or config validation.
+- break_explain: build/test/analyse BreakExplain sheet rows (RuleInputFunction, RuleInputFormula, RuleDescription, etc.) — NOT FieldOperations, NOT transform_validation standalone."""
 
 _CLASSIFICATION_PROMPT = """You are a workflow router. Given the user message, keyword scores, and available workflows, pick the single best match.
 
@@ -195,6 +196,14 @@ def normalize_extracted_params(workflow: dict, extracted: dict, message: str = "
     if wf_id == "input_files" and not _text_present(normalized.get("sheet_name")):
         normalized["sheet_name"] = "InputFiles"
 
+    if wf_id == "break_explain":
+        if not _text_present(normalized.get("sheet_name")):
+            normalized["sheet_name"] = "BreakExplain"
+        action = (normalized.get("action") or "").strip().lower()
+        if not action:
+            add_words = ("add", "append", "insert", "new row", "new rule", "create", "build")
+            normalized["action"] = "add_new" if any(w in msg_lower for w in add_words) else "analyse"
+
     return normalized
 
 
@@ -280,6 +289,32 @@ def find_missing_params(workflow: dict, extracted: dict) -> list:
             param = next((p for p in params if p["key"] == "formula_description"), None)
             return [param] if param else []
         return []
+
+    if wf_id == "break_explain":
+        action = (extracted.get("action") or "analyse").strip().lower()
+        missing = []
+        for p in params:
+            if not p.get("required", False):
+                continue
+            key = p["key"]
+            if key == "action":
+                continue
+            if action == "analyse" and key in ("formula_input", "input_format", "field_name", "new_field_name"):
+                continue
+            if action == "add_new" and key in ("lookup_type", "lookup_value", "apply_changes"):
+                continue
+            val = extracted.get(key)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(p)
+        if action == "analyse" and not _text_present(extracted.get("lookup_value")):
+            param = next((p for p in params if p["key"] == "lookup_value"), None)
+            if param and param not in missing:
+                missing.append(param)
+        elif action == "add_new" and not _text_present(extracted.get("formula_input")):
+            param = next((p for p in params if p["key"] == "formula_input"), None)
+            if param and param not in missing:
+                missing.append(param)
+        return missing
 
     if wf_id == "field_mapping_analyser":
         action = (extracted.get("action") or "analyse").strip().lower()
