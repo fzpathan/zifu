@@ -1,0 +1,819 @@
+# BreakExplain Sheet — Knowledge Base
+# ============================================================
+# This file is loaded by the llm_build_break_explain_row executor
+# and injected into the LLM system prompt as domain context.
+#
+# INSTRUCTIONS: Replace the TODO sections below with your actual
+# business rules, allowed values, and examples.  The executor will
+# include the `domain_rules` block verbatim in the system prompt.
+# ============================================================
+
+version: "1.0"
+sheet_name: BreakExplain
+
+# ---------------------------------------------------------------------------
+# Domain rules injected into every LLM call for this workflow.
+# TODO: Replace placeholder text with real business / control rules.
+# ---------------------------------------------------------------------------
+domain_rules: |
+  TODO: Add your BreakExplain domain rules here.
+
+  Suggested sections to document:
+  - What a "break" means in your reconciliation context (e.g. SRC vs TGT mismatch,
+    missing record, value tolerance breach).
+  - Allowed values for RuleInputFunction (map to ControlDash transform operation types).
+  - Allowed values for RuleInputsType (e.g. str, float, date, int).
+  - Category taxonomy (e.g. DATA_QUALITY, TIMING, MAPPING, TOLERANCE).
+  - IssueId/IssueDate conventions (Jira ticket pattern, date format).
+  - Plan values (e.g. ACCEPT, ESCALATE, FIX, MONITOR).
+  - AutoExplain vs OpsExplain distinction (system-generated vs human-written explanation).
+  - Example BreakExplain rows that are considered "correct" for reference.
+
+# ---------------------------------------------------------------------------
+# Column schema — used to guide LLM row generation and validation.
+# ---------------------------------------------------------------------------
+columns:
+  mandatory:
+    - key: FieldName
+      description: "Source input field that the rule reads from (must exist in the data)."
+      example: "trade_amount"
+
+    - key: NewFieldName
+      description: "Output field produced by the rule (the break flag/label/score)."
+      example: "amount_break_flag"
+
+    - key: RuleInputs
+      description: "Comma-separated list of input column(s) fed into the rule function."
+      example: "trade_amount,expected_amount"
+
+    - key: RuleInputsType
+      description: "Data type(s) of RuleInputs (str, float, int, date). Comma-separated when multiple."
+      example: "float,float"
+
+    - key: RuleInputFunction
+      description: |
+        Transform operation that drives the break-explain logic.
+        Maps to a ControlDash TransformOperations type:
+          DateExtract | Concatenate | Formula | Conditional | MapValues |
+          StringOperation | NumericOperation | SetValue | CopyField | Split | Replace
+        TODO: Extend with any custom functions defined in your environment.
+      example: "Conditional"
+
+    - key: RuleInputFormula
+      description: |
+        The formula expression or JSON parameters for RuleInputFunction.
+        - For Conditional: JSON with comparator, value, true_value, false_value.
+        - For Formula: pandas-eval expression string (use A, B, C as positional placeholders).
+        - For MapValues: JSON mapping dict.
+        - For DateExtract: JSON with component key.
+        - For other ops: JSON with operation-specific keys.
+        TODO: Add domain-specific formula conventions and examples.
+      example: '{"comparator": "!=", "value": "0", "true_value": "BREAK", "false_value": "OK"}'
+
+    - key: RuleDescription
+      description: "Human-readable explanation of what the rule detects and why."
+      example: "Flags records where trade_amount differs from expected_amount."
+
+  optional:
+    - key: AutoExplain
+      description: "System-generated explanation of a break (populated at runtime, not by user). TODO: define generation convention."
+      example: "Amount mismatch detected: trade_amount=100, expected_amount=105."
+
+    - key: OpsExplain
+      description: "Operations team written explanation or override. TODO: define format."
+      example: "Investigated — timing difference, acceptable."
+
+    - key: Category
+      description: "Break category. TODO: define allowed taxonomy."
+      example: "TOLERANCE"
+
+    - key: IssueId
+      description: "Linked issue/ticket ID. TODO: define pattern (e.g. JIRA-1234)."
+      example: "JIRA-1234"
+
+    - key: IssueDate
+      description: "Date the issue was raised (YYYY-MM-DD). TODO: confirm format."
+      example: "2024-03-15"
+
+    - key: Plan
+      description: "Remediation plan. TODO: define allowed values (e.g. ACCEPT, FIX, ESCALATE, MONITOR)."
+      example: "FIX"
+
+# ---------------------------------------------------------------------------
+# Test-case generation guidelines
+# ---------------------------------------------------------------------------
+test_case_guidelines: |
+  Generate exhaustive test cases that cover:
+  1. Happy path — rule fires as expected (break detected correctly).
+  2. No-break path — data is clean, rule should NOT fire.
+  3. Null / empty input — one or more RuleInputs is null or empty string.
+  4. Boundary / edge value — value exactly at the threshold (e.g. comparator == tolerance limit).
+  5. Type mismatch — input is wrong type (e.g. string where float expected).
+  6. Multi-field interaction — if RuleInputs has multiple columns, test partial-null combinations.
+
+  Each test case must include ALL columns listed in RuleInputs with realistic sample values.
+  TODO: Add domain-specific edge cases relevant to your break types.
+
+
+"""
+Executors for the break_explain workflow:
+  read_break_explain_row     — reads a row from BreakExplain sheet by FieldName/NewFieldName/row_number
+  llm_build_break_explain_row — builds or analyses a BreakExplain row and generates test cases
+  break_explain_execute       — runs the rule via the transform engine and validates all test cases
+  append_break_explain_row    — appends the validated row to the BreakExplain sheet
+"""
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from ..registry import executor
+from ..utils import (
+    accumulate_usage,
+    clean_row_dict,
+    ensure_api_root_on_path,
+    extract_json,
+    find_column,
+    secure_path,
+)
+
+logger = logging.getLogger(__name__)
+
+_KB_PATH = Path(__file__).resolve().parent.parent / "break_explain_kb.yaml"
+
+# Columns the row-lookup accepts as "field name" identifiers
+_FIELD_NAME_CANDIDATES = [
+    "NewFieldName", "Newfieldname", "new_field_name",
+    "FieldName",    "Fieldname",    "field_name",
+    "OutputField",  "Output Field",
+]
+
+# BreakExplain → TransformOperations column mapping
+_BE_TO_TRANSFORM = {
+    "RuleInputFunction": "Operation",
+    "NewFieldName":      "NewFieldName",
+    "RuleInputs":        "Inputs",
+    "RuleInputsType":    "types",
+}
+
+
+def _load_kb() -> dict:
+    import yaml
+    if not _KB_PATH.exists():
+        return {}
+    with open(_KB_PATH, encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _kb_domain_rules() -> str:
+    kb = _load_kb()
+    return (kb.get("domain_rules") or "").strip()
+
+
+def _kb_test_guidelines() -> str:
+    kb = _load_kb()
+    return (kb.get("test_case_guidelines") or "").strip()
+
+
+def _kb_column_schema() -> str:
+    kb = _load_kb()
+    cols = kb.get("columns", {})
+    mandatory = cols.get("mandatory", [])
+    optional  = cols.get("optional", [])
+    lines = ["MANDATORY columns:"]
+    for c in mandatory:
+        lines.append(f"  {c['key']}: {c.get('description','')}")
+        if c.get("example"):
+            lines.append(f"    example: {c['example']}")
+    lines.append("OPTIONAL columns:")
+    for c in optional:
+        lines.append(f"  {c['key']}: {c.get('description','')}")
+        if c.get("example"):
+            lines.append(f"    example: {c['example']}")
+    return "\n".join(lines)
+
+
+def _parse_rule_input_formula(formula_raw: Any, operation_type: str) -> dict:
+    """
+    Convert RuleInputFormula into operation_params dict.
+    Handles: JSON string, plain formula expression, plain condition string.
+    """
+    if not formula_raw:
+        return {}
+    if isinstance(formula_raw, dict):
+        return formula_raw
+    text = str(formula_raw).strip()
+    if not text:
+        return {}
+    # Try JSON first
+    if text.startswith("{"):
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+    # Formula operation — treat as formulastring
+    if operation_type.lower() in ("formula",):
+        return {"formulastring": text}
+    # Fallback
+    return {"formulastring": text}
+
+
+def _be_row_to_transform_config(row: dict) -> dict:
+    """Map a BreakExplain row dict to the transform engine format."""
+    operation_type = (
+        str(row.get("RuleInputFunction") or row.get("ruleinputfunction") or "").strip()
+    )
+    new_field = (
+        str(row.get("NewFieldName") or row.get("newfieldname") or "").strip()
+    )
+    input_fields = (
+        str(row.get("RuleInputs") or row.get("ruleinputs") or "").strip()
+    )
+    types = (
+        str(row.get("RuleInputsType") or row.get("ruleinputstype") or "").strip()
+    )
+    formula_raw = row.get("RuleInputFormula") or row.get("ruleinputformula")
+    operation_params = _parse_rule_input_formula(formula_raw, operation_type)
+    if types:
+        operation_params["types"] = types
+    return {
+        "operation_type": operation_type,
+        "new_field_name": new_field,
+        "input_fields": input_fields,
+        "operation_params": operation_params,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM system prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT_TEMPLATE = """You are a ControlDash BreakExplain configuration expert.
+
+Your role is to build, analyse, and test BreakExplain sheet rows that define how
+reconciliation breaks are detected and explained.
+
+{domain_rules_section}
+
+{column_schema}
+
+RuleInputFunction → TransformOperations mapping:
+  DateExtract | Concatenate | Formula | Conditional | MapValues |
+  StringOperation | NumericOperation | SetValue | CopyField | Split | Replace
+
+RuleInputFormula conventions:
+  - Conditional  : JSON {{"comparator": "!=", "value": "0", "true_value": "BREAK", "false_value": "OK"}}
+  - Formula      : pandas-eval expression string using A, B, C as positional placeholders
+  - MapValues    : JSON mapping dict {{"old": "new", ...}}
+  - DateExtract  : JSON {{"component": "year|month|day|..."}}
+  - Others       : JSON with operation-specific keys
+
+{test_guidelines_section}
+
+Respond with valid JSON only — no markdown fences, no text outside the JSON:
+{{
+  "row_dict": {{
+    "FieldName":        "<source field>",
+    "NewFieldName":     "<output field>",
+    "RuleInputs":       "<comma-separated input columns>",
+    "RuleInputsType":   "<comma-separated types>",
+    "RuleInputFunction":"<TransformOperation type>",
+    "RuleInputFormula": "<formula JSON or expression string>",
+    "RuleDescription":  "<human-readable rule explanation>",
+    "AutoExplain":      "<system explanation or null>",
+    "OpsExplain":       "<ops explanation or null>",
+    "Category":         "<category or null>",
+    "IssueId":          "<issue id or null>",
+    "IssueDate":        "<YYYY-MM-DD or null>",
+    "Plan":             "<plan value or null>"
+  }},
+  "operation_type":    "<TransformOperations type>",
+  "new_field_name":    "<snake_case output field>",
+  "input_fields":      "<comma-separated input columns>",
+  "operation_params":  {{ ... }},
+  "sample_data":       [ {{ "<col>": "<val>", ... }}, ... ],
+  "explanation":       "<one-line summary of the rule>"
+}}
+
+Rules:
+- All MANDATORY columns must be populated; optional columns use null when absent.
+- sample_data must contain at least 6 rows covering: happy-path, no-break, null input,
+  boundary/edge, type-mismatch, and at least one multi-field interaction if RuleInputs has >1 column.
+- new_field_name must be snake_case and match NewFieldName.
+- operation_params must only contain keys valid for the chosen operation type."""
+
+
+def _build_system_prompt() -> str:
+    domain = _kb_domain_rules()
+    schema = _kb_column_schema()
+    tests  = _kb_test_guidelines()
+
+    domain_section = (
+        f"Domain rules and context:\n{domain}" if domain
+        else "Domain rules: TODO — populate break_explain_kb.yaml with your business rules."
+    )
+    test_section = (
+        f"Test case generation guidelines:\n{tests}" if tests else ""
+    )
+    return _SYSTEM_PROMPT_TEMPLATE.format(
+        domain_rules_section=domain_section,
+        column_schema=schema,
+        test_guidelines_section=test_section,
+    )
+
+
+def _extract_message_content(content) -> str:
+    from ...ai_assistant import extract_message_content
+    return extract_message_content(content)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executor: read_break_explain_row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@executor("read_break_explain_row")
+async def _exec_read_break_explain_row(step, confirmed_params, prior_results, **ctx):
+    """Read a row from the BreakExplain sheet by FieldName, NewFieldName, or row_number."""
+    import pandas as pd
+
+    locate = prior_results.get("locate_config_file", {})
+    locate_val = locate.get("value", {}) if locate.get("status") == "success" else {}
+    file_path = (
+        locate_val.get("file_path")
+        or confirmed_params.get("file_path")
+        or confirmed_params.get("config_path")
+        or ""
+    ).strip()
+    sheet_name = (
+        confirmed_params.get("sheet_name") or step.get("sheet", "BreakExplain")
+    ).strip()
+    lookup_type  = (confirmed_params.get("lookup_type")  or "new_field_name").strip()
+    lookup_value = (confirmed_params.get("lookup_value") or "").strip()
+
+    if not file_path:
+        return "error", "file_path is required to read a BreakExplain row"
+    if not lookup_value:
+        return "error", "lookup_value is required (field name or row number)"
+
+    try:
+        path = secure_path(file_path)
+        df   = pd.read_excel(path, sheet_name=sheet_name)
+        if df.empty:
+            return "error", f"Sheet '{sheet_name}' is empty"
+
+        found_rows: List[dict] = []
+
+        if lookup_type == "row_number":
+            try:
+                row_idx = int(lookup_value) - 1
+            except ValueError:
+                return "error", f"Invalid row number: '{lookup_value}'"
+            if 0 <= row_idx < len(df):
+                row = clean_row_dict(
+                    df.iloc[row_idx].where(df.iloc[row_idx].notna(), other=None).to_dict()
+                )
+                row["_sheet"]              = sheet_name
+                row["_row_number"]         = row_idx + 1
+                row["_excel_row_number"]   = row_idx + 2
+                found_rows.append(row)
+        else:
+            field_col = find_column(df.columns, _FIELD_NAME_CANDIDATES)
+            if not field_col:
+                return "error", (
+                    f"No recognised field-name column found in sheet '{sheet_name}'. "
+                    f"Expected one of: {_FIELD_NAME_CANDIDATES}"
+                )
+            mask = df[field_col].astype(str).str.strip().str.lower() == lookup_value.lower()
+            for idx, row_data in df[mask].iterrows():
+                row = clean_row_dict(
+                    row_data.where(row_data.notna(), other=None).to_dict()
+                )
+                row["_sheet"]            = sheet_name
+                row["_row_number"]       = int(idx) + 1
+                row["_excel_row_number"] = int(idx) + 2
+                row["_matched_column"]   = field_col
+                found_rows.append(row)
+
+        if not found_rows:
+            return "error", (
+                f"No rows found matching {lookup_type}='{lookup_value}' "
+                f"in sheet '{sheet_name}'"
+            )
+
+        return "success", {
+            "file_path":  str(path),
+            "sheet":      sheet_name,
+            "rows":       found_rows,
+            "total":      len(found_rows),
+            "lookup":     {lookup_type: lookup_value},
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("read_break_explain_row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executor: llm_build_break_explain_row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@executor("llm_build_break_explain_row")
+async def _exec_llm_build_break_explain_row(step, confirmed_params, prior_results, **ctx):
+    """
+    Two modes controlled by action param:
+      analyse  — read the existing row from read_break_explain_row, understand it,
+                 propose improvements, generate test cases.
+      add_new  — build a brand-new row from formula_input + input_format (description or formula_json).
+    """
+    client, model, usage_acc = ctx["client"], ctx["model"], ctx["usage_acc"]
+    action = (confirmed_params.get("action") or "analyse").strip().lower()
+
+    system_prompt = _build_system_prompt()
+    sample_data_raw = confirmed_params.get("sample_data", "")
+    sample_data: List[dict] = []
+    if isinstance(sample_data_raw, str) and sample_data_raw.strip():
+        try:
+            sample_data = json.loads(sample_data_raw)
+        except Exception:
+            pass
+    elif isinstance(sample_data_raw, list):
+        sample_data = sample_data_raw
+
+    # ── ANALYSE mode ────────────────────────────────────────────────────────
+    if action == "analyse":
+        source_step_id = step.get("source_step_id", "read_break_explain_row")
+        prior = prior_results.get(source_step_id, {})
+        if prior.get("status") != "success":
+            return "error", f"Step '{source_step_id}' did not succeed — cannot analyse row"
+
+        row_data = prior.get("value", {})
+        rows_list = (
+            row_data.get("rows", [row_data])
+            if isinstance(row_data, dict) and "rows" in row_data
+            else [row_data]
+        )
+        first_row = rows_list[0] if rows_list else {}
+
+        user_msg = (
+            "Analyse and improve this existing BreakExplain row.\n"
+            "Map its columns to the standard transform format "
+            "(RuleInputFunction→operation_type, NewFieldName→new_field_name, "
+            "RuleInputs→input_fields, RuleInputFormula→operation_params).\n"
+            "Identify any issues and propose a corrected row_dict.\n"
+            f"Existing row:\n{json.dumps(first_row, default=str)[:2000]}\n\n"
+        )
+        if sample_data:
+            user_msg += f"Use this sample data exactly:\n{json.dumps(sample_data[:6], default=str)}"
+        else:
+            user_msg += "Generate exhaustive test cases as specified in the system prompt."
+
+    # ── ADD NEW mode ─────────────────────────────────────────────────────────
+    else:
+        formula_input  = (confirmed_params.get("formula_input")  or "").strip()
+        input_format   = (confirmed_params.get("input_format")   or "description").strip()
+        field_name     = (confirmed_params.get("field_name")     or "").strip()
+        new_field_name = (confirmed_params.get("new_field_name") or "").strip()
+
+        if not formula_input:
+            return "error", "formula_input is required for add_new action"
+
+        # Check if actual sheet structure was captured
+        structure = prior_results.get("read_sheet_structure", {}).get("value", {})
+        sheet_cols: List[str] = structure.get("columns", []) if isinstance(structure, dict) else []
+        sample_rows_str = ""
+        if isinstance(structure, dict) and structure.get("sample_rows"):
+            sample_rows_str = (
+                f"\nActual sheet columns: {sheet_cols}\n"
+                f"Recent sheet rows for reference:\n"
+                f"{json.dumps(structure['sample_rows'][:2], default=str)}"
+            )
+
+        if input_format == "formula_json":
+            user_msg = (
+                "Build a complete BreakExplain row from this partial formula JSON.\n"
+                "Fill all missing mandatory columns and generate exhaustive test cases.\n"
+                f"Formula JSON:\n{formula_input}"
+            )
+        else:
+            user_msg = (
+                "Build a complete BreakExplain row from this plain-English description.\n"
+                "Generate exhaustive test cases as specified in the system prompt.\n"
+                f"Description: {formula_input}"
+            )
+
+        if field_name:
+            user_msg += f"\nFieldName (source field): {field_name}"
+        if new_field_name:
+            user_msg += f"\nDesired NewFieldName (output field): {new_field_name}"
+        if sample_rows_str:
+            user_msg += sample_rows_str
+        if sample_data:
+            user_msg += f"\nUse this sample data exactly:\n{json.dumps(sample_data[:6], default=str)}"
+
+    try:
+        result = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=1600,
+        )
+        accumulate_usage(usage_acc, result.usage)
+        raw = _extract_message_content(result.choices[0].message.content)
+        return "success", json.loads(extract_json(raw))
+    except json.JSONDecodeError as exc:
+        return "error", f"LLM returned invalid JSON for BreakExplain row: {exc}"
+    except Exception as exc:
+        logger.error("llm_build_break_explain_row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executor: break_explain_execute
+# ─────────────────────────────────────────────────────────────────────────────
+
+@executor("break_explain_execute")
+async def _exec_break_explain_execute(step, confirmed_params, prior_results, **ctx):
+    """
+    Run test cases for a BreakExplain row through the TransformOperations engine.
+
+    Resolves the row config from llm_build_break_explain_row (either analyse_break_explain
+    or build_break_explain_row step), translates to transform format, then executes.
+    """
+    ensure_api_root_on_path()
+    try:
+        import pandas as pd
+        from transform_operations.transform_operations import TransformOperations
+
+        # Resolve prior build step — analyse takes priority, then build
+        candidates = [
+            step.get("analyse_step_id", "analyse_break_explain"),
+            step.get("build_step_id",   "build_break_explain_row"),
+        ]
+        prior_val: Optional[Dict[str, Any]] = None
+        for sid in candidates:
+            entry = prior_results.get(sid, {})
+            if entry.get("status") == "success":
+                prior_val = entry.get("value")
+                break
+
+        if prior_val is None or not isinstance(prior_val, dict):
+            return "error", (
+                "No successful build step found "
+                f"(checked: {candidates}) — cannot run break_explain_execute"
+            )
+
+        # The LLM result may carry row_dict or flat transform keys
+        row_dict = prior_val.get("row_dict", {})
+        op_type       = prior_val.get("operation_type")  or (row_dict and (
+            row_dict.get("RuleInputFunction") or row_dict.get("ruleinputfunction")
+        ))
+        new_field     = prior_val.get("new_field_name")  or (row_dict and (
+            row_dict.get("NewFieldName") or row_dict.get("newfieldname")
+        ))
+        input_fields  = prior_val.get("input_fields")    or (row_dict and (
+            row_dict.get("RuleInputs") or row_dict.get("ruleinputs")
+        ))
+        op_params     = prior_val.get("operation_params") or {}
+        if not op_params and row_dict:
+            formula_raw = row_dict.get("RuleInputFormula") or row_dict.get("ruleinputformula")
+            op_params   = _parse_rule_input_formula(formula_raw, str(op_type or ""))
+            types_val   = row_dict.get("RuleInputsType") or row_dict.get("ruleinputstype")
+            if types_val:
+                op_params["types"] = str(types_val)
+
+        if not op_type:
+            return "error", "Cannot resolve RuleInputFunction / operation_type from the build step"
+        if not new_field:
+            return "error", "Cannot resolve NewFieldName from the build step"
+        if not input_fields:
+            return "error", "Cannot resolve RuleInputs / input_fields from the build step"
+
+        # Resolve sample data: prior_val > confirmed_params > error
+        sample_data = prior_val.get("sample_data") or []
+        if not sample_data:
+            raw = confirmed_params.get("sample_data", "")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    sample_data = json.loads(raw)
+                except Exception:
+                    pass
+            elif isinstance(raw, list):
+                sample_data = raw
+
+        if not sample_data:
+            return "error", (
+                "No sample data available for break_explain_execute. "
+                "Either supply sample_data or ensure llm_build_break_explain_row generated test rows."
+            )
+
+        operation = {
+            "Operation":    str(op_type).strip(),
+            "NewFieldName": str(new_field).strip(),
+            "Inputs":       str(input_fields).strip(),
+            **({k: v for k, v in op_params.items()} if isinstance(op_params, dict) else {}),
+        }
+
+        ops = TransformOperations()
+        df  = pd.DataFrame(sample_data)
+        result_df = ops.execute_operation(df, operation)
+        result_df = result_df.where(result_df.notna(), other=None)
+        for col in result_df.columns:
+            if result_df[col].dtype.kind in ("M", "m"):
+                result_df[col] = result_df[col].astype(str)
+
+        records = result_df.to_dict(orient="records")
+
+        # Build a pass/fail summary per test row
+        output_col = str(new_field).strip()
+        test_summary = []
+        for i, row in enumerate(records):
+            val = row.get(output_col)
+            test_summary.append({
+                "test_row": i + 1,
+                "output_field": output_col,
+                "output_value": val,
+                "status": "ok" if val is not None else "null_output",
+            })
+
+        return "success", {
+            "operation":      operation,
+            "rows_tested":    len(records),
+            "results":        records,
+            "test_summary":   test_summary,
+            "null_count":     sum(1 for t in test_summary if t["status"] == "null_output"),
+        }
+
+    except Exception as exc:
+        logger.error("break_explain_execute error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executor: append_break_explain_row
+# ─────────────────────────────────────────────────────────────────────────────
+
+@executor("append_break_explain_row")
+async def _exec_append_break_explain_row(step, confirmed_params, prior_results, **ctx):
+    """Append the validated BreakExplain row to the end of the target sheet."""
+    build_step_id     = step.get("build_step_id",     "build_break_explain_row")
+    validator_step_id = step.get("validator_step_id", "break_explain_test")
+
+    build_result = prior_results.get(build_step_id, {})
+    if build_result.get("status") != "success":
+        return "error", f"Build step '{build_step_id}' did not succeed — row not appended"
+
+    validate_result = prior_results.get(validator_step_id, {})
+    if validate_result.get("status") not in ("success", "skipped"):
+        return "error", (
+            f"Validation step '{validator_step_id}' did not succeed — row not appended. "
+            "Fix test failures before writing to the sheet."
+        )
+
+    build_data = build_result.get("value", {})
+    row_dict = (
+        build_data.get("row_dict", {})
+        if isinstance(build_data, dict)
+        else {}
+    )
+    if not row_dict:
+        return "error", f"'{build_step_id}' produced no row_dict"
+
+    locate  = prior_results.get("locate_config_file", {})
+    loc_val = locate.get("value", {}) if locate.get("status") == "success" else {}
+    file_path = (
+        loc_val.get("file_path")
+        or confirmed_params.get("file_path")
+        or confirmed_params.get("config_path")
+        or ""
+    ).strip()
+    sheet_name = (confirmed_params.get("sheet_name") or "BreakExplain").strip()
+
+    if not file_path:
+        return "error", "Cannot resolve file_path for append_break_explain_row"
+
+    try:
+        from openpyxl import load_workbook
+
+        path = secure_path(file_path)
+        wb   = load_workbook(path)
+
+        if sheet_name not in wb.sheetnames:
+            # Create the sheet if it does not exist yet
+            ws = wb.create_sheet(sheet_name)
+            headers = list(row_dict.keys())
+            ws.append(headers)
+        else:
+            ws = wb[sheet_name]
+            headers = [
+                ws.cell(row=1, column=c).value
+                for c in range(1, ws.max_column + 1)
+            ]
+
+        # Build the row in column order, filling blanks for missing keys
+        row_values = [row_dict.get(str(h)) for h in headers]
+        ws.append(row_values)
+        appended_row = ws.max_row
+
+        wb.save(path)
+        return "success", {
+            "written_to":       str(path),
+            "sheet":            sheet_name,
+            "excel_row_number": appended_row,
+            "columns_written":  headers,
+            "row_dict":         row_dict,
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("append_break_explain_row error: %s", exc, exc_info=True)
+        return "error", str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executor: rewrite_break_explain_row  (analyse mode — optionally rewrites the row)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@executor("rewrite_break_explain_row")
+async def _exec_rewrite_break_explain_row(step, confirmed_params, prior_results, **ctx):
+    """Rewrite an existing BreakExplain row with the improved config (analyse mode only)."""
+    from ..utils import truthy
+
+    if not truthy(confirmed_params.get("apply_changes")):
+        return "skipped", "apply_changes is not enabled; workbook was not modified"
+
+    build_step_id     = step.get("build_step_id",     "analyse_break_explain")
+    row_step_id       = step.get("row_step_id",       "read_break_explain_row")
+    validator_step_id = step.get("validator_step_id", "break_explain_test")
+
+    build_result = prior_results.get(build_step_id, {})
+    row_result   = prior_results.get(row_step_id,   {})
+    valid_result = prior_results.get(validator_step_id, {})
+
+    if build_result.get("status") != "success":
+        return "error", f"Build step '{build_step_id}' did not succeed"
+    if row_result.get("status") != "success":
+        return "error", f"Row step '{row_step_id}' did not succeed"
+    if valid_result.get("status") not in ("success", "skipped"):
+        return "skipped", f"Validator step '{validator_step_id}' did not succeed; workbook not modified"
+
+    row_value = row_result.get("value", {})
+    rows      = row_value.get("rows", []) if isinstance(row_value, dict) else []
+    if len(rows) != 1:
+        return "error", f"Expected exactly one row to update, found {len(rows)}"
+
+    build_data = build_result.get("value", {})
+    new_row    = build_data.get("row_dict", {}) if isinstance(build_data, dict) else {}
+    if not new_row:
+        return "error", "Build step produced no row_dict"
+
+    try:
+        from openpyxl import load_workbook
+
+        path = secure_path(
+            row_value.get("file_path")
+            or confirmed_params.get("file_path")
+            or confirmed_params.get("config_path")
+        )
+        sheet_name  = rows[0].get("_sheet") or confirmed_params.get("sheet_name") or "BreakExplain"
+        target_row  = int(rows[0].get("_excel_row_number") or (int(rows[0]["_row_number"]) + 1))
+
+        wb = load_workbook(path)
+        if sheet_name not in wb.sheetnames:
+            return "error", f"Sheet '{sheet_name}' not found in workbook"
+
+        ws      = wb[sheet_name]
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        changed: Dict[str, Dict] = {}
+
+        for col_idx, header in enumerate(headers, start=1):
+            if header is None:
+                continue
+            new_val = new_row.get(str(header))
+            if new_val is None:
+                continue
+            if isinstance(new_val, (dict, list)):
+                new_val = json.dumps(new_val, default=str)
+            old_val = ws.cell(row=target_row, column=col_idx).value
+            if old_val != new_val:
+                ws.cell(row=target_row, column=col_idx).value = new_val
+                changed[str(header)] = {"old": old_val, "new": new_val}
+
+        if not changed:
+            return "skipped", "Improved row matches the workbook row; no changes written"
+
+        wb.save(path)
+        return "success", {
+            "written_to":       str(path),
+            "sheet":            sheet_name,
+            "excel_row_number": target_row,
+            "changed":          changed,
+        }
+    except ValueError as exc:
+        return "error", str(exc)
+    except Exception as exc:
+        logger.error("rewrite_break_explain_row error: %s", exc, exc_info=True)
+        return "error", str(exc)
