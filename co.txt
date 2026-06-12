@@ -1787,6 +1787,59 @@ const DEFAULT_VISIBLE_COLUMNS = {
     success_rate: true,
 };
 
+const DIMENSION_COLUMNS = ['regulation', 'asset_class', 'control_name', 'sub_control_name', 'frequency'];
+const METRIC_COLUMNS = ['expected_runs', 'total_ran', 'on_time', 'breach', 'failed', 'success_rate'];
+
+function buildGroupKey(row, groupByKeys) {
+    return groupByKeys.map((key) => String(row[key] ?? '')).join('\0');
+}
+
+function aggregateGroupRows(groupRows, groupByKeys) {
+    const aggregated = {
+        expected_runs: 0,
+        total_ran: 0,
+        on_time: 0,
+        breach: 0,
+        failed: 0,
+    };
+
+    groupByKeys.forEach((key) => {
+        aggregated[key] = groupRows[0]?.[key] ?? '-';
+    });
+
+    groupRows.forEach((row) => {
+        aggregated.expected_runs += Number(row.expected_runs) || 0;
+        aggregated.total_ran += Number(row.total_ran) || 0;
+        aggregated.on_time += Number(row.on_time) || 0;
+        aggregated.breach += Number(row.breach) || 0;
+        aggregated.failed += Number(row.failed) || 0;
+    });
+
+    aggregated.success_rate = aggregated.total_ran > 0
+        ? Math.round((aggregated.on_time / aggregated.total_ran) * 1000) / 10
+        : 0;
+    aggregated._groupKey = buildGroupKey(aggregated, groupByKeys);
+
+    return aggregated;
+}
+
+function groupRowsByDimensions(rows, groupByKeys) {
+    if (groupByKeys.length === 0) {
+        return [aggregateGroupRows(rows, [])];
+    }
+
+    const groups = new Map();
+    rows.forEach((row) => {
+        const key = buildGroupKey(row, groupByKeys);
+        if (!groups.has(key)) {
+            groups.set(key, []);
+        }
+        groups.get(key).push(row);
+    });
+
+    return Array.from(groups.values()).map((groupRows) => aggregateGroupRows(groupRows, groupByKeys));
+}
+
 export default function MonthlySummaryTable({
     rows = [],
     summary = {},
@@ -1802,10 +1855,16 @@ export default function MonthlySummaryTable({
     const [itemsPerPage, setItemsPerPage] = useState(50);
     const [columnFilters, setColumnFilters] = useState({});
 
+    const isGroupedView = !visibleColumns.control_id;
+    const groupByKeys = useMemo(
+        () => DIMENSION_COLUMNS.filter((key) => visibleColumns[key]),
+        [visibleColumns]
+    );
+
     const filteredRows = useMemo(() => {
         return rows.filter((row) => {
             return Object.entries(columnFilters).every(([key, value]) => {
-                if (!value) return true;
+                if (!value || METRIC_COLUMNS.includes(key)) return true;
                 const cell = row[key];
                 if (cell === null || cell === undefined) return false;
                 return String(cell).toLowerCase().includes(String(value).toLowerCase());
@@ -1813,8 +1872,23 @@ export default function MonthlySummaryTable({
         });
     }, [rows, columnFilters]);
 
+    const displayRows = useMemo(() => {
+        const baseRows = isGroupedView
+            ? groupRowsByDimensions(filteredRows, groupByKeys)
+            : filteredRows;
+
+        return baseRows.filter((row) => {
+            return Object.entries(columnFilters).every(([key, value]) => {
+                if (!value || !METRIC_COLUMNS.includes(key)) return true;
+                const cell = row[key];
+                if (cell === null || cell === undefined) return false;
+                return String(cell).toLowerCase().includes(String(value).toLowerCase());
+            });
+        });
+    }, [filteredRows, isGroupedView, groupByKeys, columnFilters]);
+
     const sortedRows = useMemo(() => {
-        const sorted = [...filteredRows];
+        const sorted = [...displayRows];
         sorted.sort((a, b) => {
             const aVal = a[sortColumn];
             const bVal = b[sortColumn];
@@ -1828,7 +1902,7 @@ export default function MonthlySummaryTable({
             return sortDirection === 'asc' ? compare : -compare;
         });
         return sorted;
-    }, [filteredRows, sortColumn, sortDirection]);
+    }, [displayRows, sortColumn, sortDirection]);
 
     const totalPages = Math.max(1, Math.ceil(sortedRows.length / itemsPerPage));
     const paginatedRows = sortedRows.slice(
@@ -1844,6 +1918,31 @@ export default function MonthlySummaryTable({
             setSortDirection('asc');
         }
     };
+
+    const handleColumnVisibilityChange = (key, checked) => {
+        setVisibleColumns((prev) => {
+            const next = { ...prev, [key]: checked };
+            if (key === 'control_id' && !checked && sortColumn === 'control_id') {
+                const nextVisible = Object.entries(next)
+                    .filter(([, visible]) => visible)
+                    .map(([col]) => col);
+                setSortColumn(nextVisible[0] || 'total_ran');
+            }
+            return next;
+        });
+        setCurrentPage(1);
+    };
+
+    const getRowKey = (row, index) => {
+        if (row.control_id) {
+            return row.control_id;
+        }
+        return row._groupKey || `group-${index}`;
+    };
+
+    const tableTitle = isGroupedView
+        ? `Monthly Control Summary (${sortedRows.length} grouped rows from ${rows.length} controls)`
+        : `Monthly Control Summary (${rows.length} controls)`;
 
     const visibleColumnKeys = Object.entries(visibleColumns)
         .filter(([, visible]) => visible)
@@ -1899,7 +1998,7 @@ export default function MonthlySummaryTable({
             <div className="bg-white rounded-lg shadow-md overflow-hidden">
                 <div className="p-4 border-b border-gray-200 flex items-center justify-between">
                     <h2 className="text-lg font-semibold text-gray-800">
-                        Monthly Control Summary ({rows.length} controls)
+                        {tableTitle}
                     </h2>
                     <div className="flex items-center gap-3">
                         <div className="relative">
@@ -1924,10 +2023,7 @@ export default function MonthlySummaryTable({
                                                         type="checkbox"
                                                         checked={value}
                                                         onChange={(e) => {
-                                                            setVisibleColumns((prev) => ({
-                                                                ...prev,
-                                                                [key]: e.target.checked,
-                                                            }));
+                                                            handleColumnVisibilityChange(key, e.target.checked);
                                                         }}
                                                         className="rounded border-gray-300 text-blue-600 focus:ring-red-600"
                                                     />
@@ -1989,16 +2085,18 @@ export default function MonthlySummaryTable({
                                     <tr className="bg-gray-50 border-t border-gray-200">
                                         {visibleColumnKeys.map((key) => (
                                             <td key={`filter-${key}`} className="px-2 py-2">
-                                                <input
-                                                    type="text"
-                                                    placeholder="Filter..."
-                                                    value={columnFilters[key] || ''}
-                                                    onChange={(e) => {
-                                                        setColumnFilters((prev) => ({ ...prev, [key]: e.target.value }));
-                                                        setCurrentPage(1);
-                                                    }}
-                                                    className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-red-600 bg-white"
-                                                />
+                                                {(!isGroupedView || METRIC_COLUMNS.includes(key) || key === 'control_id') && (
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Filter..."
+                                                        value={columnFilters[key] || ''}
+                                                        onChange={(e) => {
+                                                            setColumnFilters((prev) => ({ ...prev, [key]: e.target.value }));
+                                                            setCurrentPage(1);
+                                                        }}
+                                                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-red-600 bg-white"
+                                                    />
+                                                )}
                                             </td>
                                         ))}
                                     </tr>
@@ -2014,10 +2112,10 @@ export default function MonthlySummaryTable({
                                             </td>
                                         </tr>
                                     ) : (
-                                        paginatedRows.map((row) => (
-                                            <tr key={row.control_id} className="hover:bg-gray-50">
+                                        paginatedRows.map((row, index) => (
+                                            <tr key={getRowKey(row, index)} className="hover:bg-gray-50">
                                                 {visibleColumnKeys.map((key) => (
-                                                    <td key={`${row.control_id}-${key}`} className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                    <td key={`${getRowKey(row, index)}-${key}`} className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
                                                         {key === 'success_rate'
                                                             ? `${row[key] ?? 0}%`
                                                             : (row[key] ?? '-')}
@@ -2062,6 +2160,7 @@ export default function MonthlySummaryTable({
         </>
     );
 }
+
 #######Controls.py
 """
 Control Tasks Router (Old API)
