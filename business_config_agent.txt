@@ -43,3 +43,10 @@ router.include_router(chat.router)
 def initialize() -> None:
     """Create input/output roots if missing."""
     ensure_roots_exist()
+    {
+      title: 'Agentic Config Flow',
+      description: 'Agentic AI assistant for config inspection, data profiling, transform validation, and report generation — with live tool-call progress and sandbox artifacts.',
+      icon: FaProjectDiagram,
+      accessKey: 'business-config-agent',
+      onClick: openBusinessConfigAgent
+    },
