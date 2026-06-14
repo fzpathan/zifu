@@ -1,0 +1,235 @@
+"""POST /api/bca/chat — the main SSE endpoint.
+
+The endpoint is non-streaming at the LLM layer: the LLM call returns one
+final response per turn. Tool calls and the final assistant message are
+forwarded as SSE events so the client still gets live progress.
+"""
+
+from __future__ import annotations
+import asyncio
+from pathlib import Path
+from typing import AsyncGenerator
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.agent.agent import Agent
+from ai_coding_agent.agent.events import AgentEventType
+from ai_coding_agent.config.config import ApprovalPolicy, Config, ModelConfig
+from ai_coding_agent.server.deps import (
+    get_conversation_store,
+    get_default_config,
+    get_registry,
+)
+from ai_coding_agent.server.schemas import ChatMessage, ChatRequest
+from ai_coding_agent.server.streaming import sse_generator
+from ai_coding_agent.utils.env import (
+    get_default_model,
+    get_default_user,
+    get_input_folders,
+    get_input_root,
+    get_user_sandbox_dir,
+    invalidate_artifact_cache,
+)
+
+router = APIRouter(prefix=API_PREFIX, tags=["chat"])
+
+
+@router.post("/chat")
+async def chat(req: ChatRequest) -> StreamingResponse:
+    store = get_conversation_store()
+
+    # Single-tenant: ignore the client-supplied user_id and always use
+    # the demo-user workspace. Keeps the localStorage value out of the
+    # path; nothing the client sends can change the user namespace.
+    user_id = get_default_user()
+
+    # Resolve sandbox
+    try:
+        sandbox_dir = get_user_sandbox_dir(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Resolve read paths from active_input_folder. If none is supplied we
+    # default to the entire input root so the assistant always has a
+    # read_paths scope to work with.
+    read_paths: list[Path] = []
+    if req.active_input_folder:
+        if req.active_input_folder not in get_input_folders():
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown input folder {req.active_input_folder!r}",
+            )
+        read_paths.append((get_input_root() / req.active_input_folder).resolve())
+    else:
+        try:
+            read_paths.append(get_input_root())
+        except RuntimeError:
+            pass
+
+    # Persist / load conversation. The frontend generates its own chat ids
+    # locally (chat-<ts>-<rand>), so an unknown id means a brand-new chat —
+    # register it under that id rather than rejecting the request.
+    if req.conversation_id:
+        conv = await store.get(req.conversation_id, user_id)
+        if not conv:
+            try:
+                conv = await store.create(user_id, conversation_id=req.conversation_id)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+    else:
+        conv = await store.create(user_id)
+        req = req.model_copy(update={"conversation_id": conv.id})
+
+    # Default the model to the server-side default if the client didn't pick one.
+    model_name = (req.model or get_default_model()).strip() or get_default_model()
+
+    # Build Config for this request
+    cfg = Config(
+        model=ModelConfig(
+            name=model_name,
+            temperature=req.temperature,
+            context_window=get_default_config().model.context_window,
+        ),
+        cwd=sandbox_dir,
+        sandbox_dir=sandbox_dir,
+        read_paths=read_paths,
+        approval=ApprovalPolicy.AUTO,
+        max_turns=30,
+    )
+
+    # Compose the user message (attach files as inline notes)
+    last = req.messages[-1] if req.messages else None
+    if last is None or last.role != "user":
+        raise HTTPException(status_code=400, detail="last message must be from user")
+    user_text = last.content
+    if req.attached_paths:
+        attached_block = "\n\n".join(
+            f"<attached-file path=\"{p}\">referenced input file</attached-file>"
+            for p in req.attached_paths
+        )
+        user_text = f"{user_text}\n\n{attached_block}" if user_text else attached_block
+
+    async def event_source() -> AsyncGenerator[dict, None]:
+        # Persist the user message
+        await store.append_message(conv.id, user_id, last)
+        yield {
+            "type": "agent_start",
+            "conversation_id": conv.id,
+            "message": user_text,
+        }
+
+        final_text: str | None = None
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        try:
+            async with Agent(cfg) as agent:
+                async for event in agent.run(user_text):
+                    etype = event.type
+                    data = event.data or {}
+                    if etype == AgentEventType.TEXT_DELTA:
+                        # Non-streaming; aggregate silently.
+                        continue
+                    if etype == AgentEventType.TEXT_COMPLETE:
+                        content = data.get("content", "") or ""
+                        final_text = (final_text or "") + content
+                        yield {"type": "message", "role": "assistant", "content": content}
+                        continue
+                    if etype == AgentEventType.TOOL_CALL_START:
+                        yield {
+                            "type": "tool_call_start",
+                            "name": data.get("name"),
+                            "call_id": data.get("call_id"),
+                            "arguments": data.get("arguments", {}),
+                            "tool_label": _tool_label(data.get("name"), data.get("arguments", {})),
+                        }
+                        continue
+                    if etype == AgentEventType.TOOL_CALL_COMPLETE:
+                        success = data.get("success", False)
+                        output = data.get("output", "")
+                        tool_name = data.get("name") or ""
+                        # Invalidate the cached artifact list whenever a write
+                        # tool finishes — the next /api/bca/artifacts call will
+                        # walk the sandbox fresh.
+                        if success and tool_name in {"write_file", "generate_report", "subagent_report_writer"}:
+                            invalidate_artifact_cache(user_id)
+                        if isinstance(output, str) and len(output) > 4000:
+                            output = output[:4000] + "...[truncated]"
+                        yield {
+                            "type": "tool_call_complete",
+                            "name": data.get("name"),
+                            "call_id": data.get("call_id"),
+                            "success": success,
+                            "output": output,
+                            "error": data.get("error"),
+                        }
+                        continue
+                    if etype == AgentEventType.AGENT_ERROR:
+                        yield {"type": "error", "error": data.get("error", "Unknown error")}
+                        continue
+                    if etype == AgentEventType.AGENT_END:
+                        usage = data.get("usage") or {}
+                        if usage:
+                            usage_total["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                            usage_total["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                            usage_total["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+        except Exception as e:  # noqa: BLE001
+            yield {"type": "error", "error": f"server error: {e}"}
+
+        # Persist assistant message
+        if final_text:
+            await store.append_message(
+                conv.id,
+                user_id,
+                ChatMessage(role="assistant", content=final_text),
+            )
+
+        yield {
+            "type": "agent_end",
+            "conversation_id": conv.id,
+            "usage": usage_total,
+        }
+
+    return StreamingResponse(
+        sse_generator(event_source()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _tool_label(name: str | None, arguments: dict) -> str:
+    if not name:
+        return ""
+    if name == "subagent_input_inspector":
+        return "Inspecting input files…"
+    if name == "subagent_data_profiler":
+        return "Profiling data…"
+    if name == "subagent_anomaly_hunter":
+        return "Hunting anomalies…"
+    if name == "subagent_report_writer":
+        return "Writing report…"
+    if name == "subagent_conversation_summariser":
+        return "Summarising conversation…"
+    if name == "read_file":
+        return f"Reading {arguments.get('path', '…')}"
+    if name == "list_dir":
+        return f"Listing {arguments.get('path', '.')}"
+    if name == "grep":
+        return f"Searching for {arguments.get('pattern', '')!r}"
+    if name == "glob":
+        return f"Globbing {arguments.get('pattern', '')!r}"
+    if name == "inspect_input":
+        return f"Inspecting {arguments.get('path', '…')}"
+    if name == "profile_data":
+        return f"Profiling {arguments.get('path', '…')}"
+    if name == "generate_report":
+        return f"Writing report: {arguments.get('title', '…')}"
+    if name == "write_file":
+        return f"Writing {arguments.get('path', '…')}"
+    if name == "think":
+        return "Thinking…"
+    if name == "todos":
+        return "Updating task list…"
+    if name == "memory":
+        return f"Memory: {arguments.get('action', '…')}"
+    return f"Running tool: {name}"

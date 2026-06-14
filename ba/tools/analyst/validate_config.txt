@@ -1,0 +1,240 @@
+"""``validate_config`` analyst tool.
+
+Validates a ControlDash QA/COMP Excel config workbook and reports errors
+grouped by sheet. Read-only; operates inside the sandbox model.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.analyst._common import (
+    AnalystDependencyError,
+    AnalystError,
+    excel_sheet_names,
+    ensure_readable,
+    is_excel,
+    read_xlsx_sheet,
+    read_xlsx_workbook,
+)
+from ai_coding_agent.tools.analyst._etl import (
+    CONFIG_SHEETS,
+    OPERATION_NAMES,
+    REQUIRED_SHEETS,
+    TRANSFORM_OPERATIONS,
+    normalise_control_type,
+    parse_params,
+    resolve_column,
+    split_inputs,
+)
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class ValidateConfigParams(BaseModel):
+    path: str = Field(
+        ...,
+        description="Path to the ControlDash Excel config workbook (.xlsx/.xls) to validate.",
+    )
+    control_type: str = Field(
+        ...,
+        description="Control type the config is for: 'QA' (Quality Assurance) or 'COMP' (Completeness).",
+    )
+
+
+class ValidateConfigTool(Tool):
+    name = "validate_config"
+    description = (
+        "Validate a ControlDash QA/COMP Excel config workbook and report errors grouped by sheet. "
+        "Checks that the required sheets exist, that FieldOperations rows name an output field and a "
+        "recognized transform operation, that operation-params JSON is well-formed, and that each "
+        "operation has the inputs/params it needs. Read-only; produces a PASS/FAIL report."
+    )
+    kind = ToolKind.READ
+    schema = ValidateConfigParams
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        # Blocking workbook read/parse — run off the event loop so concurrent
+        # tool calls (asyncio.gather) and the SSE stream are not serialised.
+        return await asyncio.to_thread(self._run, invocation)
+
+    def _run(self, invocation: ToolInvocation) -> ToolResult:
+        params = ValidateConfigParams(**invocation.params)
+        control_type = normalise_control_type(params.control_type)
+        if control_type is None:
+            return ToolResult.error_result(
+                f"Unknown control_type '{params.control_type}'. Use 'QA' or 'COMP'."
+            )
+
+        target = Path(params.path)
+        if not target.is_absolute():
+            target = (invocation.cwd / target).resolve()
+        read_paths = list(self.config.read_paths or [])
+        try:
+            ensure_readable(target, read_paths)
+        except AnalystError as e:
+            return ToolResult.error_result(str(e))
+        if not is_excel(target):
+            return ToolResult.error_result(
+                f"validate_config expects an Excel workbook (.xlsx/.xls); got '{target.suffix}'."
+            )
+
+        try:
+            sheets = excel_sheet_names(target)
+        except AnalystDependencyError as e:
+            return ToolResult.error_result(str(e))
+        except Exception as e:
+            return ToolResult.error_result(f"Could not open workbook: {e}")
+
+        # Open the workbook once and cache every sheet we need.
+        try:
+            workbook = read_xlsx_workbook(target)
+        except Exception as e:
+            return ToolResult.error_result(f"Could not read workbook: {e}")
+
+        # Group findings by sheet (plus a 'workbook' bucket for global checks).
+        errors: dict[str, list[str]] = {}
+        warnings: dict[str, list[str]] = {}
+
+        def add_error(sheet: str, msg: str) -> None:
+            errors.setdefault(sheet, []).append(msg)
+
+        def add_warning(sheet: str, msg: str) -> None:
+            warnings.setdefault(sheet, []).append(msg)
+
+        sheet_lookup = {s.strip().lower(): s for s in sheets}
+
+        # 1. Required sheets present for this control type.
+        for required in REQUIRED_SHEETS[control_type]:
+            if required.lower() not in sheet_lookup:
+                add_error("workbook", f"Missing required sheet '{required}' for {control_type} configs.")
+
+        # 2. Unknown sheets (informational warning only).
+        for s in sheets:
+            if s.strip().lower() not in {k.lower() for k in CONFIG_SHEETS}:
+                add_warning("workbook", f"Sheet '{s}' is not a recognized ControlDash config sheet.")
+
+        # 3. FieldOperations row-level validation.
+        fo_name = sheet_lookup.get("fieldoperations")
+        fo_row_count = 0
+        if fo_name:
+            try:
+                cols, rows = workbook.get(fo_name, ([], []))
+            except Exception as e:
+                add_error(fo_name, f"Could not read sheet: {e}")
+                cols, rows = None, None
+            if cols is not None:
+                fo_row_count = len(rows)
+                c_name = resolve_column(cols, "new_field")
+                c_op = resolve_column(cols, "operation")
+                c_inputs = resolve_column(cols, "inputs")
+                c_params = resolve_column(cols, "params")
+
+                idx_name = cols.index(c_name) if c_name else None
+                idx_op = cols.index(c_op) if c_op else None
+                idx_inputs = cols.index(c_inputs) if c_inputs else None
+                idx_params = cols.index(c_params) if c_params else None
+
+                def cell(row: list, i: int | None):
+                    if i is None or i >= len(row):
+                        return None
+                    return row[i]
+
+                if c_name is None:
+                    add_error(fo_name, "No output-field column found (expected NewFieldName/OutputField).")
+                if c_op is None:
+                    add_error(fo_name, "No operation column found (expected OperationType/Operation).")
+
+                if c_name is not None and c_op is not None:
+                    for ri, row in enumerate(rows):
+                        excel_row = ri + 2  # +1 header, +1 to 1-base
+                        new_field = cell(row, idx_name)
+                        op_raw = cell(row, idx_op)
+                        op = str(op_raw).strip() if op_raw is not None else ""
+
+                        nf = str(new_field).strip() if new_field is not None else ""
+                        if not nf or nf.lower() == "nan":
+                            add_error(fo_name, f"Row {excel_row}: missing output field name.")
+                        if not op or op.lower() == "nan":
+                            add_error(fo_name, f"Row {excel_row}: missing operation type.")
+                            continue
+
+                        canonical = next((o for o in OPERATION_NAMES if o.lower() == op.lower()), None)
+                        if canonical is None:
+                            add_error(
+                                fo_name,
+                                f"Row {excel_row}: unknown operation '{op}'. "
+                                f"Expected one of: {', '.join(OPERATION_NAMES)}.",
+                            )
+                            continue
+
+                        spec = TRANSFORM_OPERATIONS[canonical]
+                        inputs = split_inputs(cell(row, idx_inputs)) if idx_inputs is not None else []
+                        if len(inputs) < spec["min_inputs"]:
+                            add_error(
+                                fo_name,
+                                f"Row {excel_row} ({nf or canonical}): {canonical} needs at least "
+                                f"{spec['min_inputs']} input field(s), found {len(inputs)}.",
+                            )
+
+                        raw_params = cell(row, idx_params) if idx_params is not None else None
+                        parsed, perr = parse_params(raw_params)
+                        if perr:
+                            add_error(fo_name, f"Row {excel_row} ({nf or canonical}): {perr}.")
+                        elif parsed is not None:
+                            missing = [k for k in spec["params"] if k not in parsed]
+                            if missing:
+                                add_warning(
+                                    fo_name,
+                                    f"Row {excel_row} ({nf or canonical}): {canonical} usually needs "
+                                    f"param(s) {missing}.",
+                                )
+
+        # 4. InputFiles sanity (must have at least one declared input).
+        if_name = sheet_lookup.get("inputfiles")
+        if if_name:
+            try:
+                _icols, irows = workbook.get(if_name, ([], []))
+                if len(irows) == 0:
+                    add_error(if_name, "InputFiles sheet has no rows; at least one input file must be declared.")
+            except Exception as e:
+                add_error(if_name, f"Could not read sheet: {e}")
+
+        total_errors = sum(len(v) for v in errors.values())
+        total_warnings = sum(len(v) for v in warnings.values())
+        verdict = "PASS" if total_errors == 0 else "FAIL"
+
+        lines = [
+            f"Config validation — {target.name} ({control_type})",
+            f"Verdict: {verdict}  |  errors: {total_errors}  warnings: {total_warnings}",
+            f"Sheets ({len(sheets)}): {', '.join(sheets)}",
+            f"FieldOperations rows: {fo_row_count}",
+        ]
+        if total_errors:
+            lines.append("\nErrors by sheet:")
+            for sheet, msgs in errors.items():
+                lines.append(f"  [{sheet}]")
+                for m in msgs:
+                    lines.append(f"    - {m}")
+        if total_warnings:
+            lines.append("\nWarnings by sheet:")
+            for sheet, msgs in warnings.items():
+                lines.append(f"  [{sheet}]")
+                for m in msgs:
+                    lines.append(f"    - {m}")
+        if not total_errors and not total_warnings:
+            lines.append("\nAll checked sheets are clean.")
+
+        return ToolResult.success_result(
+            "\n".join(lines),
+            metadata={
+                "path": str(target),
+                "control_type": control_type,
+                "verdict": verdict,
+                "error_count": total_errors,
+                "warning_count": total_warnings,
+                "sheets": sheets,
+            },
+        )

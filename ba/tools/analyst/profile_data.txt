@@ -1,0 +1,124 @@
+"""``profile_data`` analyst tool.
+
+Computes per-column statistics and flags for a tabular input. Read-only.
+"""
+
+from __future__ import annotations
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.analyst._common import (
+    AnalystError,
+    MAX_PROFILE_ROWS,
+    column_summary,
+    detect_format,
+    ensure_readable,
+    read_csv,
+    read_xlsx,
+)
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class ProfileDataParams(BaseModel):
+    path: str = Field(..., description="Path to the input file (csv or xlsx).")
+    columns: list[str] | None = Field(
+        default=None,
+        description="Optional list of column names to focus on; defaults to all columns.",
+    )
+    sample_size: int = Field(
+        MAX_PROFILE_ROWS,
+        ge=1,
+        le=MAX_PROFILE_ROWS,
+        description="Maximum rows to read for the profile.",
+    )
+
+
+class ProfileDataTool(Tool):
+    name = "profile_data"
+    description = (
+        "Compute a deep statistical profile of a tabular input (CSV or XLSX): per-column "
+        "nulls, unique counts, min/max/mean/median/std, top values, type inference, and "
+        "anomaly flags (high_nulls, constant_column, suspicious_outliers). Read-only."
+    )
+    kind = ToolKind.READ
+    schema = ProfileDataParams
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        # Blocking file read/parse — run off the event loop so concurrent
+        # tool calls (asyncio.gather) and the SSE stream are not serialised.
+        return await asyncio.to_thread(self._run, invocation)
+
+    def _run(self, invocation: ToolInvocation) -> ToolResult:
+        try:
+            params = ProfileDataParams(**invocation.params)
+            read_paths = list(self.config.read_paths or [])
+
+            target = Path(params.path)
+            if not target.is_absolute():
+                target = (invocation.cwd / target).resolve()
+            ensure_readable(target, read_paths)
+
+            fmt = detect_format(target)
+            if fmt not in {"csv", "xlsx"}:
+                return ToolResult.error_result(
+                    f"profile_data only supports csv/xlsx; got {fmt!r}. Use inspect_input for other formats."
+                )
+
+            if fmt == "csv":
+                headers, rows = read_csv(target, max_rows=params.sample_size)
+            else:
+                headers, rows = read_xlsx(target, max_rows=params.sample_size)
+
+            # Filter columns if requested
+            if params.columns:
+                col_indexes = []
+                missing = []
+                for c in params.columns:
+                    if c in headers:
+                        col_indexes.append(headers.index(c))
+                    else:
+                        missing.append(c)
+                if missing:
+                    return ToolResult.error_result(
+                        f"column(s) not found: {', '.join(missing)}"
+                    )
+            else:
+                col_indexes = list(range(len(headers)))
+
+            columns_out: list[dict[str, Any]] = []
+            for idx in col_indexes:
+                columns_out.append(column_summary(headers, rows, idx))
+
+            global_flags: list[str] = []
+            high_null_cols = [c["name"] for c in columns_out if "high_nulls" in c["flags"]]
+            if high_null_cols:
+                global_flags.append(f"high_nulls: {', '.join(high_null_cols)}")
+            constant_cols = [c["name"] for c in columns_out if "constant_column" in c["flags"]]
+            if constant_cols:
+                global_flags.append(f"constant_column: {', '.join(constant_cols)}")
+            outlier_cols = [c["name"] for c in columns_out if "suspicious_outliers" in c["flags"]]
+            if outlier_cols:
+                global_flags.append(f"suspicious_outliers: {', '.join(outlier_cols)}")
+
+            result = {
+                "file": str(target),
+                "row_count": len(rows),
+                "columns": columns_out,
+                "global_flags": global_flags,
+            }
+
+            return ToolResult.success_result(
+                json.dumps(result, indent=2, default=str),
+                metadata={
+                    "path": str(target),
+                    "row_count": len(rows),
+                    "columns": len(columns_out),
+                },
+            )
+        except AnalystError as e:
+            return ToolResult.error_result(str(e))
+        except Exception as e:
+            return ToolResult.error_result(f"profile_data failed: {e}")

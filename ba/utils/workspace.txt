@@ -1,0 +1,83 @@
+"""Sandbox helpers used by every file-touching tool and the analyst tools.
+
+The Business-Analyst assistant only operates on:
+
+* ``Config.read_paths`` — server-controlled input folders the LLM can read.
+* ``Config.sandbox_dir`` — per-user output folder; the only place writes are allowed.
+
+These helpers enforce that boundary; they are intentionally simple so they can
+be reasoned about without surprises. Defense-in-depth approval still lives in
+``safety/approval.py``.
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from typing import Iterable
+
+
+def is_readable(path: Path, read_paths: Iterable[Path]) -> bool:
+    """True if ``path`` resolves to a location inside one of ``read_paths``.
+
+    Symlinks are resolved before the check. Absolute paths outside the
+    read roots return False; relative paths must resolve under a root.
+    """
+    if not read_paths:
+        return False
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    for root in read_paths:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def resolve_write(path_str: str, sandbox_dir: Path) -> Path:
+    """Resolve a write target inside ``sandbox_dir`` and refuse escapes.
+
+    Relative paths are joined onto ``sandbox_dir``. Absolute paths are
+    accepted only if they already live under ``sandbox_dir`` after
+    resolution. ``..`` segments are rejected outright so a caller cannot
+    trick the resolver into escaping.
+    """
+    if path_str is None or path_str == "":
+        raise ValueError("destination path is required")
+
+    if ".." in Path(path_str).parts:
+        raise ValueError(f"path traversal is not allowed: {path_str!r}")
+
+    sandbox = sandbox_dir.resolve()
+
+    candidate = Path(path_str)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (sandbox / candidate).resolve()
+
+    try:
+        resolved.relative_to(sandbox)
+    except ValueError as exc:
+        raise ValueError(
+            f"path {path_str!r} escapes the sandbox {str(sandbox)!r}"
+        ) from exc
+
+    return resolved
+
+
+def list_readable_files(
+    root: Path, read_paths: Iterable[Path], pattern: str | None = None
+) -> list[Path]:
+    """Return a sorted list of files under ``root`` that are inside read_paths."""
+    if not is_readable(root, read_paths):
+        return []
+    if not root.exists() or not root.is_dir():
+        return []
+    if pattern:
+        matches = list(root.glob(pattern))
+    else:
+        matches = list(root.iterdir())
+    return [p for p in matches if p.is_file() or p.is_dir()]

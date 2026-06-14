@@ -1,0 +1,19 @@
+"""GET /api/bca/input-folders — list server-controlled input folders."""
+
+from __future__ import annotations
+from fastapi import APIRouter
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.server.schemas import InputFolder
+from ai_coding_agent.utils.env import get_input_folders, get_input_root
+
+router = APIRouter(prefix=API_PREFIX, tags=["inputs"])
+
+
+@router.get("/input-folders", response_model=list[InputFolder])
+async def input_folders() -> list[InputFolder]:
+    root = get_input_root()
+    return [
+        InputFolder(name=name, path=str(root / name))
+        for name in get_input_folders()
+    ]

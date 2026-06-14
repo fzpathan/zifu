@@ -1,0 +1,387 @@
+import asyncio
+from typing import Any
+from ai_coding_agent.config.config import Config
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolResult
+from dataclasses import dataclass
+from pydantic import BaseModel, Field
+
+
+class SubagentParams(BaseModel):
+    goal: str = Field(
+        ..., description="The specific task or goal for the sub-agent to accomplish"
+    )
+
+
+@dataclass
+class SubagentDefinition:
+    name: str
+    description: str
+    goal_prompt: str
+    allowed_tools: list[str] | None = None
+    max_turns: int = 20
+    timeout_seconds: float = 600
+
+
+class SubagentTool(Tool):
+    def __init__(self, config: Config, definition: SubagentDefinition, *, mutating: bool = True):
+        super().__init__(config)
+        self.definition = definition
+        self._mutating = mutating
+
+    @property
+    def name(self) -> str:
+        return f"subagent_{self.definition.name}"
+
+    @property
+    def description(self) -> str:
+        return f"subagent_{self.definition.description}"
+
+    schema = SubagentParams
+
+    def is_mutating(self, params: dict[str, Any]) -> bool:
+        return self._mutating
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        from ai_coding_agent.agent.agent import Agent
+        from ai_coding_agent.agent.events import AgentEventType
+
+        params = SubagentParams(**invocation.params)
+        if not params.goal:
+            return ToolResult.error_result("No goal specified for sub-agent")
+
+        config_dict = self.config.to_dict()
+        config_dict["max_turns"] = self.definition.max_turns
+        if self.definition.allowed_tools:
+            config_dict["allowed_tools"] = self.definition.allowed_tools
+
+        subagent_config = Config(**config_dict)
+
+        prompt = f"""You are a specialized sub-agent with a single, narrow task to complete.
+
+{self.definition.goal_prompt}
+
+YOUR TASK:
+{params.goal}
+
+IMPORTANT:
+- Focus only on completing the specified task.
+- Do not engage in unrelated actions.
+- Stay within the configured tool set; do not call tools that are not listed.
+- When you have the answer, return a single ```json fenced block that matches the output contract, followed by one short prose paragraph.
+- Be concise and direct.
+"""
+
+        tool_calls: list[str] = []
+        final_response: str | None = None
+        error: str | None = None
+        terminate_response = "goal"
+
+        try:
+            async with Agent(subagent_config) as agent:
+                deadline = (
+                    asyncio.get_running_loop().time() + self.definition.timeout_seconds
+                )
+
+                async for event in agent.run(prompt):
+                    if asyncio.get_running_loop().time() > deadline:
+                        terminate_response = "timeout"
+                        final_response = "Sub-agent timed out"
+                        break
+
+                    if event.type == AgentEventType.TOOL_CALL_START:
+                        tool_calls.append(event.data.get("name"))
+                    elif event.type == AgentEventType.TEXT_COMPLETE:
+                        final_response = event.data.get("content")
+                    elif event.type == AgentEventType.AGENT_END:
+                        if final_response is None:
+                            final_response = event.data.get("response")
+                    elif event.type == AgentEventType.AGENT_ERROR:
+                        terminate_response = "error"
+                        error = event.data.get("error", "Unknown")
+                        final_response = f"Sub-agent error: {error}"
+                        break
+        except Exception as e:
+            terminate_response = "error"
+            error = str(e)
+            final_response = f"Sub-agent failed: {e}"
+
+        result = f"""Sub-agent '{self.definition.name}' completed.
+Termination: {terminate_response}
+Tools called: {', '.join(tool_calls) if tool_calls else 'None'}
+
+Result:
+{final_response or 'No response'}
+"""
+
+        if error:
+            return ToolResult.error_result(result)
+
+        return ToolResult.success_result(result)
+
+
+# ── Built-in BA sub-agents ────────────────────────────────────────────────────
+
+CONFIG_INSPECTOR = SubagentDefinition(
+    name="config_inspector",
+    description=(
+        "Find ControlDash QA/COMP config workbooks in the input folders and catalog "
+        "their sheets and structure (InputFiles, rules, Enrichment, FieldOperations, "
+        "OutputRule) plus any obvious structural issues."
+    ),
+    goal_prompt=(
+        "You are the ControlDash config-inspector. Your single mission is to locate "
+        "QA/COMP config workbook(s) and catalog their sheets and structure as a JSON "
+        "object.\n\n"
+        "EXPECTED INPUTS: a folder or a list of workbook paths (relative to the active input folder).\n"
+        "EXPECTED OUTPUT: a single ```json fenced block with the contract below, "
+        "followed by one short prose paragraph (2-4 sentences) summarising what was found.\n\n"
+        "OUTPUT CONTRACT (return as JSON):\n"
+        "{\n"
+        '  "workbooks": [\n'
+        "    {\n"
+        '      "file": "<filename>",\n'
+        '      "likely_control_type": "QA|COMP|unknown",\n'
+        '      "sheets": ["<sheet name>", ...],\n'
+        '      "recognized_sheets": ["InputFiles", "rules", "Enrichment", "FieldOperations", "OutputRule"],\n'
+        '      "unknown_sheets": ["<sheet name>", ...],\n'
+        '      "field_operations_rows": <int|null>,\n'
+        '      "issues": ["<string>", ...]\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "NEGATIVE BEHAVIOURS:\n"
+        "- Do not call other sub-agents.\n"
+        "- Do not modify any files; inspection is read-only.\n"
+        "- Do not validate or run transforms; just catalog structure.\n"
+        "- Do not invent sheets or columns; if a workbook cannot be read, put it in `issues`.\n\n"
+        "STYLE: cite file and sheet names verbatim; one paragraph per workbook if helpful."
+    ),
+    allowed_tools=["read_file", "grep", "glob", "list_dir", "inspect_input"],
+    max_turns=12,
+    timeout_seconds=180,
+)
+
+
+VALIDATION_ANALYST = SubagentDefinition(
+    name="validation_analyst",
+    description=(
+        "Validate a ControlDash QA or COMP config workbook with validate_config and "
+        "report a PASS/FAIL verdict, errors grouped by sheet, and suggested fixes."
+    ),
+    goal_prompt=(
+        "You are the ControlDash validation-analyst. Your single mission is to validate "
+        "a config workbook for a given control type and report the result as a JSON "
+        "object.\n\n"
+        "EXPECTED INPUTS: a workbook path and a control_type ('QA' or 'COMP'). If the "
+        "control type is not given, inspect the workbook and infer it, then state your assumption.\n"
+        "EXPECTED OUTPUT: a single ```json fenced block with the contract below, "
+        "followed by a short prose paragraph summarising the verdict and the most important fixes.\n\n"
+        "OUTPUT CONTRACT (return as JSON):\n"
+        "{\n"
+        '  "file": "<filename>",\n'
+        '  "control_type": "QA|COMP",\n'
+        '  "verdict": "PASS|FAIL",\n'
+        '  "error_count": <int>,\n'
+        '  "warning_count": <int>,\n'
+        '  "errors_by_sheet": {"<sheet>": ["<error>", ...]},\n'
+        '  "warnings_by_sheet": {"<sheet>": ["<warning>", ...]},\n'
+        '  "suggested_fixes": ["<actionable fix>", ...]\n'
+        "}\n\n"
+        "NEGATIVE BEHAVIOURS:\n"
+        "- Do not call other sub-agents.\n"
+        "- Do not modify any files; do not write to the sandbox.\n"
+        "- Do not invent errors; report only what validate_config returns.\n\n"
+        "STYLE: lead with the verdict; group fixes by sheet; cite sheet names verbatim."
+    ),
+    allowed_tools=["read_file", "list_dir", "glob", "inspect_input", "validate_config"],
+    max_turns=15,
+    timeout_seconds=240,
+)
+
+
+TRANSFORM_ANALYST = SubagentDefinition(
+    name="transform_analyst",
+    description=(
+        "Analyze and explain the FieldOperations transforms in a ControlDash config "
+        "workbook via analyze_transforms, and flag rows with missing inputs or params."
+    ),
+    goal_prompt=(
+        "You are the ControlDash transform-analyst. Your single mission is to read and "
+        "explain the FieldOperations transforms in a config workbook and report them as a "
+        "JSON object.\n\n"
+        "EXPECTED INPUTS: a workbook path; optionally a single field_name or row_number to focus on.\n"
+        "EXPECTED OUTPUT: a single ```json fenced block with the contract below, "
+        "followed by a short prose paragraph summarising what the transforms do and which rows are flagged.\n\n"
+        "OUTPUT CONTRACT (return as JSON):\n"
+        "{\n"
+        '  "file": "<filename>",\n'
+        '  "sheet": "FieldOperations",\n'
+        '  "transforms": [\n'
+        "    {\n"
+        '      "row": <int>,\n'
+        '      "output_field": "<NewFieldName>",\n'
+        '      "operation": "DateExtract|Concatenate|Formula|Conditional|MapValues|StringOperation|'
+        'NumericOperation|SetValue|CopyField|Split|Replace|unknown",\n'
+        '      "inputs": ["<field>", ...],\n'
+        '      "params": {"<key>": "<value>"},\n'
+        '      "explanation": "<plain-English description>",\n'
+        '      "issues": ["<missing input/param or unknown operation>", ...]\n'
+        "    }\n"
+        "  ],\n"
+        '  "flagged_count": <int>\n'
+        "}\n\n"
+        "NEGATIVE BEHAVIOURS:\n"
+        "- Do not call other sub-agents.\n"
+        "- Do not modify any files; do not write to the sandbox.\n"
+        "- Do not invent operations or params; report only what the workbook contains.\n\n"
+        "STYLE: one entry per transform row; explain each operation in plain English; flag issues explicitly."
+    ),
+    allowed_tools=[
+        "read_file", "list_dir", "inspect_input", "analyze_transforms", "validate_config",
+    ],
+    max_turns=15,
+    timeout_seconds=240,
+)
+
+
+COMPLETENESS_RECONCILER = SubagentDefinition(
+    name="completeness_reconciler",
+    description=(
+        "For COMP controls, reconcile input vs output completeness — surface missing "
+        "keys, duplicate keys, and coverage gaps using inspect_input, profile_data, and "
+        "validate_config."
+    ),
+    goal_prompt=(
+        "You are the ControlDash completeness-reconciler. Your single mission is to assess "
+        "input-vs-output completeness for a COMP control and report gaps as a JSON object.\n\n"
+        "EXPECTED INPUTS: a COMP config workbook path and/or the input and output data files "
+        "it references (declared in InputFiles / OutputRule).\n"
+        "EXPECTED OUTPUT: a single ```json fenced block with the contract below, "
+        "followed by a short prose paragraph summarising the completeness verdict and the biggest gaps.\n\n"
+        "OUTPUT CONTRACT (return as JSON):\n"
+        "{\n"
+        '  "control_type": "COMP",\n'
+        '  "input_files": ["<filename>", ...],\n'
+        '  "output_files": ["<filename>", ...],\n'
+        '  "key_columns": ["<column>", ...],\n'
+        '  "input_row_count": <int|null>,\n'
+        '  "output_row_count": <int|null>,\n'
+        '  "missing_keys": <int|null>,\n'
+        '  "duplicate_keys": <int|null>,\n'
+        '  "gaps": [\n'
+        '    {"severity": "low|medium|high", "where": "<file>:<column_or_keys>", "description": "<finding>", "evidence": "<numbers/examples>"}\n'
+        "  ],\n"
+        '  "verdict": "complete|incomplete|inconclusive"\n'
+        "}\n\n"
+        "NEGATIVE BEHAVIOURS:\n"
+        "- Do not call other sub-agents.\n"
+        "- Do not modify any files; do not write to the sandbox.\n"
+        "- Do not invent counts; if a number cannot be determined, return null and explain.\n\n"
+        "STYLE: severity-first ordering in the prose; cite key columns and concrete counts."
+    ),
+    allowed_tools=[
+        "read_file", "list_dir", "glob", "inspect_input", "profile_data", "validate_config",
+    ],
+    max_turns=15,
+    timeout_seconds=240,
+)
+
+
+REPORT_WRITER = SubagentDefinition(
+    name="report_writer",
+    description=(
+        "Synthesize validation and transform findings for a ControlDash QA/COMP config "
+        "into a polished report and save it into the user sandbox (markdown by default; "
+        "optionally xlsx/docx/pptx)."
+    ),
+    goal_prompt=(
+        "You are the ControlDash report-writer. Your single mission is to produce a polished "
+        "report from a config workbook plus (optionally) prior validation_analyst / "
+        "transform_analyst / completeness_reconciler findings, and save it to the sandbox.\n\n"
+        "EXPECTED INPUTS: title, workbook path, control type, optional prior findings, optional "
+        "`format` (\"md\"|\"xlsx\"|\"docx\"|\"pptx\"), optional `destination` filename inside the sandbox.\n"
+        "EXPECTED OUTPUT: a single ```json fenced block with the contract below.\n\n"
+        "OUTPUT CONTRACT (return as JSON):\n"
+        "{\n"
+        '  "report_markdown": "<full markdown report text>",\n'
+        '  "destination_path": "<sandbox-relative path or null>",\n'
+        '  "sections": ["summary", "config_structure", "validation", "transforms", "completeness", "recommendations", "appendix"]\n'
+        "}\n\n"
+        "REPORT TEMPLATE (use these sections in order; omit completeness for QA configs):\n"
+        "1. Summary — 2-4 sentences; workbook name, control type, headline verdict.\n"
+        "2. Config Structure — a markdown table of `sheet | role | rows | notes`.\n"
+        "3. Validation — PASS/FAIL verdict and a table of `sheet | errors | warnings` plus key fixes.\n"
+        "4. Transforms — a table of `output_field | operation | inputs | issues`.\n"
+        "5. Completeness (COMP only) — input-vs-output gaps, missing/duplicate keys.\n"
+        "6. Recommendations — 3-7 numbered action items.\n"
+        "7. Appendix — full error/warning lists and inputs consulted.\n\n"
+        "NEGATIVE BEHAVIOURS:\n"
+        "- Do not call other sub-agents (use the data they returned, don't re-invoke them).\n"
+        "- Do not invent numbers; cite the workbook/sheet for every figure.\n"
+        "- Do not write outside the sandbox.\n\n"
+        "STYLE: polished business prose; tables over prose for tabular data; "
+        "no filler, no preamble, no postamble."
+    ),
+    allowed_tools=[
+        "read_file", "inspect_input", "validate_config", "analyze_transforms",
+        "profile_data", "generate_report", "think", "todos", "memory",
+    ],
+    max_turns=20,
+    timeout_seconds=300,
+)
+
+
+_BUILTIN_SUBAGENTS: list[SubagentDefinition] = [
+    CONFIG_INSPECTOR,
+    VALIDATION_ANALYST,
+    TRANSFORM_ANALYST,
+    COMPLETENESS_RECONCILER,
+    REPORT_WRITER,
+]
+
+# Per-subagent mutability flag. Read-only sub-agents (config_inspector,
+# validation_analyst, transform_analyst, completeness_reconciler) are
+# marked non-mutating so the model can fan out inspections in parallel
+# rather than serialising them. report_writer writes to the user sandbox
+# and stays mutating.
+_SUBAGENT_MUTATING: dict[str, bool] = {
+    CONFIG_INSPECTOR.name: False,
+    VALIDATION_ANALYST.name: False,
+    TRANSFORM_ANALYST.name: False,
+    COMPLETENESS_RECONCILER.name: False,
+    REPORT_WRITER.name: True,
+}
+
+_USER_SUBAGENTS: list[SubagentDefinition] = []
+_USER_SUBAGENT_MUTATING: dict[str, bool] = {}
+
+
+def register_subagent(definition: SubagentDefinition, *, mutating: bool = True) -> None:
+    """Add a new sub-agent to the global registry. Callable at app startup.
+
+    Example
+    -------
+    >>> from ai_coding_agent.tools.subagents import (
+    ...     register_subagent, SubagentDefinition,
+    ... )
+    >>> register_subagent(SubagentDefinition(
+    ...     name="industry_analyst",
+    ...     description="Run industry-specific checks against a CSV.",
+    ...     goal_prompt="...",
+    ...     allowed_tools=["read_file", "profile_data"],
+    ... ), mutating=False)
+    """
+    _USER_SUBAGENTS.append(definition)
+    _USER_SUBAGENT_MUTATING[definition.name] = mutating
+
+
+def get_subagent_definitions(
+    extra: list[SubagentDefinition] | None = None,
+) -> list[SubagentDefinition]:
+    """Built-ins + globally registered + caller-supplied (one-shot) extras."""
+    return list(_BUILTIN_SUBAGENTS) + list(_USER_SUBAGENTS) + (extra or [])
+
+
+def get_subagent_mutating_map() -> dict[str, bool]:
+    """Return ``{name: is_mutating}`` for every registered sub-agent."""
+    return {**_SUBAGENT_MUTATING, **_USER_SUBAGENT_MUTATING}

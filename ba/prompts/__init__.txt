@@ -1,0 +1,17 @@
+"""Prompt package entry point — BA persona only.
+
+The library now ships the Business-Analyst persona exclusively. There is no
+coding mode.
+"""
+
+from ai_coding_agent.prompts.ba import (
+    create_loop_breaker_prompt,
+    get_ba_system_prompt,
+    get_compression_prompt,
+)
+
+__all__ = [
+    "get_ba_system_prompt",
+    "get_compression_prompt",
+    "create_loop_breaker_prompt",
+]

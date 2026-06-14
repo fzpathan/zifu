@@ -1,0 +1,33 @@
+"""GET /api/bca/artifacts — list files in a user's sandbox."""
+
+from __future__ import annotations
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.utils.env import (
+    get_default_user,
+    get_user_sandbox_dir,
+    list_user_artifacts,
+)
+
+router = APIRouter(prefix=API_PREFIX, tags=["artifacts"])
+
+
+@router.get("/artifacts")
+async def list_artifacts() -> dict:
+    return {"items": list_user_artifacts(get_default_user())}
+
+
+@router.get("/artifacts/download")
+async def download_artifact(path: str):
+    sandbox = get_user_sandbox_dir(get_default_user())
+    target = (sandbox / path).resolve()
+    # prevent escape
+    try:
+        target.relative_to(sandbox)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="path escapes sandbox")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(target, filename=target.name)

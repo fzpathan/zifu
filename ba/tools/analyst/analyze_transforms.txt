@@ -1,0 +1,187 @@
+"""``analyze_transforms`` analyst tool.
+
+Reads and explains the FieldOperations transforms in a ControlDash config
+workbook. Read-only; operates inside the sandbox model.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.analyst._common import (
+    AnalystDependencyError,
+    AnalystError,
+    excel_sheet_names,
+    ensure_readable,
+    is_excel,
+    read_xlsx_sheet,
+)
+from ai_coding_agent.tools.analyst._etl import (
+    OPERATION_NAMES,
+    TRANSFORM_OPERATIONS,
+    parse_params,
+    resolve_column,
+    split_inputs,
+)
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class AnalyzeTransformsParams(BaseModel):
+    path: str = Field(
+        ...,
+        description="Path to the ControlDash Excel config workbook (.xlsx/.xls).",
+    )
+    sheet_name: str = Field(
+        "FieldOperations",
+        description="Sheet that holds the field transforms (default 'FieldOperations').",
+    )
+    field_name: str | None = Field(
+        None,
+        description="Optional output field name (NewFieldName) to analyze a single transform row.",
+    )
+    row_number: int | None = Field(
+        None,
+        description="Optional 1-based data row number (excludes the header) to analyze a single row.",
+    )
+
+
+class AnalyzeTransformsTool(Tool):
+    name = "analyze_transforms"
+    description = (
+        "Read and explain the FieldOperations transforms in a ControlDash config workbook. For each "
+        "row it identifies the transform operation (DateExtract, Concatenate, Formula, Conditional, "
+        "MapValues, StringOperation, NumericOperation, SetValue, CopyField, Split, Replace), explains "
+        "what it does in plain English, and flags missing inputs or params. Optionally target one row "
+        "by field name or row number. Read-only."
+    )
+    kind = ToolKind.READ
+    schema = AnalyzeTransformsParams
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        # Blocking workbook read/parse — run off the event loop so concurrent
+        # tool calls (asyncio.gather) and the SSE stream are not serialised.
+        return await asyncio.to_thread(self._run, invocation)
+
+    def _run(self, invocation: ToolInvocation) -> ToolResult:
+        params = AnalyzeTransformsParams(**invocation.params)
+        target = Path(params.path)
+        if not target.is_absolute():
+            target = (invocation.cwd / target).resolve()
+        read_paths = list(self.config.read_paths or [])
+        try:
+            ensure_readable(target, read_paths)
+        except AnalystError as e:
+            return ToolResult.error_result(str(e))
+        if not is_excel(target):
+            return ToolResult.error_result(
+                f"analyze_transforms expects an Excel workbook (.xlsx/.xls); got '{target.suffix}'."
+            )
+
+        try:
+            sheets = excel_sheet_names(target)
+        except AnalystDependencyError as e:
+            return ToolResult.error_result(str(e))
+        except Exception as e:
+            return ToolResult.error_result(f"Could not open workbook: {e}")
+
+        sheet = next((s for s in sheets if s.strip().lower() == params.sheet_name.strip().lower()), None)
+        if sheet is None:
+            return ToolResult.error_result(
+                f"Sheet '{params.sheet_name}' not found. Available sheets: {', '.join(sheets)}."
+            )
+
+        try:
+            cols, rows = read_xlsx_sheet(target, sheet)
+        except Exception as e:
+            return ToolResult.error_result(f"Could not read sheet '{sheet}': {e}")
+
+        c_name = resolve_column(cols, "new_field")
+        c_op = resolve_column(cols, "operation")
+        c_inputs = resolve_column(cols, "inputs")
+        c_params = resolve_column(cols, "params")
+        if c_op is None:
+            return ToolResult.error_result(
+                f"No operation column found in '{sheet}' (expected OperationType/Operation). "
+                f"Columns: {', '.join(str(c) for c in cols)}."
+            )
+
+        idx_name = cols.index(c_name) if c_name else None
+        idx_op = cols.index(c_op)
+        idx_inputs = cols.index(c_inputs) if c_inputs else None
+        idx_params = cols.index(c_params) if c_params else None
+
+        def cell(row: list, i: int | None):
+            if i is None or i >= len(row):
+                return None
+            return row[i]
+
+        # Select the rows to analyze.
+        indices = list(range(len(rows)))
+        if params.row_number is not None:
+            i = params.row_number - 1
+            if i < 0 or i >= len(rows):
+                return ToolResult.error_result(
+                    f"row_number {params.row_number} is out of range (sheet has {len(rows)} data rows)."
+                )
+            indices = [i]
+        elif params.field_name and idx_name is not None:
+            target_field = params.field_name.strip().lower()
+            indices = [
+                i for i in range(len(rows))
+                if str(cell(rows[i], idx_name)).strip().lower() == target_field
+            ]
+            if not indices:
+                return ToolResult.error_result(
+                    f"No FieldOperations row with output field '{params.field_name}'."
+                )
+
+        lines = [f"Transform analysis — {target.name} :: {sheet} ({len(indices)} of {len(rows)} rows)"]
+        flagged = 0
+        for i in indices:
+            row = rows[i]
+            excel_row = i + 2
+            nf = str(cell(row, idx_name)).strip() if idx_name is not None else "(unnamed)"
+            op_raw = cell(row, idx_op)
+            op = str(op_raw).strip() if op_raw is not None else ""
+            inputs = split_inputs(cell(row, idx_inputs)) if idx_inputs is not None else []
+            parsed, perr = parse_params(cell(row, idx_params)) if idx_params is not None else ({}, None)
+
+            canonical = next((o for o in OPERATION_NAMES if o.lower() == op.lower()), None)
+            lines.append(f"\nRow {excel_row}: {nf or '(unnamed)'}  <-  {op or '(no op)'}")
+            if canonical is None:
+                lines.append(f"  ! Unknown operation. Expected one of: {', '.join(OPERATION_NAMES)}.")
+                flagged += 1
+                continue
+
+            spec = TRANSFORM_OPERATIONS[canonical]
+            lines.append(f"  what it does: {spec['desc']}")
+            lines.append(f"  inputs: {inputs or '(none)'}")
+            lines.append(f"  params: {parsed if parsed else '(none)'}")
+
+            issues = []
+            if len(inputs) < spec["min_inputs"]:
+                issues.append(f"needs >= {spec['min_inputs']} input(s), found {len(inputs)}")
+            if perr:
+                issues.append(perr)
+            elif parsed is not None:
+                missing = [k for k in spec["params"] if k not in parsed]
+                if missing:
+                    issues.append(f"missing param(s): {missing}")
+            if issues:
+                flagged += 1
+                for issue in issues:
+                    lines.append(f"  ! {issue}")
+
+        lines.append(f"\n{flagged} row(s) flagged with issues.")
+        return ToolResult.success_result(
+            "\n".join(lines),
+            metadata={
+                "path": str(target),
+                "sheet": sheet,
+                "rows_analyzed": len(indices),
+                "flagged": flagged,
+            },
+        )

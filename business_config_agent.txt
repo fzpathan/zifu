@@ -1,0 +1,45 @@
+"""Bridge router — mounts ai_coding_agent server routes into main_v2.
+
+Environment variables (see ai_coding_agent.utils.env):
+  API_KEY, BASE_URL — required for chat
+  BA_INPUT_ROOT, BA_OUTPUT_ROOT — optional input/output paths
+  MODEL_NAME, BA_DEFAULT_USER — optional defaults
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_ROUTERS_DIR = Path(__file__).resolve().parent
+if str(_ROUTERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROUTERS_DIR))
+
+from fastapi import APIRouter
+
+from ai_coding_agent.server.routes import (
+    artifacts,
+    chat,
+    conversations,
+    files,
+    health,
+    input_folders,
+    skills,
+    upload,
+)
+from ai_coding_agent.utils.env import ensure_roots_exist
+
+router = APIRouter(tags=["Business Config Agent"])
+
+router.include_router(health.router)
+router.include_router(input_folders.router)
+router.include_router(skills.router)
+router.include_router(files.router)
+router.include_router(upload.router)
+router.include_router(artifacts.router)
+router.include_router(conversations.router)
+router.include_router(chat.router)
+
+
+def initialize() -> None:
+    """Create input/output roots if missing."""
+    ensure_roots_exist()

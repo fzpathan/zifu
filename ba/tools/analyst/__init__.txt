@@ -1,0 +1,32 @@
+"""Analyst tool set: ``inspect_input``, ``profile_data``, ``generate_report``.
+
+These are BA-domain tools that operate strictly inside the sandbox model
+defined by ``Config.read_paths`` (for reads) and ``Config.sandbox_dir``
+(for writes).
+"""
+
+from ai_coding_agent.tools.analyst.analyze_transforms import AnalyzeTransformsTool
+from ai_coding_agent.tools.analyst.generate_report import GenerateReportTool
+from ai_coding_agent.tools.analyst.inspect_input import InspectInputTool
+from ai_coding_agent.tools.analyst.profile_data import ProfileDataTool
+from ai_coding_agent.tools.analyst.validate_config import ValidateConfigTool
+
+__all__ = [
+    "InspectInputTool",
+    "ProfileDataTool",
+    "GenerateReportTool",
+    "ValidateConfigTool",
+    "AnalyzeTransformsTool",
+    "get_analyst_tools",
+]
+
+
+def get_analyst_tools() -> list[type]:
+    """Return the analyst tool classes."""
+    return [
+        InspectInputTool,
+        ProfileDataTool,
+        GenerateReportTool,
+        ValidateConfigTool,
+        AnalyzeTransformsTool,
+    ]

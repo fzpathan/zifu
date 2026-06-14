@@ -1,0 +1,32 @@
+from __future__ import annotations
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai_coding_agent.context.manager import MessageItem
+
+_STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "in", "on", "at",
+    "to", "of", "for", "with", "this", "that", "it", "be", "do",
+    "and", "or", "not", "by", "as", "if", "from", "have", "has",
+    "i", "you", "we", "they", "he", "she", "can", "will", "would",
+    "could", "should", "may", "might", "my", "your", "its", "our",
+}
+
+
+def score_relevance(message: MessageItem, query: str) -> float:
+    """Return a [0.0, 1.0] keyword overlap score between a message and a query.
+
+    Uses word-level Jaccard-like scoring after stripping stop words.
+    Returns 0.0 if the query is empty or has no meaningful tokens.
+    """
+    query_tokens = {
+        t for t in re.findall(r"\w+", query.lower())
+        if t not in _STOP_WORDS and len(t) > 1
+    }
+    if not query_tokens:
+        return 0.0
+
+    content_tokens = set(re.findall(r"\w+", message.content.lower()))
+    overlap = len(query_tokens & content_tokens)
+    return overlap / len(query_tokens)

@@ -1,0 +1,47 @@
+from ai_coding_agent.tools.builtin.glob import GlobTool
+from ai_coding_agent.tools.builtin.grep import GrepTool
+from ai_coding_agent.tools.builtin.list_dir import ListDirTool
+from ai_coding_agent.tools.builtin.memory import MemoryTool
+from ai_coding_agent.tools.builtin.read_file import ReadFileTool
+from ai_coding_agent.tools.builtin.think import ThinkTool
+from ai_coding_agent.tools.builtin.todo import TodosTool
+from ai_coding_agent.tools.builtin.write_file import WriteFileTool
+
+__all__ = [
+    "ReadFileTool",
+    "WriteFileTool",
+    "ListDirTool",
+    "GrepTool",
+    "GlobTool",
+    "TodosTool",
+    "MemoryTool",
+    "ThinkTool",
+]
+
+
+def get_builtin_tools(
+    enable_think_tool: bool = True,
+) -> list[type]:
+    """Return the BA-only tool set.
+
+    Sandboxing (read_paths / sandbox_dir) is enforced at runtime by the
+    individual tools via ``utils.workspace``.
+    """
+    tools: list[type] = [
+        ReadFileTool,
+        WriteFileTool,
+        ListDirTool,
+        GrepTool,
+        GlobTool,
+        TodosTool,
+        MemoryTool,
+    ]
+
+    if enable_think_tool:
+        tools.append(ThinkTool)
+
+    return tools
+
+
+def get_all_builtin_tools() -> list[type]:
+    return get_builtin_tools(enable_think_tool=True)

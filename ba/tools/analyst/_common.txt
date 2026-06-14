@@ -1,0 +1,551 @@
+"""Common helpers for the analyst tools.
+
+Centralises:
+
+* Sandbox enforcement via ``utils.workspace`` (read paths / sandbox dir).
+* Format detection and safe readers for csv / xlsx / json / json-schema.
+* Sampling, dtype inference, and small utilities shared by the three tools.
+"""
+
+from __future__ import annotations
+import csv
+import functools
+import json
+import os
+from datetime import datetime, date
+from pathlib import Path
+from typing import Any, Iterable
+
+from ai_coding_agent.utils.workspace import is_readable, resolve_write
+
+
+MAX_SAMPLE_ROWS = 50
+MAX_PROFILE_ROWS = 200_000
+MAX_FILE_BYTES = 50 * 1024 * 1024  # 50MB hard cap on analyst reads
+
+
+class AnalystError(Exception):
+    pass
+
+
+def detect_format(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return "csv"
+    if suffix in {".xlsx", ".xlsm"}:
+        return "xlsx"
+    if suffix == ".xls":
+        return "xls"
+    if suffix in {".json", ".jsonl", ".ndjson"}:
+        return "json"
+    return "unknown"
+
+
+def ensure_readable(path: Path, read_paths: list[Path]) -> None:
+    if not is_readable(path, read_paths):
+        raise AnalystError(
+            f"path {str(path)!r} is outside the configured read paths"
+        )
+    if not path.exists():
+        raise AnalystError(f"file not found: {str(path)!r}")
+    if not path.is_file():
+        raise AnalystError(f"not a file: {str(path)!r}")
+    if path.stat().st_size > MAX_FILE_BYTES:
+        raise AnalystError(
+            f"file too large for analyst tools ({path.stat().st_size} bytes; "
+            f"limit is {MAX_FILE_BYTES})"
+        )
+
+
+def ensure_writable(destination: str, sandbox_dir: Path) -> Path:
+    return resolve_write(destination, sandbox_dir)
+
+
+def read_json(path: Path) -> Any:
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8")
+    if suffix == ".jsonl" or suffix == ".ndjson":
+        rows = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+        return rows
+    return json.loads(text)
+
+
+def read_csv(path: Path, max_rows: int | None = None) -> tuple[list[str], list[list[Any]]]:
+    """Return (headers, rows) using the stdlib ``csv`` module.
+
+    Numeric / date conversion is done lazily by the caller; we keep raw
+    strings so that ``inspect_input`` can show exactly what's in the file.
+    """
+    with open(path, "r", encoding="utf-8-sig", newline="") as fp:
+        reader = csv.reader(fp)
+        try:
+            headers = next(reader)
+        except StopIteration:
+            return [], []
+        headers = [h if h else f"col_{i}" for i, h in enumerate(headers)]
+        rows: list[list[Any]] = []
+        for i, row in enumerate(reader):
+            if max_rows is not None and i >= max_rows:
+                break
+            rows.append(row)
+    return headers, rows
+
+
+def read_xlsx(path: Path, max_rows: int | None = None) -> tuple[list[str], list[list[Any]]]:
+    """Read the first worksheet of an xlsx file using only the stdlib.
+
+    xlsx files are zip archives containing ``xl/sharedStrings.xml`` and
+    ``xl/worksheets/sheet1.xml``. We parse both with stdlib ``xml.etree``
+    to avoid pulling in openpyxl as a hard dependency.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+    with zipfile.ZipFile(path) as zf:
+        try:
+            shared = zf.read("xl/sharedStrings.xml")
+        except KeyError:
+            shared = b"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>"
+        try:
+            sheet = zf.read("xl/worksheets/sheet1.xml")
+        except KeyError:
+            raise AnalystError("xlsx file has no sheet1.xml")
+
+    sst_root = ET.fromstring(shared)
+    strings: list[str] = []
+    for si in sst_root.findall("main:si", ns):
+        text_parts = []
+        for t in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"):
+            text_parts.append(t.text or "")
+        strings.append("".join(text_parts))
+
+    sheet_root = ET.fromstring(sheet)
+    rows: list[list[Any]] = []
+
+    for row in sheet_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row"):
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+        current: dict[int, Any] = {}
+        for c in row.findall("main:c", ns):
+            ref = c.get("r", "")
+            col_letters = "".join(ch for ch in ref if ch.isalpha())
+            col_index = _column_letters_to_index(col_letters)
+            t_attr = c.get("t", "n")
+            v = c.find("main:v", ns)
+            inline = c.find("main:is", ns)
+            value: Any = None
+            if t_attr == "s" and v is not None and v.text is not None:
+                try:
+                    value = strings[int(v.text)]
+                except (ValueError, IndexError):
+                    value = None
+            elif t_attr == "inlineStr" and inline is not None:
+                parts = [t.text or "" for t in inline.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")]
+                value = "".join(parts) or None
+            elif t_attr == "b" and v is not None and v.text is not None:
+                value = v.text == "1"
+            elif v is not None and v.text is not None:
+                value = v.text
+            current[col_index] = value
+        if not current:
+            continue
+        max_col = max(current.keys())
+        rows.append([current.get(i) for i in range(max_col + 1)])
+
+    if not rows:
+        return [], []
+
+    header_row = rows[0]
+    headers: list[str] = []
+    for i, cell in enumerate(header_row):
+        if cell is None or cell == "":
+            headers.append(f"col_{i}")
+        else:
+            headers.append(str(cell))
+    data_rows = [[_coerce_cell(c) for c in r] for r in rows[1:]]
+    return headers, data_rows
+
+
+def _column_letters_to_index(letters: str) -> int:
+    """Convert ``A`` → 0, ``B`` → 1, … ``AA`` → 26."""
+    idx = 0
+    for ch in letters.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _coerce_cell(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return None
+        return s
+    return str(value)
+
+
+def infer_dtype(values: Iterable[Any]) -> str:
+    cleaned: list[Any] = [v for v in values if v is not None and v != ""]
+    if not cleaned:
+        return "empty"
+    int_count = float_count = bool_count = date_count = text_count = 0
+    for v in cleaned:
+        if isinstance(v, bool):
+            bool_count += 1
+            continue
+        if isinstance(v, (int, float)):
+            if isinstance(v, int):
+                int_count += 1
+            else:
+                float_count += 1
+            continue
+        if isinstance(v, str):
+            if _try_int(v) is not None or _try_float(v) is not None:
+                if _try_int(v) is not None:
+                    int_count += 1
+                else:
+                    float_count += 1
+                continue
+            if _try_date(v) is not None:
+                date_count += 1
+                continue
+            text_count += 1
+    total = len(cleaned)
+    if int_count == total or (int_count + float_count == total and int_count == total):
+        return "integer"
+    if int_count + float_count == total:
+        return "float"
+    if bool_count == total:
+        return "boolean"
+    if date_count == total:
+        return "date"
+    return "text"
+
+
+def _try_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _try_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _try_date(value: str) -> date | None:
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def column_summary(headers: list[str], rows: list[list[Any]], col_index: int) -> dict[str, Any]:
+    series: list[Any] = []
+    nulls = 0
+    for r in rows:
+        if col_index >= len(r):
+            nulls += 1
+            series.append(None)
+        else:
+            v = r[col_index]
+            if v is None or v == "":
+                nulls += 1
+            else:
+                series.append(v)
+    non_null = [v for v in series if v is not None and v != ""]
+    dtype = infer_dtype(series)
+    summary: dict[str, Any] = {
+        "name": headers[col_index] if col_index < len(headers) else f"col_{col_index}",
+        "dtype": dtype,
+        "nulls": nulls,
+        "uniques": len({str(v) for v in non_null}),
+        "top_values": [],
+        "flags": [],
+    }
+    # numeric stats
+    numeric: list[float] = []
+    for v in non_null:
+        n = None
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            n = float(v)
+        elif isinstance(v, str):
+            f = _try_float(v)
+            if f is not None:
+                n = f
+        if n is not None:
+            numeric.append(n)
+    if numeric:
+        summary["min"] = min(numeric)
+        summary["max"] = max(numeric)
+        summary["mean"] = sum(numeric) / len(numeric)
+        sorted_n = sorted(numeric)
+        mid = len(sorted_n) // 2
+        if len(sorted_n) % 2:
+            summary["median"] = sorted_n[mid]
+        else:
+            summary["median"] = (sorted_n[mid - 1] + sorted_n[mid]) / 2
+        # stddev (population)
+        mu = summary["mean"]
+        var = sum((x - mu) ** 2 for x in numeric) / len(numeric)
+        summary["std"] = var ** 0.5
+    else:
+        summary["min"] = None
+        summary["max"] = None
+        summary["mean"] = None
+        summary["median"] = None
+        summary["std"] = None
+
+    # top values
+    counter: dict[str, int] = {}
+    for v in non_null:
+        key = str(v)
+        counter[key] = counter.get(key, 0) + 1
+    top = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    summary["top_values"] = [{"value": k, "count": c} for k, c in top]
+
+    # flags
+    total = len(rows) or 1
+    if nulls / total > 0.20:
+        summary["flags"].append("high_nulls")
+    if summary["uniques"] <= 1 and non_null:
+        summary["flags"].append("constant_column")
+    if dtype in {"integer", "float"} and numeric:
+        std = summary["std"] or 0
+        if std == 0:
+            summary["flags"].append("constant_column")
+        else:
+            spread = summary["max"] - summary["min"]
+            if spread > 0:
+                outliers = [x for x in numeric if abs(x - summary["mean"]) > 3 * std]
+                if outliers:
+                    summary["flags"].append("suspicious_outliers")
+
+    return summary
+
+
+# --- Multi-sheet xlsx support (stdlib only) ----------------------------------
+#
+# The default ``read_xlsx`` above only reads the first worksheet. ControlDash
+# QA/COMP config workbooks are multi-sheet (InputFiles, rules, Enrichment,
+# FieldOperations, OutputRule), so the validate_config / analyze_transforms
+# tools need to enumerate sheet names and read a named sheet. We keep this
+# stdlib-only (zipfile + xml.etree) to avoid an openpyxl/pandas dependency.
+
+
+class AnalystDependencyError(AnalystError):
+    """Raised when an optional dependency required for a read is unavailable."""
+
+
+def is_excel(path: Path) -> bool:
+    return path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}
+
+
+def _sheet_target_map(zf) -> dict[str, str]:
+    """Map sheet display-name -> worksheet xml path inside the archive."""
+    import xml.etree.ElementTree as ET
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    try:
+        wb = ET.fromstring(zf.read("xl/workbook.xml"))
+    except KeyError:
+        raise AnalystError("workbook.xml not found; not a valid xlsx file")
+
+    try:
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    except KeyError:
+        rels = None
+
+    rid_to_target: dict[str, str] = {}
+    if rels is not None:
+        for rel in rels.findall(f"{{{pkg_rel_ns}}}Relationship"):
+            rid = rel.get("Id")
+            target = rel.get("Target", "")
+            if rid and target:
+                if not target.startswith("/"):
+                    target = "xl/" + target.lstrip("./")
+                else:
+                    target = target.lstrip("/")
+                rid_to_target[rid] = target
+
+    result: dict[str, str] = {}
+    sheets_el = wb.find(f"{{{main_ns}}}sheets")
+    if sheets_el is None:
+        return result
+    fallback_idx = 1
+    for sheet in sheets_el.findall(f"{{{main_ns}}}sheet"):
+        name = sheet.get("name") or f"Sheet{fallback_idx}"
+        rid = sheet.get(f"{{{rel_ns}}}id")
+        target = rid_to_target.get(rid) if rid else None
+        if not target:
+            target = f"xl/worksheets/sheet{fallback_idx}.xml"
+        result[name] = target
+        fallback_idx += 1
+    return result
+
+
+def excel_sheet_names(path: Path) -> list[str]:
+    """Return the ordered list of sheet names in an xlsx/xlsm workbook."""
+    import zipfile
+
+    if path.suffix.lower() == ".xls":
+        raise AnalystDependencyError(
+            "Legacy .xls workbooks are not supported; please provide an .xlsx file."
+        )
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return list(_sheet_target_map(zf).keys())
+    except zipfile.BadZipFile:
+        raise AnalystError(f"file is not a valid xlsx archive: {path.name}")
+
+
+def _parse_sheet_xml(
+    sheet_xml: bytes,
+    strings: list[str],
+    ns: dict[str, str],
+    max_rows: int | None,
+) -> list[list[Any]]:
+    import xml.etree.ElementTree as ET
+
+    sheet_root = ET.fromstring(sheet_xml)
+    rows: list[list[Any]] = []
+    for row in sheet_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row"):
+        if max_rows is not None and len(rows) > max_rows:
+            break
+        current: dict[int, Any] = {}
+        for c in row.findall("main:c", ns):
+            ref = c.get("r", "")
+            col_letters = "".join(ch for ch in ref if ch.isalpha())
+            col_index = _column_letters_to_index(col_letters)
+            t_attr = c.get("t", "n")
+            v = c.find("main:v", ns)
+            inline = c.find("main:is", ns)
+            value: Any = None
+            if t_attr == "s" and v is not None and v.text is not None:
+                try:
+                    value = strings[int(v.text)]
+                except (ValueError, IndexError):
+                    value = None
+            elif t_attr == "inlineStr" and inline is not None:
+                parts = [
+                    t.text or ""
+                    for t in inline.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")
+                ]
+                value = "".join(parts) or None
+            elif t_attr == "b" and v is not None and v.text is not None:
+                value = v.text == "1"
+            elif v is not None and v.text is not None:
+                value = v.text
+            current[col_index] = value
+        if not current:
+            continue
+        max_col = max(current.keys())
+        rows.append([current.get(i) for i in range(max_col + 1)])
+    return rows
+
+
+def _split_headers_and_rows(rows: list[list[Any]]) -> tuple[list[str], list[list[Any]]]:
+    if not rows:
+        return [], []
+    header_row = rows[0]
+    headers: list[str] = []
+    for i, cell in enumerate(header_row):
+        if cell is None or cell == "":
+            headers.append(f"col_{i}")
+        else:
+            headers.append(str(cell))
+    data_rows = [[_coerce_cell(c) for c in r] for r in rows[1:]]
+    return headers, data_rows
+
+
+@functools.lru_cache(maxsize=32)
+def _open_xlsx_shared_strings(path_str: str, _mtime: float) -> list[str]:
+    """Cache the sharedStrings list keyed by (path, mtime) so the cache is
+    automatically invalidated when a workbook is overwritten."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(path_str) as zf:
+        try:
+            shared = zf.read("xl/sharedStrings.xml")
+        except KeyError:
+            return []
+        ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        root = ET.fromstring(shared)
+        strings: list[str] = []
+        for si in root.findall("main:si", ns):
+            parts = [
+                t.text or ""
+                for t in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")
+            ]
+            strings.append("".join(parts))
+        return strings
+
+
+def read_xlsx_workbook(
+    path: Path,
+    max_rows: int | None = None,
+) -> dict[str, tuple[list[str], list[list[Any]]]]:
+    """Read all sheets of an xlsx file in a single zip open.
+
+    Returns ``{sheet_name: (headers, rows)}`` for every worksheet. This is
+    strictly faster than calling :func:`read_xlsx_sheet` per sheet because
+    the zip is opened and the sharedStrings table is parsed once.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    if path.suffix.lower() == ".xls":
+        raise AnalystDependencyError(
+            "Legacy .xls workbooks are not supported; please provide an .xlsx file."
+        )
+
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            target_map = _sheet_target_map(zf)
+            strings = _open_xlsx_shared_strings(str(path), path.stat().st_mtime)
+            result: dict[str, tuple[list[str], list[list[Any]]]] = {}
+            for sheet_name, target in target_map.items():
+                try:
+                    sheet_xml = zf.read(target)
+                except KeyError:
+                    continue
+                raw_rows = _parse_sheet_xml(sheet_xml, strings, ns, max_rows)
+                result[sheet_name] = _split_headers_and_rows(raw_rows)
+            return result
+    except zipfile.BadZipFile:
+        raise AnalystError(f"file is not a valid xlsx archive: {path.name}")
+
+
+def read_xlsx_sheet(
+    path: Path, sheet: str, max_rows: int | None = None
+) -> tuple[list[str], list[list[Any]]]:
+    """Read a named worksheet from an xlsx workbook into (headers, rows)."""
+    workbook = read_xlsx_workbook(path, max_rows=max_rows)
+    target_lookup = {name.strip().lower(): name for name in workbook}
+    actual_name = target_lookup.get(sheet.strip().lower())
+    if actual_name is None:
+        raise AnalystError(
+            f"sheet {sheet!r} not found; available: {', '.join(workbook.keys())}"
+        )
+    return workbook[actual_name]

@@ -1,0 +1,92 @@
+"""GET /api/bca/files?folder=...&path=... — read-only browsing of an input folder.
+
+When ``path`` is omitted, lists the folder's top-level entries. When
+``path`` points to a file, returns its content. All access is sandboxed
+to the requested folder.
+"""
+
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Annotated
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import PlainTextResponse, Response
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.server.schemas import FileEntry
+from ai_coding_agent.utils.env import get_input_folders, get_input_root
+from ai_coding_agent.utils.workspace import is_readable
+
+router = APIRouter(prefix=API_PREFIX, tags=["files"])
+
+TEXT_EXTENSIONS = {".csv", ".txt", ".json", ".md", ".jsonl", ".ndjson", ".tsv", ".yaml", ".yml"}
+BINARY_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".parquet", ".pdf", ".png", ".jpg", ".jpeg", ".gif"}
+
+
+@router.get("/files", response_model=list[FileEntry])
+async def list_files(
+    folder: Annotated[str, Query(description="Input folder name")],
+    path: Annotated[str, Query(description="Relative path inside the folder")] = "",
+) -> list[FileEntry]:
+    root = get_input_root()
+    if folder not in get_input_folders():
+        raise HTTPException(status_code=404, detail=f"unknown input folder {folder!r}")
+    base = (root / folder).resolve()
+    target = (base / path).resolve() if path else base
+    if not is_readable(target, [base]):
+        raise HTTPException(status_code=403, detail="path escapes folder")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="path not found")
+    if target.is_file():
+        return [
+            FileEntry(
+                path=str(target.relative_to(base)).replace("\\", "/"),
+                size=target.stat().st_size,
+                modified=target.stat().st_mtime,
+                is_dir=False,
+            )
+        ]
+    items: list[FileEntry] = []
+    for p in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+        if p.name.startswith("."):
+            continue
+        items.append(
+            FileEntry(
+                path=str(p.relative_to(base)).replace("\\", "/"),
+                size=p.stat().st_size if p.is_file() else 0,
+                modified=p.stat().st_mtime,
+                is_dir=p.is_dir(),
+            )
+        )
+    return items
+
+
+@router.get("/files/raw")
+async def get_file_raw(
+    folder: Annotated[str, Query()],
+    path: Annotated[str, Query()],
+) -> Response:
+    root = get_input_root()
+    if folder not in get_input_folders():
+        raise HTTPException(status_code=404, detail=f"unknown input folder {folder!r}")
+    base = (root / folder).resolve()
+    target = (base / path).resolve()
+    if not is_readable(target, [base]):
+        raise HTTPException(status_code=403, detail="path escapes folder")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    suffix = target.suffix.lower()
+    if suffix in TEXT_EXTENSIONS:
+        return PlainTextResponse(target.read_text(encoding="utf-8", errors="replace"))
+    if suffix in BINARY_EXTENSIONS:
+        return Response(
+            content=target.read_bytes(),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+        )
+    # Default: octet-stream
+    return Response(
+        content=target.read_bytes(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+    )

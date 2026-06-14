@@ -1,0 +1,37 @@
+"""Shared FastAPI dependencies and the tool-registry singleton."""
+
+from __future__ import annotations
+from ai_coding_agent.config.config import Config
+from ai_coding_agent.tools.registry import ToolRegistry, create_default_registry
+from ai_coding_agent.tools.subagents import get_subagent_definitions
+from ai_coding_agent.server.sessions import ConversationStore
+
+
+_default_config: Config | None = None
+_default_registry: ToolRegistry | None = None
+_conversation_store: ConversationStore | None = None
+
+
+def get_default_config() -> Config:
+    global _default_config
+    if _default_config is None:
+        _default_config = Config()
+    return _default_config
+
+
+def get_registry() -> ToolRegistry:
+    global _default_registry
+    if _default_registry is None:
+        _default_registry = create_default_registry(get_default_config())
+    return _default_registry
+
+
+def get_conversation_store() -> ConversationStore:
+    global _conversation_store
+    if _conversation_store is None:
+        _conversation_store = ConversationStore()
+    return _conversation_store
+
+
+def get_subagent_names() -> list[str]:
+    return [d.name for d in get_subagent_definitions()]

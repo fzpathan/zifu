@@ -1,0 +1,257 @@
+import asyncio
+from typing import Any, AsyncGenerator
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
+
+from ai_coding_agent.client.response import (
+    StreamEventType,
+    StreamEvent,
+    TextDelta,
+    TokenUsage,
+    ToolCall,
+    ToolCallDelta,
+    parse_tool_call_arguments,
+)
+from ai_coding_agent.config.config import Config
+
+
+class LLMClient:
+    # Backoff schedule for transient errors. len(RETRY_DELAYS) retries on top
+    # of the initial attempt.
+    RETRY_DELAYS = [1.0, 2.0, 4.0]
+    _RETRYABLE_STATUS = {500, 502, 503, 504}
+
+    def __init__(self, config: Config) -> None:
+        self._client: AsyncOpenAI | None = None
+        self.config = config
+
+    def get_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.close()
+            self._client = None
+
+    def _build_tools(self, tools: list[dict[str, Any]]):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get(
+                        "parameters",
+                        {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    ),
+                },
+            }
+            for tool in tools
+        ]
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        client = self.get_client()
+
+        kwargs = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "stream": stream,
+        }
+
+        if tools:
+            kwargs["tools"] = self._build_tools(tools)
+            kwargs["tool_choice"] = "auto"
+
+        # Retries live in a single place (_call_with_retry). Here we only
+        # translate a terminal failure into an ERROR event for the agent loop.
+        try:
+            if stream:
+                async for event in self._stream_response(client, kwargs):
+                    yield event
+            else:
+                async for event in self._non_stream_response(client, kwargs):
+                    yield event
+        except RateLimitError as e:
+            yield StreamEvent(type=StreamEventType.ERROR, error=f"Rate limit exceeded: {e}")
+        except (APIConnectionError, APITimeoutError) as e:
+            yield StreamEvent(type=StreamEventType.ERROR, error=f"Connection error: {e}")
+        except APIError as e:
+            yield StreamEvent(type=StreamEventType.ERROR, error=f"API error: {e}")
+        except Exception as e:  # noqa: BLE001 — defensive catch-all for the agent loop
+            yield StreamEvent(type=StreamEventType.ERROR, error=f"LLM error: {e}")
+
+    async def _call_with_retry(self, client: AsyncOpenAI, **kwargs):
+        """Single retry layer. Retries rate-limits, connection/timeout errors,
+        and 5xx statuses with exponential backoff; raises everything else."""
+        last_error: Exception | None = None
+        for attempt in range(len(self.RETRY_DELAYS) + 1):
+            try:
+                return await client.chat.completions.create(**kwargs)
+            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                last_error = e
+            except APIStatusError as e:
+                if e.status_code not in self._RETRYABLE_STATUS:
+                    raise
+                last_error = e
+            if attempt < len(self.RETRY_DELAYS):
+                await asyncio.sleep(self.RETRY_DELAYS[attempt])
+            else:
+                raise last_error
+
+    async def _stream_response(
+        self,
+        client: AsyncOpenAI,
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        response = await self._call_with_retry(client, **kwargs)
+
+        finish_reason: str | None = None
+        usage: TokenUsage | None = None
+        tool_calls: dict[int, dict[str, Any]] = {}
+
+        async for chunk in response:
+            if hasattr(chunk, "usage") and chunk.usage:
+                prompt_details = getattr(chunk.usage, "prompt_tokens_details", None)
+                usage = TokenUsage(
+                    prompt_tokens=chunk.usage.prompt_tokens,
+                    completion_tokens=chunk.usage.completion_tokens,
+                    total_tokens=chunk.usage.total_tokens,
+                    cached_tokens=(
+                        prompt_details.cached_tokens
+                        if prompt_details
+                        else 0
+                    ),
+                )
+
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            if delta.content:
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA,
+                    text_delta=TextDelta(delta.content),
+                )
+
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    idx = tool_call_delta.index
+
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": tool_call_delta.id or "",
+                            "name": "",
+                            "arguments": "",
+                        }
+
+                        if tool_call_delta.function:
+                            if tool_call_delta.function.name:
+                                tool_calls[idx]["name"] = tool_call_delta.function.name
+                                yield StreamEvent(
+                                    type=StreamEventType.TOOL_CALL_START,
+                                    tool_call_delta=ToolCallDelta(
+                                        call_id=tool_calls[idx]["id"],
+                                        name=tool_call_delta.function.name,
+                                    ),
+                                )
+
+                        if tool_call_delta.function.arguments:
+                            tool_calls[idx][
+                                "arguments"
+                            ] += tool_call_delta.function.arguments
+
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_CALL_DELTA,
+                                tool_call_delta=ToolCallDelta(
+                                    call_id=tool_calls[idx]["id"],
+                                    name=tool_call_delta.function.name,
+                                    arguments_delta=tool_call_delta.function.arguments,
+                                ),
+                            )
+
+        for idx, tc in tool_calls.items():
+            yield StreamEvent(
+                type=StreamEventType.TOOL_CALL_COMPLETE,
+                tool_call=ToolCall(
+                    call_id=tc["id"],
+                    name=tc["name"],
+                    arguments=parse_tool_call_arguments(tc["arguments"]),
+                ),
+            )
+
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+    async def _non_stream_response(
+        self,
+        client: AsyncOpenAI,
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        response = await self._call_with_retry(client, **kwargs)
+        choice = response.choices[0]
+        message = choice.message
+
+        # yield text first if present
+        if message.content:
+            yield StreamEvent(
+                type=StreamEventType.TEXT_DELTA,
+                text_delta=TextDelta(content=message.content),
+            )
+
+        # yield each tool call as a separate TOOL_CALL_COMPLETE event
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                yield StreamEvent(
+                    type=StreamEventType.TOOL_CALL_COMPLETE,
+                    tool_call=ToolCall(
+                        call_id=tc.id,
+                        name=tc.function.name,
+                        arguments=parse_tool_call_arguments(tc.function.arguments),
+                    ),
+                )
+
+        usage = None
+        if response.usage:
+            usage = TokenUsage(
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                total_tokens=response.usage.total_tokens,
+                cached_tokens=(
+                    response.usage.prompt_tokens_details.cached_tokens
+                    if response.usage.prompt_tokens_details
+                    else 0
+                ),
+            )
+
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=choice.finish_reason,
+            usage=usage,
+        )

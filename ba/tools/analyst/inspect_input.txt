@@ -1,0 +1,181 @@
+"""``inspect_input`` analyst tool.
+
+Inspects the schema / structure of one input file and returns a JSON
+object suitable for the model. The tool itself only reads from
+``read_paths`` and never writes anywhere.
+"""
+
+from __future__ import annotations
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.analyst._common import (
+    AnalystError,
+    MAX_PROFILE_ROWS,
+    MAX_SAMPLE_ROWS,
+    column_summary,
+    detect_format,
+    ensure_readable,
+    read_csv,
+    read_json,
+    read_xlsx,
+)
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class InspectInputParams(BaseModel):
+    path: str = Field(..., description="Path to the input file (relative or absolute).")
+    sample_size: int = Field(
+        MAX_SAMPLE_ROWS,
+        ge=1,
+        le=500,
+        description="How many sample rows to include in the output.",
+    )
+
+
+class InspectInputTool(Tool):
+    name = "inspect_input"
+    description = (
+        "Inspect the schema and structure of an input file (CSV, XLSX, JSON, JSON-Lines, "
+        "or JSON-Schema). Returns column names, inferred data types, sample values, "
+        "row count, and any obvious structural issues. Read-only."
+    )
+    kind = ToolKind.READ
+    schema = InspectInputParams
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        # Blocking file read/parse — run off the event loop so concurrent
+        # tool calls (asyncio.gather) and the SSE stream are not serialised.
+        return await asyncio.to_thread(self._run, invocation)
+
+    def _run(self, invocation: ToolInvocation) -> ToolResult:
+        try:
+            params = InspectInputParams(**invocation.params)
+            read_paths = list(self.config.read_paths or [])
+
+            target = Path(params.path)
+            if not target.is_absolute():
+                target = (invocation.cwd / target).resolve()
+            ensure_readable(target, read_paths)
+
+            fmt = detect_format(target)
+            file_size = target.stat().st_size
+            result: dict[str, Any] = {
+                "file": str(target),
+                "format": fmt,
+                "size_bytes": file_size,
+                "rows": None,
+                "columns": [],
+                "issues": [],
+            }
+
+            if fmt == "csv":
+                headers, rows = read_csv(target, max_rows=min(params.sample_size * 4, MAX_PROFILE_ROWS))
+                result["rows"] = None
+                for r in [headers] + rows:
+                    pass
+                # total row count via streaming
+                with open(target, "r", encoding="utf-8-sig", errors="replace") as fp:
+                    total = sum(1 for _ in fp) - 1
+                result["rows"] = max(total, 0)
+                result["columns"] = _column_summaries(headers, rows[: params.sample_size])
+
+            elif fmt == "xlsx":
+                headers, rows = read_xlsx(target, max_rows=params.sample_size)
+                result["rows"] = None
+                result["columns"] = _column_summaries(headers, rows[: params.sample_size])
+                result["rows"] = "(sampled; full row count not enumerated for xlsx)"
+
+            elif fmt in {"json", "jsonl", "ndjson"}:
+                data = read_json(target)
+                if isinstance(data, list):
+                    result["rows"] = len(data)
+                    if data and isinstance(data[0], dict):
+                        keys: list[str] = []
+                        for item in data[: params.sample_size]:
+                            for k in (item or {}).keys():
+                                if k not in keys:
+                                    keys.append(k)
+                        result["columns"] = [
+                            {
+                                "name": k,
+                                "dtype": _infer_dict_dtype([(it or {}).get(k) for it in data[: params.sample_size]]),
+                                "nullable": any((it or {}).get(k) in (None, "") for it in data[: params.sample_size]),
+                                "sample": [str((it or {}).get(k)) for it in data[:3] if (it or {}).get(k) is not None],
+                            }
+                            for k in keys
+                        ]
+                    else:
+                        result["columns"] = [
+                            {
+                                "name": "value",
+                                "dtype": _infer_dict_dtype(data[: params.sample_size]),
+                                "nullable": any(v is None for v in data[: params.sample_size]),
+                                "sample": [str(v) for v in data[:3] if v is not None],
+                            }
+                        ]
+                elif isinstance(data, dict):
+                    # JSON-Schema-ish?
+                    if "$schema" in data or "type" in data and "properties" in data:
+                        result["format"] = "json-schema"
+                        props = data.get("properties", {})
+                        result["columns"] = [
+                            {
+                                "name": k,
+                                "dtype": str(v.get("type", "unknown")) if isinstance(v, dict) else "unknown",
+                                "nullable": True,
+                                "sample": [],
+                            }
+                            for k, v in props.items()
+                        ]
+                        result["rows"] = None
+                    else:
+                        result["columns"] = [
+                            {
+                                "name": k,
+                                "dtype": _infer_dict_dtype([v]),
+                                "nullable": v is None,
+                                "sample": [str(v)] if v is not None else [],
+                            }
+                            for k, v in data.items()
+                        ]
+                        result["rows"] = 1
+                else:
+                    result["issues"].append("Top-level JSON value is not an object or array.")
+            else:
+                result["issues"].append(
+                    f"Unrecognised extension {target.suffix!r}; only csv/xlsx/json/jsonl are supported."
+                )
+
+            return ToolResult.success_result(
+                json.dumps(result, indent=2, default=str),
+                metadata={"path": str(target), "format": fmt, "columns": len(result["columns"])},
+            )
+        except AnalystError as e:
+            return ToolResult.error_result(str(e))
+        except Exception as e:
+            return ToolResult.error_result(f"inspect_input failed: {e}")
+
+
+def _column_summaries(headers: list[str], rows: list[list[Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for col_idx, name in enumerate(headers):
+        summary = column_summary(headers, rows, col_idx)
+        sample = [r[col_idx] for r in rows[:5] if col_idx < len(r) and r[col_idx] is not None]
+        out.append(
+            {
+                "name": summary["name"],
+                "dtype": summary["dtype"],
+                "nullable": summary["nulls"] > 0,
+                "sample": [str(v) for v in sample[:5]],
+            }
+        )
+    return out
+
+
+def _infer_dict_dtype(values: list[Any]) -> str:
+    from ai_coding_agent.tools.analyst._common import infer_dtype
+    return infer_dtype(values)

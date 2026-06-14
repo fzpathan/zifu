@@ -1,0 +1,31 @@
+"""SSE helpers for the BA chat endpoint."""
+
+from __future__ import annotations
+import asyncio
+import json
+from typing import Any, AsyncGenerator
+
+
+def sse_event(payload: dict[str, Any]) -> bytes:
+    """Encode one SSE event as ``data: <json>\\n\\n`` bytes."""
+    return f"data: {json.dumps(payload, default=str)}\n\n".encode("utf-8")
+
+
+async def sse_generator(
+    event_source: AsyncGenerator[dict[str, Any], None],
+) -> AsyncGenerator[bytes, None]:
+    """Wrap an async dict-generator as SSE bytes.
+
+    Each dict emitted by ``event_source`` is serialised as one SSE event.
+    A final ``{"type": "agent_end"}`` is treated as the end of the
+    stream; the generator then returns.
+    """
+    try:
+        async for event in event_source:
+            yield sse_event(event)
+            await asyncio.sleep(0)
+    except Exception as e:  # noqa: BLE001
+        yield sse_event({"type": "error", "error": str(e)})
+        return
+    # Always send a final heartbeat-style done so the client knows the stream ended cleanly.
+    yield sse_event({"type": "stream_done"})

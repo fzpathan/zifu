@@ -1,0 +1,39 @@
+"""Conversation CRUD (single-tenant, demo-user)."""
+
+from __future__ import annotations
+from fastapi import APIRouter, HTTPException
+from typing import Any
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.server.deps import get_conversation_store
+from ai_coding_agent.server.schemas import (
+    ChatMessage,
+    ConversationCreate,
+    ConversationSummary,
+)
+from ai_coding_agent.utils.env import get_default_user
+
+router = APIRouter(prefix=API_PREFIX, tags=["conversations"])
+
+
+@router.post("/conversations", response_model=ConversationSummary)
+async def create_conversation(body: ConversationCreate) -> ConversationSummary:
+    conv = await get_conversation_store().create(get_default_user(), body.title)
+    return ConversationSummary(**conv.to_summary())
+
+
+@router.get("/conversations", response_model=list[ConversationSummary])
+async def list_conversations() -> list[ConversationSummary]:
+    # user_id is no longer a query param — the workspace is fixed to demo-user.
+    # Old clients that still send ?user_id=... are tolerated (FastAPI ignores
+    # extra query params on GET handlers).
+    summaries = await get_conversation_store().list_for_user(get_default_user())
+    return [ConversationSummary(**s) for s in summaries]
+
+
+@router.get("/conversations/{conversation_id}/messages", response_model=list[ChatMessage])
+async def get_messages(conversation_id: str) -> list[ChatMessage]:
+    conv = await get_conversation_store().get(conversation_id, get_default_user())
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return conv.messages

@@ -1,0 +1,115 @@
+from __future__ import annotations
+from enum import Enum
+import os
+from pathlib import Path
+from typing import Any
+from pydantic import BaseModel, Field
+
+
+class ModelConfig(BaseModel):
+    name: str = "openai/gpt-4o-mini"
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    context_window: int = 64_000
+
+
+class ApprovalPolicy(str, Enum):
+    ON_REQUEST = "on-request"
+    ON_FAILURE = "on-failure"
+    AUTO = "auto"
+    NEVER = "never"
+    YOLO = "yolo"
+
+
+class Config(BaseModel):
+    """Business-Analyst assistant configuration.
+
+    The library now only ships the business-analyst persona — there is no
+    coding mode. The Config exposes the knobs that the BA agent and its
+    sub-agents need (read-only input paths, per-user sandbox, sub-agent
+    registry hook, model, approval).
+    """
+
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    cwd: Path = Field(default_factory=Path.cwd)
+
+    # Server-controlled read scope: folders the LLM is allowed to read.
+    read_paths: list[Path] = Field(default_factory=list)
+
+    # Per-user sandbox where reports and other artifacts can be written.
+    sandbox_dir: Path = Field(default_factory=Path.cwd)
+
+    # If set, only these tools are exposed to the agent.
+    allowed_tools: list[str] | None = Field(
+        None,
+        description="If set, only these tools will be available to the agent",
+    )
+
+    # Sub-agents (passed through to the registry).
+    enable_subagents: bool = True
+    extra_subagents: list[Any] = Field(
+        default_factory=list,
+        description="Extra SubagentDefinition instances to register; "
+                    "uses Any to avoid a circular import on the BA sub-agents module.",
+    )
+
+    approval: ApprovalPolicy = ApprovalPolicy.AUTO
+    max_turns: int = 30
+
+    developer_instructions: str | None = None
+    user_instructions: str | None = None
+
+    debug: bool = False
+
+    l0_token_budget: int = 20_000
+    l1_token_budget: int = 8_000
+    l1_min_relevance: float = 0.15
+    # When True, conditionally-loaded (L1) history is re-selected by relevance
+    # to the latest user query each turn. That changes which older messages are
+    # included as the query changes, which churns the prompt prefix and lowers
+    # provider prompt-cache hit rate. Set False to select L1 by recency instead
+    # (deterministic for a given window → better cache reuse, lower TTFT/cost).
+    l1_relevance_rerank: bool = True
+    codebase_memory_top_k: int = 1
+    memory_max_chars: int = 12_000
+    tool_timeout_sec: int = 120
+
+    @property
+    def api_key(self) -> str | None:
+        return os.environ.get("API_KEY")
+
+    @property
+    def base_url(self) -> str | None:
+        return os.environ.get("BASE_URL")
+
+    @property
+    def model_name(self) -> str:
+        return self.model.name
+
+    @model_name.setter
+    def model_name(self, value: str) -> None:
+        self.model.name = value
+
+    @property
+    def temperature(self) -> float:
+        return self.model.temperature
+
+    @temperature.setter
+    def temperature(self, value: float) -> None:
+        self.model.temperature = value
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+
+        if not self.api_key:
+            errors.append("No API key found. Set API_KEY environment variable")
+
+        if not self.cwd.exists():
+            errors.append(f"Working directory does not exist: {self.cwd}")
+
+        if not self.sandbox_dir.exists():
+            errors.append(f"Sandbox directory does not exist: {self.sandbox_dir}")
+
+        return errors
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")

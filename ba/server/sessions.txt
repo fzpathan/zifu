@@ -1,0 +1,223 @@
+"""Per-user conversation store.
+
+Conversations are kept in memory for fast access and persisted as
+JSONL files under ``BA_OUTPUT_ROOT/<user_id>/conversations/<id>.jsonl``.
+The server is allowed to forget in-memory state on restart; on a miss it
+re-reads the file from disk.
+"""
+
+from __future__ import annotations
+import asyncio
+import json
+import re
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from ai_coding_agent.server.schemas import ChatMessage
+from ai_coding_agent.utils.env import get_user_sandbox_dir
+
+# Conversation ids become file names (<id>.jsonl); restrict to safe chars.
+_VALID_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def is_valid_conversation_id(conversation_id: str) -> bool:
+    return bool(_VALID_ID.match(conversation_id))
+
+
+class Conversation:
+    def __init__(self, id: str, user_id: str, title: str = "New chat") -> None:
+        self.id = id
+        self.user_id = user_id
+        self.title = title
+        self.created_at = datetime.utcnow()
+        self.updated_at = self.created_at
+        self.messages: list[ChatMessage] = []
+        self.usage_total: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    @property
+    def path(self) -> Path:
+        sandbox = get_user_sandbox_dir(self.user_id)
+        return sandbox / "conversations" / f"{self.id}.jsonl"
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "message_count": len(self.messages),
+        }
+
+    def append_message(self, message: ChatMessage) -> None:
+        self._record_in_memory(message)
+        self._append_to_disk(message)
+
+    def _record_in_memory(self, message: ChatMessage) -> None:
+        """In-memory mutation only (cheap, no I/O). The disk write is done
+        separately so callers on the async path can offload it to a thread."""
+        self.messages.append(message)
+        self.updated_at = datetime.utcnow()
+        if self.title == "New chat" and message.role == "user" and message.content:
+            self.title = (message.content[:40] + ("..." if len(message.content) > 40 else "")).strip()
+
+    def _append_to_disk(self, message: ChatMessage) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "role": message.role,
+            "content": message.content,
+            "name": message.name,
+            "tool_call_id": message.tool_call_id,
+            "ts": datetime.utcnow().isoformat(),
+        }
+        with open(self.path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @classmethod
+    def from_disk(cls, id: str, user_id: str) -> "Conversation | None":
+        sandbox = get_user_sandbox_dir(user_id)
+        path = sandbox / "conversations" / f"{id}.jsonl"
+        if not path.exists():
+            return None
+        conv = cls(id=id, user_id=user_id)
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    conv.messages.append(
+                        ChatMessage(
+                            role=record.get("role", "user"),
+                            content=record.get("content", ""),
+                            name=record.get("name"),
+                            tool_call_id=record.get("tool_call_id"),
+                        )
+                    )
+            if conv.messages:
+                first_user = next((m for m in conv.messages if m.role == "user"), None)
+                if first_user:
+                    conv.title = (first_user.content[:40] + ("..." if len(first_user.content) > 40 else "")).strip()
+        except Exception:
+            return None
+        return conv
+
+
+class ConversationStore:
+    def __init__(self) -> None:
+        self._conversations: dict[str, Conversation] = {}
+        self._lock = asyncio.Lock()
+
+    async def create(
+        self,
+        user_id: str,
+        title: str | None = None,
+        conversation_id: str | None = None,
+    ) -> Conversation:
+        """Create a conversation. Accepts an optional client-supplied id
+        (validated, since it becomes a file name); otherwise a uuid4 is used."""
+        if conversation_id is not None and not is_valid_conversation_id(conversation_id):
+            raise ValueError(f"invalid conversation_id {conversation_id!r}")
+        async with self._lock:
+            conv = Conversation(
+                id=conversation_id or str(uuid.uuid4()),
+                user_id=user_id,
+                title=title or "New chat",
+            )
+            self._conversations[f"{user_id}::{conv.id}"] = conv
+            # Touch the file so it appears in the sandbox
+            conv.path.parent.mkdir(parents=True, exist_ok=True)
+            if not conv.path.exists():
+                conv.path.write_text("", encoding="utf-8")
+            return conv
+
+    async def get(self, conversation_id: str, user_id: str) -> Conversation | None:
+        if not is_valid_conversation_id(conversation_id):
+            return None
+        key = f"{user_id}::{conversation_id}"
+        async with self._lock:
+            if key in self._conversations:
+                return self._conversations[key]
+            # Blocking file read — offload so the event loop keeps serving.
+            conv = await asyncio.to_thread(Conversation.from_disk, conversation_id, user_id)
+            if conv:
+                self._conversations[key] = conv
+            return conv
+
+    async def list_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        """Return conversation summaries (dicts) newest-first.
+
+        Reads only what a summary needs (file mtime, the first user line for
+        the title, and a line count) instead of fully parsing every JSONL
+        file, and does the whole sweep in a worker thread.
+        """
+        sandbox = get_user_sandbox_dir(user_id)
+        conv_dir = sandbox / "conversations"
+        if not conv_dir.exists():
+            return []
+        return await asyncio.to_thread(self._list_summaries_sync, conv_dir, user_id)
+
+    @staticmethod
+    def _list_summaries_sync(conv_dir: Path, user_id: str) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        for p in conv_dir.glob("*.jsonl"):
+            summary = ConversationStore._summary_from_file(p, user_id)
+            if summary:
+                summaries.append(summary)
+        summaries.sort(key=lambda s: s["updated_at"], reverse=True)
+        return summaries
+
+    @staticmethod
+    def _summary_from_file(path: Path, user_id: str) -> dict[str, Any] | None:
+        """Cheap summary read: stat for timestamps, scan lines for the count,
+        and JSON-parse only up to the first user message for the title."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        title = "New chat"
+        count = 0
+        found_title = False
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    count += 1
+                    if not found_title:
+                        try:
+                            record = json.loads(line)
+                        except Exception:
+                            continue
+                        if record.get("role") == "user" and record.get("content"):
+                            content = record["content"]
+                            title = (content[:40] + ("..." if len(content) > 40 else "")).strip()
+                            found_title = True
+        except OSError:
+            return None
+        updated = datetime.utcfromtimestamp(stat.st_mtime)
+        created = datetime.utcfromtimestamp(getattr(stat, "st_ctime", stat.st_mtime))
+        return {
+            "id": path.stem,
+            "user_id": user_id,
+            "title": title,
+            "created_at": created.isoformat(),
+            "updated_at": updated.isoformat(),
+            "message_count": count,
+        }
+
+    async def append_message(self, conversation_id: str, user_id: str, message: ChatMessage) -> None:
+        conv = await self.get(conversation_id, user_id)
+        if not conv:
+            return
+        conv._record_in_memory(message)
+        # Blocking disk append — offload so streaming/other requests aren't stalled.
+        await asyncio.to_thread(conv._append_to_disk, message)

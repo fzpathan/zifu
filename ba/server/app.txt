@@ -1,0 +1,138 @@
+"""FastAPI application factory for the BA server.
+
+Usage
+-----
+Set the required environment variables (see ``utils.env``), then run:
+
+    uvicorn ai_coding_agent.server.app:app --host 127.0.0.1 --port 8000
+
+The same app, when ``frontend/build/`` exists, will serve the static
+SPA from the root. The API is mounted under ``/api/bca``.
+"""
+
+from __future__ import annotations
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.server.routes import (
+    artifacts,
+    chat,
+    conversations,
+    files,
+    health,
+    input_folders,
+    skills,
+    upload,
+)
+from ai_coding_agent.utils.env import (
+    ensure_roots_exist,
+    get_host,
+    get_port,
+    get_input_root,
+    get_output_root,
+)
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("ba_server")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_roots_exist()
+    try:
+        logger.info("BA_INPUT_ROOT = %s", get_input_root())
+    except RuntimeError as e:
+        logger.warning("BA_INPUT_ROOT not configured: %s", e)
+    try:
+        logger.info("BA_OUTPUT_ROOT = %s", get_output_root())
+    except RuntimeError as e:
+        logger.warning("BA_OUTPUT_ROOT not configured: %s", e)
+    yield
+
+
+app = FastAPI(
+    title="Business Config Agent",
+    version="2.0.0",
+    description="Business config assistant with SSE tool-call progress.",
+    lifespan=lifespan,
+)
+
+
+# CORS — open in dev, restricted by env in production (default: open for localhost).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# API routes
+app.include_router(health.router)
+app.include_router(input_folders.router)
+app.include_router(skills.router)
+app.include_router(files.router)
+app.include_router(upload.router)
+app.include_router(artifacts.router)
+app.include_router(conversations.router)
+app.include_router(chat.router)
+
+
+# Optional static mount for the CRA build.
+_FRONTEND_BUILD = Path(__file__).resolve().parents[2] / "frontend" / "build"
+
+
+@app.get(f"{API_PREFIX}/frontend")
+async def frontend_info() -> JSONResponse:
+    return JSONResponse(
+        {
+            "build_dir": str(_FRONTEND_BUILD),
+            "served": _FRONTEND_BUILD.is_dir() and (_FRONTEND_BUILD / "index.html").is_file(),
+        }
+    )
+
+
+if _FRONTEND_BUILD.is_dir() and (_FRONTEND_BUILD / "index.html").is_file():
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(_FRONTEND_BUILD / "static"), check_dir=False),
+        name="static",
+    )
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(str(_FRONTEND_BUILD / "index.html"))
+
+    @app.get("/{path:path}")
+    async def spa_catch_all(path: str):
+        # Don't shadow API routes (already registered above)
+        if path.startswith("api/"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        candidate = _FRONTEND_BUILD / path
+        if candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(_FRONTEND_BUILD / "index.html"))
+
+
+def main() -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "ai_coding_agent.server.app:app",
+        host=get_host(),
+        port=get_port(),
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

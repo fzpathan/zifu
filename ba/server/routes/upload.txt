@@ -1,0 +1,46 @@
+"""POST /api/bca/upload — drop a file into the user's sandbox."""
+
+from __future__ import annotations
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+import re
+import uuid
+from pathlib import Path
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.utils.env import get_user_sandbox_dir, invalidate_artifact_cache
+
+router = APIRouter(prefix=API_PREFIX, tags=["upload"])
+
+
+_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(name: str) -> str:
+    name = name.replace("\\", "/").split("/")[-1]
+    name = _FILENAME_RE.sub("_", name).strip("._")
+    if not name:
+        name = f"upload-{uuid.uuid4().hex[:8]}"
+    return name
+
+
+@router.post("/upload")
+async def upload(
+    file: UploadFile = File(...),
+    destination: str | None = Form(default=None),
+) -> dict:
+    from ai_coding_agent.utils.env import get_default_user
+    user_id = get_default_user()
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="missing filename")
+    sandbox = get_user_sandbox_dir(user_id)
+    name = _safe_filename(destination or file.filename)
+    target = sandbox / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = await file.read()
+    target.write_bytes(content)
+    invalidate_artifact_cache(user_id)
+    return {
+        "path": name,
+        "absolute": str(target),
+        "size": target.stat().st_size,
+    }

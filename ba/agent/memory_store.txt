@@ -1,0 +1,185 @@
+from __future__ import annotations
+import hashlib
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+from ai_coding_agent.config.loader import get_data_dir
+
+_MAX_ENTRIES = 20
+_SKELETON_STALE_DAYS = 7
+_LEARNED_SKILL_SESSION_COUNT = 20
+
+
+def _cwd_hash(cwd: Path) -> str:
+    return hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:16]
+
+
+def _store_path(cwd: Path) -> Path:
+    return get_data_dir() / "codebase_memory" / f"{_cwd_hash(cwd)}.json"
+
+
+def _load(cwd: Path) -> list[dict]:
+    path = _store_path(cwd)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_entries(cwd: Path, entries: list[dict]) -> None:
+    path = _store_path(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def project_memory_path(cwd: Path) -> Path:
+    return cwd.resolve() / ".ai-agent" / "memory.md"
+
+
+def load_project_memory(cwd: Path) -> str | None:
+    path = project_memory_path(cwd)
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return content or None
+
+
+def save_project_memory_entries(cwd: Path, entries: dict[str, str]) -> None:
+    path = project_memory_path(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = ["# Memory", ""]
+    if entries:
+        for key, value in sorted(entries.items()):
+            lines.append(f"## {key}")
+            lines.append(str(value).strip())
+            lines.append("")
+    else:
+        lines.append("_No memories stored._")
+        lines.append("")
+
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text("\n".join(lines), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _score(text: str, query: str) -> float:
+    stop = {"the", "a", "an", "is", "are", "in", "on", "to", "of", "for", "with"}
+    q_tokens = {t for t in re.findall(r"\w+", query.lower()) if t not in stop and len(t) > 1}
+    if not q_tokens:
+        return 0.0
+    t_tokens = set(re.findall(r"\w+", text.lower()))
+    return len(q_tokens & t_tokens) / len(q_tokens)
+
+
+class SessionMemoryStore:
+    def save(self, cwd: Path, session_id: str, summary: str) -> None:
+        entries = [e for e in _load(cwd) if e.get("type") != "session" or e.get("session_id") != session_id]
+        entries.append({
+            "type": "session",
+            "session_id": session_id,
+            "timestamp": datetime.now().isoformat(),
+            "summary": summary,
+            "cwd": str(cwd.resolve()),
+        })
+        # keep most recent _MAX_ENTRIES session entries (plus any skeleton entry)
+        skeleton = [e for e in entries if e.get("type") == "skeleton"]
+        sessions = [e for e in entries if e.get("type") == "session"]
+        sessions.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+        _save_entries(cwd, skeleton + sessions[:_MAX_ENTRIES])
+
+    def recall(self, cwd: Path, query: str | None = None, top_k: int = 3) -> str | None:
+        sessions = [e for e in _load(cwd) if e.get("type") == "session"]
+        if not sessions:
+            return None
+
+        if query:
+            sessions.sort(key=lambda e: _score(e.get("summary", ""), query), reverse=True)
+        else:
+            sessions.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+
+        top = sessions[:top_k]
+        if not top:
+            return None
+
+        parts = ["## Past Work on This Codebase\n"]
+        for entry in top:
+            ts = entry.get("timestamp", "")[:10]
+            parts.append(f"### Session {ts}\n{entry['summary']}")
+        return "\n\n".join(parts)
+
+    def session_count(self, cwd: Path) -> int:
+        return len([e for e in _load(cwd) if e.get("type") == "session"])
+
+    def maybe_write_learned_skill(self, cwd: Path) -> Path | None:
+        sessions = [e for e in _load(cwd) if e.get("type") == "session"]
+        sessions.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+        if len(sessions) < _LEARNED_SKILL_SESSION_COUNT:
+            return None
+
+        selected = list(reversed(sessions[:_LEARNED_SKILL_SESSION_COUNT]))
+        skill_dir = cwd.resolve() / ".ai-agent" / "skills" / "learned-workflow"
+        skill_path = skill_dir / "SKILL.md"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        summaries = []
+        for index, entry in enumerate(selected, start=1):
+            timestamp = entry.get("timestamp", "")[:10] or "unknown date"
+            summary = str(entry.get("summary", "")).strip()
+            if summary:
+                summaries.append(f"{index}. {timestamp}\n{summary}")
+
+        body = "\n\n".join(summaries)
+        content = f"""---
+name: learned-workflow
+description: Use when working in this project and the request resembles recurring patterns from the last {_LEARNED_SKILL_SESSION_COUNT} saved conversations.
+args_optional: true
+---
+
+# Learned Workflow
+
+Use the recurring lessons below as project-local guidance. Keep them subordinate to direct user instructions and current repository state.
+
+## Recent Conversation Patterns
+
+{body}
+"""
+        skill_path.write_text(content, encoding="utf-8")
+        return skill_path
+
+    def save_skeleton(self, cwd: Path, skeleton: str) -> None:
+        entries = [e for e in _load(cwd) if e.get("type") != "skeleton"]
+        entries.insert(0, {
+            "type": "skeleton",
+            "indexed_at": datetime.now().isoformat(),
+            "skeleton": skeleton,
+            "cwd": str(cwd.resolve()),
+        })
+        _save_entries(cwd, entries)
+
+    def load_skeleton(self, cwd: Path) -> tuple[str, datetime] | None:
+        for entry in _load(cwd):
+            if entry.get("type") == "skeleton":
+                try:
+                    indexed_at = datetime.fromisoformat(entry["indexed_at"])
+                    return entry["skeleton"], indexed_at
+                except Exception:
+                    return None
+        return None

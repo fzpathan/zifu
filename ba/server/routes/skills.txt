@@ -1,0 +1,103 @@
+"""GET /api/bca/input-skills — load slash-command skills from the input folder.
+
+Looks for a ``skills/`` subfolder inside the active input folder (or at
+``BA_INPUT_ROOT/skills/`` when no folder is specified).  Every ``*.json``
+file in that directory is treated as a skill definition.
+
+Expected JSON shape::
+
+    {
+        "name":        "mycheck",           // identifier, [a-z0-9_] only
+        "description": "Run my check",      // short label shown in the picker
+        "prompt":      "Please run …"       // text injected into the message input
+    }
+
+Any file that is missing a required field, or whose ``name`` contains
+invalid characters, is silently skipped so a malformed file never breaks
+the picker.
+"""
+
+from __future__ import annotations
+import json
+import re
+from pathlib import Path
+
+from fastapi import APIRouter, Query
+
+from ai_coding_agent.server.routes._constants import API_PREFIX
+from ai_coding_agent.utils.env import get_input_folders, get_input_root
+
+router = APIRouter(prefix=API_PREFIX, tags=["skills"])
+
+_NAME_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+_SKILLS_DIR = "skills"
+
+
+def _load_skills_from_dir(skills_dir: Path) -> list[dict]:
+    """Read and validate all *.json skill files in *skills_dir*."""
+    if not skills_dir.is_dir():
+        return []
+    result: list[dict] = []
+    for p in sorted(skills_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name", "")
+        description = data.get("description", "")
+        prompt = data.get("prompt", "")
+        if (
+            not isinstance(name, str)
+            or not _NAME_RE.match(name)
+            or not isinstance(description, str)
+            or not description.strip()
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+        ):
+            continue
+        result.append(
+            {
+                "name": name,
+                "label": f"/{name}",
+                "description": description.strip(),
+                "prompt": prompt.strip(),
+                "type": "prompt",
+                "source": p.name,
+            }
+        )
+    return result
+
+
+@router.get("/input-skills")
+async def input_skills(
+    folder: str | None = Query(default=None, description="Name of the active input subfolder"),
+) -> dict:
+    """Return skill definitions found in the active input folder's ``skills/`` subdirectory.
+
+    - If *folder* is given it must be a known input folder; we look inside
+      ``{BA_INPUT_ROOT}/{folder}/skills/``.
+    - If *folder* is omitted we look at ``{BA_INPUT_ROOT}/skills/`` directly.
+
+    Returns ``{"skills": [...], "source_dir": "<relative path or null>"}``
+    """
+    root = get_input_root()
+
+    if folder:
+        # Validate against the known folder list to prevent path traversal.
+        known = get_input_folders()
+        if folder not in known:
+            return {"skills": [], "source_dir": None}
+        skills_dir = (root / folder / _SKILLS_DIR).resolve()
+        # Ensure it stays inside root
+        try:
+            skills_dir.relative_to(root)
+        except ValueError:
+            return {"skills": [], "source_dir": None}
+    else:
+        skills_dir = (root / _SKILLS_DIR).resolve()
+
+    skills = _load_skills_from_dir(skills_dir)
+    source = str(skills_dir.relative_to(root)) if skills_dir.exists() else None
+    return {"skills": skills, "source_dir": source}

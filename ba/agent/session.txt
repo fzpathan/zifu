@@ -1,0 +1,136 @@
+from datetime import datetime
+import json
+from typing import Any
+import uuid
+from ai_coding_agent.agent.memory_store import SessionMemoryStore, load_project_memory
+from ai_coding_agent.client.llm_client import LLMClient
+from ai_coding_agent.config.config import Config
+from ai_coding_agent.config.loader import get_data_dir
+from ai_coding_agent.context.compaction import ChatCompactor
+from ai_coding_agent.context.loop_detector import LoopDetector
+from ai_coding_agent.context.manager import ContextManager
+from ai_coding_agent.safety.approval import ApprovalManager
+from ai_coding_agent.tools.registry import create_default_registry
+
+
+class Session:
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = LLMClient(config=config)
+        self.tool_registry = create_default_registry(config)
+        self.context_manager: ContextManager | None = None
+        self.chat_compactor = ChatCompactor(self.client)
+        self.approval_manager = ApprovalManager(
+            self.config.approval,
+            self.config.cwd,
+        )
+        self.loop_detector = LoopDetector()
+        self.hook_system = None
+        self.session_id = str(uuid.uuid4())
+        self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+
+        self.turn_count = 0
+        self.skeleton_stale: bool = False
+
+    def _load_project_agent_context(self) -> tuple[str, datetime] | None:
+        candidate_paths = [
+            self.config.cwd / ".ai-agent" / "Agent.md",
+            self.config.cwd / ".ai-agent" / "AGENT.md",
+        ]
+
+        for path in candidate_paths:
+            if not path.exists():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if not content:
+                    continue
+                indexed_at = datetime.fromtimestamp(path.stat().st_mtime)
+                return content, indexed_at
+            except Exception:
+                continue
+
+        return None
+
+    async def initialize(self) -> None:
+        user_memory = self._load_memory()
+        memory_store = SessionMemoryStore()
+
+        # Recall past session summaries for this codebase
+        codebase_memory = memory_store.recall(
+            self.config.cwd,
+            top_k=self.config.codebase_memory_top_k,
+        )
+        if codebase_memory:
+            user_memory = (user_memory + "\n\n" + codebase_memory) if user_memory else codebase_memory
+
+        # Inject project summary if available. Prefer the durable Agent.md copy
+        # written by /init, and fall back to the stored summary entry.
+        skeleton_result = self._load_project_agent_context()
+        if skeleton_result is None:
+            skeleton_result = memory_store.load_skeleton(self.config.cwd)
+        if skeleton_result:
+            skeleton_text, indexed_at = skeleton_result
+            age_days = (datetime.now() - indexed_at).days
+            if age_days > 7:
+                self.skeleton_stale = True
+            user_memory = (user_memory + "\n\n" + skeleton_text) if user_memory else skeleton_text
+
+        self.context_manager = ContextManager(
+            config=self.config,
+            user_memory=user_memory,
+            tools=self.tool_registry.get_tools(),
+        )
+
+    def _load_memory(self) -> str | None:
+        memory_sections: list[str] = []
+
+        data_dir = get_data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        path = data_dir / "user_memory.json"
+
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+                data = json.loads(content)
+                entries = data.get("entries")
+                if entries:
+                    lines = ["User preferences and notes:"]
+                    for key, value in entries.items():
+                        lines.append(f"- {key}: {value}")
+                    memory_sections.append("\n".join(lines))
+            except Exception:
+                pass
+
+        project_memory = load_project_memory(self.config.cwd)
+        if project_memory:
+            if len(project_memory) > self.config.memory_max_chars:
+                project_memory = (
+                    project_memory[: self.config.memory_max_chars]
+                    + "\n... [project memory truncated]"
+                )
+            memory_sections.append(
+                "Project memory from .ai-agent/memory.md:\n" + project_memory
+            )
+
+        if not memory_sections:
+            return None
+
+        return "\n\n".join(memory_sections)
+
+    def increment_turn(self) -> int:
+        self.turn_count += 1
+        self.updated_at = datetime.now()
+
+        return self.turn_count
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "created_at": self.created_at.isoformat(),
+            "turn_count": self.turn_count,
+            "message_count": self.context_manager.message_count,
+            "token_usage": self.context_manager.total_usage,
+            "tools_count": len(self.tool_registry.get_tools()),
+        }

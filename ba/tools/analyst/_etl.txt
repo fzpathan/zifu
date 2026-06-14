@@ -1,0 +1,117 @@
+"""Domain knowledge for ControlDash QA / COMP ETL configuration workbooks.
+
+ControlDash drives data-quality (QA) and completeness-reconciliation (COMP)
+controls from Excel "config" workbooks. Each workbook is a set of named sheets
+that together describe how source files are read, transformed, enriched, checked,
+and reconciled. The analyst tools in this package read those workbooks (read-only)
+and report structure, validation errors, and transform behaviour.
+
+This module is the single source of truth for the config schema so the tools and
+the system prompt stay consistent. No heavy dependencies are imported here.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+# Control types ----------------------------------------------------------------
+CONTROL_TYPES = ("QA", "COMP")
+
+CONTROL_TYPE_DESCRIPTIONS = {
+    "QA": "Quality Assurance — row-level rules/assertions that validate source data.",
+    "COMP": "Completeness — reconciliation that confirms inputs flow through to outputs.",
+}
+
+# Canonical config sheets ------------------------------------------------------
+# Maps the canonical sheet name to a short description of its role.
+CONFIG_SHEETS = {
+    "InputFiles": "Declares each source input file, its format, and key columns.",
+    "rules": "Row-level QA rule/assertion definitions.",
+    "Enrichment": "Lookup/join-based enrichment that adds columns to input rows.",
+    "FieldOperations": "Field-level transforms that derive or rewrite columns.",
+    "OutputRule": "Defines the output dataset and reconciliation output.",
+}
+
+# Sheets that are typically required for each control type.
+REQUIRED_SHEETS = {
+    "QA": ("InputFiles", "rules", "FieldOperations"),
+    "COMP": ("InputFiles", "FieldOperations", "OutputRule"),
+}
+
+# Transform operations supported by the transform engine. For each operation we
+# record the parameter keys it expects inside the operation-params JSON and how
+# many input fields it normally consumes.
+TRANSFORM_OPERATIONS: dict[str, dict[str, Any]] = {
+    "DateExtract": {"params": ["component"], "min_inputs": 1, "desc": "Extract a date component (year/month/day/...) from a date field."},
+    "Concatenate": {"params": ["separator"], "min_inputs": 2, "desc": "Join two or more fields into one with a separator."},
+    "Formula": {"params": ["expression"], "min_inputs": 1, "desc": "Evaluate an arithmetic/string expression over input fields."},
+    "Conditional": {"params": ["conditions"], "min_inputs": 1, "desc": "Return a value based on if/else-style conditions."},
+    "MapValues": {"params": ["mapping"], "min_inputs": 1, "desc": "Map source values to target labels via a dictionary."},
+    "StringOperation": {"params": ["operation"], "min_inputs": 1, "desc": "Apply a string op (upper/lower/trim/substring/...)."},
+    "NumericOperation": {"params": ["operation"], "min_inputs": 1, "desc": "Apply a numeric op (round/abs/floor/ceil/...)."},
+    "SetValue": {"params": ["value"], "min_inputs": 0, "desc": "Set a constant value on every row."},
+    "CopyField": {"params": [], "min_inputs": 1, "desc": "Copy a source field into a new field unchanged."},
+    "Split": {"params": ["separator"], "min_inputs": 1, "desc": "Split a field on a separator and keep one part."},
+    "Replace": {"params": ["find", "replace"], "min_inputs": 1, "desc": "Find/replace substrings within a field."},
+}
+
+OPERATION_NAMES = tuple(TRANSFORM_OPERATIONS.keys())
+
+# Column-name candidates inside the FieldOperations sheet. Real workbooks vary in
+# casing/spelling, so the tools resolve columns case-insensitively against these.
+FIELD_OP_COLUMNS = {
+    "new_field": ("NewFieldName", "OutputField", "new_field_name", "output_field", "field"),
+    "operation": ("OperationType", "Operation", "operation_type", "op", "type"),
+    "inputs": ("InputFields", "InputField", "input_fields", "source_fields", "fields"),
+    "params": ("OperationParams", "Params", "operation_params", "parameters", "config"),
+}
+
+
+def normalise_control_type(value: str | None) -> str | None:
+    if not value:
+        return None
+    v = str(value).strip().upper()
+    if v in ("COMPLETENESS",):
+        return "COMP"
+    if v in ("QUALITY", "QUALITY ASSURANCE"):
+        return "QA"
+    return v if v in CONTROL_TYPES else None
+
+
+def resolve_column(columns: list[str], key: str) -> str | None:
+    """Find the actual column header that matches a FIELD_OP_COLUMNS candidate set."""
+    candidates = {c.lower() for c in FIELD_OP_COLUMNS.get(key, ())}
+    for col in columns:
+        if str(col).strip().lower() in candidates:
+            return col
+    return None
+
+
+def parse_params(raw: Any) -> tuple[dict | None, str | None]:
+    """Parse an operation-params cell into a dict. Returns (params, error)."""
+    if raw is None:
+        return {}, None
+    if isinstance(raw, dict):
+        return raw, None
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "none", "null"):
+        return {}, None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed, None
+        return {}, f"operation params must be a JSON object, got {type(parsed).__name__}"
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON in operation params: {exc}"
+
+
+def split_inputs(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "none", "null"):
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]

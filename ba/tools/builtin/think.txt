@@ -1,0 +1,48 @@
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class ThinkParams(BaseModel):
+    thought: str = Field(
+        ...,
+        description=(
+            "Your reasoning, analysis, or plan. Use this to think through complex problems, "
+            "evaluate options, check assumptions, or plan a sequence of actions before executing them. "
+            "This thought is visible to you but does not execute any actions."
+        ),
+    )
+
+
+class ThinkTool(Tool):
+    """A scratchpad tool for explicit reasoning.
+
+    Inspired by the observation that LLMs perform better on complex tasks when
+    they have a designated space for chain-of-thought reasoning that is clearly
+    separate from action-taking. This prevents reasoning text from accidentally
+    being treated as user-facing output or tool arguments.
+    """
+
+    name = "think"
+    description = (
+        "Use this tool to reason through complex problems before acting. "
+        "Write out your analysis, check assumptions, evaluate tradeoffs, or plan a sequence of steps. "
+        "The thought is recorded but does not execute any actions or modify any state. "
+        "Use this when: (1) a task has multiple plausible approaches and you need to pick one, "
+        "(2) you need to verify your understanding before making changes, "
+        "(3) debugging a non-obvious error, or (4) planning a multi-step operation."
+    )
+    kind = ToolKind.READ  # Read kind: non-mutating, never needs approval
+
+    schema = ThinkParams
+
+    def is_mutating(self, params: dict) -> bool:
+        return False
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        params = ThinkParams(**invocation.params)
+        # Simply echo back that the thought was recorded.
+        # The value is in the reasoning appearing in the conversation context.
+        return ToolResult.success_result(
+            f"Thought recorded:\n\n{params.thought}"
+        )

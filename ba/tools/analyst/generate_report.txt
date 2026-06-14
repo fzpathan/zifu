@@ -1,0 +1,501 @@
+"""``generate_report`` analyst tool.
+
+Renders a structured markdown report (or xlsx/docx/pptx when asked) from
+the inputs and any prior sub-agent findings the parent passes in. The
+output is always written into the per-user sandbox; reads come from the
+configured ``read_paths`` only.
+"""
+
+from __future__ import annotations
+import asyncio
+import json
+import os
+from pathlib import Path
+from typing import Any
+from pydantic import BaseModel, Field
+
+from ai_coding_agent.tools.analyst._common import (
+    AnalystError,
+    column_summary,
+    detect_format,
+    ensure_readable,
+    ensure_writable,
+    read_csv,
+    read_xlsx,
+)
+from ai_coding_agent.tools.base import Tool, ToolInvocation, ToolKind, ToolResult
+
+
+class GenerateReportParams(BaseModel):
+    title: str = Field(..., description="Title of the report.")
+    sections: list[str] = Field(
+        default_factory=lambda: [
+            "summary", "schema", "statistics", "anomalies", "recommendations", "appendix",
+        ],
+        description="Section slugs in the order they should appear.",
+    )
+    inputs: list[str] = Field(
+        default_factory=list,
+        description="List of input file paths the report should reference.",
+    )
+    inspector_findings: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional findings JSON from the input_inspector sub-agent.",
+    )
+    profiler_findings: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional findings JSON from the data_profiler sub-agent.",
+    )
+    anomaly_findings: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional findings JSON from the anomaly_hunter sub-agent.",
+    )
+    recommendations: list[str] = Field(
+        default_factory=list,
+        description="List of recommendation strings (3-7) for the Recommendations section.",
+    )
+    format: str = Field(
+        "md",
+        description="Output format: 'md' (default), 'xlsx', 'docx', 'pptx'.",
+    )
+    destination: str | None = Field(
+        default=None,
+        description="Filename (relative to sandbox) to write the report to. "
+                    "If omitted, a filename is derived from the title.",
+    )
+
+
+class GenerateReportTool(Tool):
+    name = "generate_report"
+    description = (
+        "Generate a structured business-analysis report from the supplied input files "
+        "and any prior sub-agent findings. Markdown by default; xlsx, docx, and pptx "
+        "are also supported. Writes only into the configured sandbox_dir."
+    )
+    kind = ToolKind.WRITE
+    schema = GenerateReportParams
+
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+        # Blocking render + file write — run off the event loop so the SSE
+        # stream and other requests are not blocked while the report is built.
+        return await asyncio.to_thread(self._run, invocation)
+
+    def _run(self, invocation: ToolInvocation) -> ToolResult:
+        try:
+            params = GenerateReportParams(**invocation.params)
+            read_paths = list(self.config.read_paths or [])
+            sandbox_dir = self.config.sandbox_dir
+
+            markdown = _render_markdown(params)
+
+            ext = {"md": "md", "xlsx": "xlsx", "docx": "docx", "pptx": "pptx"}.get(
+                params.format.lower(), "md"
+            )
+            if params.destination:
+                filename = params.destination
+            else:
+                slug = "".join(c if c.isalnum() else "_" for c in params.title.lower()).strip("_") or "report"
+                filename = f"{slug}.{ext}"
+            target = ensure_writable(filename, sandbox_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            if ext == "md":
+                _atomic_write_text(target, markdown)
+            elif ext == "xlsx":
+                _write_minimal_xlsx(target, params, markdown)
+            elif ext == "docx":
+                _write_minimal_docx(target, markdown)
+            elif ext == "pptx":
+                _write_minimal_pptx(target, params, markdown)
+            else:
+                return ToolResult.error_result(
+                    f"unsupported format {params.format!r}; use one of md/xlsx/docx/pptx"
+                )
+
+            return ToolResult.success_result(
+                f"Report written: {target}\n\n--- Markdown ---\n{markdown}",
+                metadata={
+                    "destination_path": str(target.relative_to(sandbox_dir)).replace("\\", "/"),
+                    "absolute_path": str(target),
+                    "format": ext,
+                    "bytes": target.stat().st_size,
+                },
+            )
+        except AnalystError as e:
+            return ToolResult.error_result(str(e))
+        except Exception as e:
+            return ToolResult.error_result(f"generate_report failed: {e}")
+
+
+def _render_markdown(params: GenerateReportParams) -> str:
+    lines: list[str] = [f"# {params.title}", ""]
+    sections_lower = [s.lower() for s in params.sections]
+
+    if "summary" in sections_lower:
+        lines.extend(_render_summary(params))
+    if "schema" in sections_lower:
+        lines.extend(_render_schema(params))
+    if "statistics" in sections_lower:
+        lines.extend(_render_statistics(params))
+    if "anomalies" in sections_lower:
+        lines.extend(_render_anomalies(params))
+    if "recommendations" in sections_lower:
+        lines.extend(_render_recommendations(params))
+    if "appendix" in sections_lower:
+        lines.extend(_render_appendix(params))
+    # any user-specified section we don't know about — render as a placeholder
+    known = {"summary", "schema", "statistics", "anomalies", "recommendations", "appendix"}
+    extras = [s for s in sections_lower if s not in known]
+    if extras:
+        lines.append("## " + ", ".join(extras).title())
+        lines.append("")
+        lines.append("_No content supplied for this section._")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_summary(params: GenerateReportParams) -> list[str]:
+    lines = ["## Summary", ""]
+    if params.inputs:
+        lines.append(f"This report covers {len(params.inputs)} input file(s):")
+        for p in params.inputs:
+            lines.append(f"- `{p}`")
+        lines.append("")
+    else:
+        lines.append("_No input files were referenced._")
+        lines.append("")
+    return lines
+
+
+def _render_schema(params: GenerateReportParams) -> list[str]:
+    lines = ["## Schema", ""]
+    if not params.inputs:
+        return lines + ["_No input files._", ""]
+    lines.append("| File | Format | Columns | Rows |")
+    lines.append("|---|---|---|---:|")
+    inputs = params.inspector_findings or {}
+    files = inputs.get("files") if isinstance(inputs, dict) else None
+    if not files:
+        # Fall back to live inspection
+        for p in params.inputs:
+            try:
+                target = Path(p)
+                if not target.is_absolute():
+                    target = (params.sandbox_dir or Path.cwd()) / target
+                fmt = detect_format(target)
+                if fmt == "csv":
+                    headers, _ = read_csv(target, max_rows=1)
+                elif fmt == "xlsx":
+                    headers, _ = read_xlsx(target, max_rows=1)
+                else:
+                    headers = []
+                lines.append(f"| `{p}` | {fmt} | {len(headers)} | n/a |")
+            except Exception as e:
+                lines.append(f"| `{p}` | error | — | — |")
+        return lines + [""]
+
+    for entry in files:
+        cols = entry.get("columns", []) or []
+        lines.append(
+            f"| `{entry.get('file','?')}` | {entry.get('format','?')} | {len(cols)} | {entry.get('rows','?')} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_statistics(params: GenerateReportParams) -> list[str]:
+    lines = ["## Statistics", ""]
+    profile = params.profiler_findings or {}
+    cols = profile.get("columns", []) if isinstance(profile, dict) else []
+    if not cols:
+        lines.append("_No profile data available._")
+        lines.append("")
+        return lines
+    lines.append("| Column | dtype | nulls | uniques | min | max | mean | median | std |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for c in cols:
+        lines.append(
+            f"| {c.get('name','')} | {c.get('dtype','')} | {c.get('nulls','')} | "
+            f"{c.get('uniques','')} | {c.get('min','')} | {c.get('max','')} | "
+            f"{c.get('mean','')} | {c.get('median','')} | {c.get('std','')} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_anomalies(params: GenerateReportParams) -> list[str]:
+    lines = ["## Anomalies", ""]
+    findings = []
+    if isinstance(params.anomaly_findings, dict):
+        findings = list(params.anomaly_findings.get("findings") or [])
+    if not findings:
+        lines.append("_No anomalies reported._")
+        lines.append("")
+        return lines
+
+    severity_order = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: severity_order.get(str(f.get("severity", "low")).lower(), 3))
+    for f in findings:
+        sev = str(f.get("severity", "low")).upper()
+        lines.append(f"- **[{sev}] {f.get('type','issue')}** at `{f.get('where','?')}` — {f.get('description','')}")
+        evidence = f.get("evidence")
+        if evidence:
+            lines.append(f"  - Evidence: {evidence}")
+    lines.append("")
+    return lines
+
+
+def _render_recommendations(params: GenerateReportParams) -> list[str]:
+    lines = ["## Recommendations", ""]
+    if not params.recommendations:
+        lines.append("_No recommendations supplied._")
+        lines.append("")
+        return lines
+    for i, rec in enumerate(params.recommendations, start=1):
+        lines.append(f"{i}. {rec}")
+    lines.append("")
+    return lines
+
+
+def _render_appendix(params: GenerateReportParams) -> list[str]:
+    lines = ["## Appendix", ""]
+    lines.append("### Inputs")
+    if params.inputs:
+        for p in params.inputs:
+            lines.append(f"- `{p}`")
+    else:
+        lines.append("_No input files._")
+    lines.append("")
+    lines.append("### Sub-agent findings")
+    if params.inspector_findings:
+        lines.append("- Inspector findings: attached")
+    if params.profiler_findings:
+        lines.append("- Profiler findings: attached")
+    if params.anomaly_findings:
+        lines.append("- Anomaly findings: attached")
+    if not any([params.inspector_findings, params.profiler_findings, params.anomaly_findings]):
+        lines.append("_None._")
+    lines.append("")
+    return lines
+
+
+# ── Writers ─────────────────────────────────────────────────────────────────
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _write_minimal_xlsx(path: Path, params: GenerateReportParams, markdown: str) -> None:
+    """Write a minimal but valid xlsx file containing the markdown in one cell.
+
+    We avoid the openpyxl dependency by hand-assembling the xlsx zip
+    structure. The output is fully openable in Excel and LibreOffice.
+    """
+    import zipfile
+    import io
+
+    rows = [line for line in markdown.splitlines()]
+
+    shared_strings = "\n".join(
+        f"<si><t xml:space=\"preserve\">{_xml_escape(s)}</t></si>" for s in rows
+    )
+    shared_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        f"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"{len(rows)}\" uniqueCount=\"{len(rows)}\">"
+        f"{shared_strings}"
+        "</sst>"
+    )
+
+    sheet_rows = []
+    for i in range(len(rows)):
+        sheet_rows.append(
+            f"<row r=\"{i+1}\"><c r=\"A{i+1}\" t=\"s\"><v>{i}</v></c></row>"
+        )
+    sheet_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        "<sheetData>" + "".join(sheet_rows) + "</sheetData></worksheet>"
+    )
+
+    content_types = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>"
+        "</Types>"
+    )
+    rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "</Relationships>"
+    )
+    workbook_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+        "</Relationships>"
+    )
+    workbook_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<sheets><sheet name=\"Report\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/sharedStrings.xml", shared_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+
+def _write_minimal_docx(path: Path, markdown: str) -> None:
+    """Write a minimal but valid docx file (single paragraph) with the markdown text."""
+    import zipfile
+
+    body = (
+        "<w:p><w:r><w:t xml:space=\"preserve\">"
+        + _xml_escape(markdown)
+        + "</w:t></w:r></w:p>"
+    )
+    document = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>" + body + "</w:body></w:document>"
+    )
+    content_types = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        "</Types>"
+    )
+    rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/document.xml", document)
+
+
+def _write_minimal_pptx(path: Path, params: GenerateReportParams, markdown: str) -> None:
+    """Write a minimal but valid pptx with one slide per section."""
+    import zipfile
+
+    sections = params.sections or ["summary"]
+    slide_text_blocks = []
+    for i, section in enumerate(sections, start=1):
+        title = section.title()
+        body = _section_body(markdown, section)
+        slide_text_blocks.append((title, body))
+
+    slides_xml = []
+    for i, (title, body) in enumerate(slide_text_blocks, start=1):
+        slide = (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" "
+            "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+            "<p:cSld><p:spTree>"
+            "<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>"
+            "<p:grpSpPr/>"
+            "<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Title\"/><p:cNvSpPr><a:spLocks noGrp=\"1\"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>"
+            "<p:spPr><a:xfrm><a:off x=\"457200\" y=\"274680\"/><a:ext cx=\"8229240\" cy=\"1142640\"/></a:xfrm>"
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr>"
+            "<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>"
+            + _xml_escape(title)
+            + "</a:t></a:r></a:p></p:txBody></p:sp>"
+            "<p:sp><p:nvSpPr><p:cNvPr id=\"3\" name=\"Body\"/><p:cNvSpPr><a:spLocks noGrp=\"1\"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>"
+            "<p:spPr><a:xfrm><a:off x=\"457200\" y=\"1600200\"/><a:ext cx=\"8229240\" cy=\"4525560\"/></a:xfrm>"
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr>"
+            "<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>"
+            + _xml_escape(body[:60000])
+            + "</a:t></a:r></a:p></p:txBody></p:sp>"
+            "</p:spTree></p:cSld></p:sld>"
+        )
+        slides_xml.append(slide)
+
+    presentation = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<p:sldIdLst>"
+        + "".join(f"<p:sldId id=\"{i+256}\" r:id=\"rId{i+1}\"/>" for i in range(len(slides_xml)))
+        + "</p:sldIdLst></p:presentation>"
+    )
+    pres_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        + "".join(
+            f"<Relationship Id=\"rId{i+1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide{i+1}.xml\"/>"
+            for i in range(len(slides_xml))
+        )
+        + "</Relationships>"
+    )
+    content_types = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>"
+        + "".join(
+            f"<Override PartName=\"/ppt/slides/slide{i+1}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>"
+            for i in range(len(slides_xml))
+        )
+        + "</Types>"
+    )
+    rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"ppt/presentation.xml\"/>"
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("ppt/presentation.xml", presentation)
+        zf.writestr("ppt/_rels/presentation.xml.rels", pres_rels)
+        for i, slide in enumerate(slides_xml, start=1):
+            zf.writestr(f"ppt/slides/slide{i}.xml", slide)
+
+
+def _section_body(markdown: str, section: str) -> str:
+    lines = markdown.splitlines()
+    out: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.startswith("## "):
+            in_section = line[3:].strip().lower() == section.lower()
+            continue
+        if in_section:
+            out.append(line)
+    return "\n".join(out).strip() or "(no content)"
+
+
+def _xml_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )

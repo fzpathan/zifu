@@ -1,0 +1,76 @@
+"""Pydantic schemas for the BA server."""
+
+from __future__ import annotations
+from typing import Any, Literal
+from pydantic import BaseModel, Field
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system", "tool"]
+    content: str
+    name: str | None = None
+    tool_call_id: str | None = None
+
+
+class ChatRequest(BaseModel):
+    # user_id is accepted for back-compat but always normalised to the
+    # single hardcoded demo-user on the server. Multi-tenant support is
+    # out of scope for this build.
+    user_id: str | None = Field(
+        default=None,
+        description="Ignored. The server uses a single demo-user workspace.",
+    )
+    conversation_id: str | None = Field(
+        default=None, description="Existing conversation id; null to start a new one."
+    )
+    model: str | None = Field(
+        default=None,
+        description="Model name (OpenAI-compatible). Omit to use the server default.",
+    )
+    temperature: float = Field(0.3, ge=0.0, le=2.0)
+    messages: list[ChatMessage] = Field(..., description="Conversation history.")
+    active_input_folder: str | None = Field(
+        default=None,
+        description="Name of the active input subfolder; restricts reads.",
+    )
+    attached_paths: list[str] = Field(
+        default_factory=list,
+        description="File paths to attach to the next user message.",
+    )
+    environment: str = Field(
+        default="dev", description="Free-form environment tag (dev/poc/prod)."
+    )
+
+
+class ConversationSummary(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = None
+
+
+class InputFolder(BaseModel):
+    name: str
+    path: str
+
+
+class FileEntry(BaseModel):
+    path: str
+    size: int
+    modified: float
+    is_dir: bool = False
+
+
+class HealthResponse(BaseModel):
+    mode: str
+    model: str
+    tools: int
+    sub_agents: int
+    input_folders: list[str]
+    user_sandboxes: list[str]
