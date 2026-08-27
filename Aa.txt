@@ -1,0 +1,78 @@
+Here's a working pattern. The key trick: don't manually rebuild the assistant message from the SDK object — **dump the raw response and pass it back as-is**, so you don't accidentally drop the `thought_signature` field Gemini attaches.
+
+```python
+import json
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="YOUR_GEMINI_API_KEY",
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+
+def get_weather(city):
+    return f"It's sunny in {city}, 24°C"
+
+messages = [{"role": "user", "content": "What's the weather in Tokyo?"}]
+
+response = client.chat.completions.create(
+    model="gemini-2.5-flash",   # or gemini-3-pro-preview, etc.
+    messages=messages,
+    tools=tools,
+)
+
+# IMPORTANT: dump the raw message dict instead of touching response.choices[0].message
+# directly — this preserves non-standard fields like extra_content.google.thought_signature
+raw_message = response.model_dump()["choices"][0]["message"]
+messages.append(raw_message)
+
+if raw_message.get("tool_calls"):
+    for tool_call in raw_message["tool_calls"]:
+        name = tool_call["function"]["name"]
+        args = json.loads(tool_call["function"]["arguments"])
+        result = get_weather(**args) if name == "get_weather" else None
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": result,
+        })
+
+    # Second call — thought_signature is now echoed back correctly
+    followup = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=messages,
+        tools=tools,
+    )
+    print(followup.choices[0].message.content)
+```
+
+**Why this works:** the `openai` SDK's pydantic models often silently drop fields they don't recognize (like Gemini's `extra_content.google.thought_signature`) if you rebuild the message dict by hand from `.tool_calls[i].function.name` etc. Calling `.model_dump()` on the raw response and appending that dict directly keeps every field the API actually returned, including the signature.
+
+**If `model_dump()` still doesn't show `extra_content`:** some SDK versions filter unknown fields even from `model_dump()`. In that case, bypass the SDK's typed layer entirely:
+
+```python
+raw = client.chat.completions.with_raw_response.create(
+    model="gemini-2.5-flash",
+    messages=messages,
+    tools=tools,
+)
+raw_json = json.loads(raw.text)
+raw_message = raw_json["choices"][0]["message"]
+```
+
+This guarantees you get the exact JSON Google sent, `thought_signature` included, since you skip pydantic parsing altogether.
+
+If you're using a framework (LangChain, LiteLLM, CrewAI, etc.) instead of raw `openai` calls, the fix has to happen at their layer — check if there's a recent version/patch, since several of them have open GitHub issues about stripping this exact field.
