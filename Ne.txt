@@ -1,0 +1,55 @@
+Here's a full technical brief you can hand to Copilot (or any dev) to fix the multi-turn tool-calling flow. Structured so it can act on it directly.
+
+---
+
+## Problem Statement
+
+Multi-turn tool/function calling against Gemini models (3.x and 3.5-flash specifically) fails with:
+```
+400 INVALID_ARGUMENT: Function call is missing a thought_signature in functionCall parts.
+```
+
+**Root cause:** Gemini 3+ models attach a `thought_signature` (an encrypted string representing the model's internal reasoning state) to each `functionCall` part in their response. This signature **must be echoed back verbatim** in the next turn's request history when that function call is included. If it's dropped anywhere in the round-trip — by our gateway, by an OpenAI-compatibility translation layer, or by our own message-building code — Gemini rejects the follow-up request.
+
+---
+
+## What Copilot needs to check/fix
+
+### 1. Locate where turn-1 response is parsed
+Find the code that receives the model's tool-call response and find where it builds the "assistant" message to append to history for turn 2. This is almost always where the field gets dropped — because standard `tool_calls[i].function.{name,arguments}` schemas don't have a slot for `thought_signature`, so any code that manually reconstructs the message (instead of preserving the raw response) silently loses it.
+
+### 2. Confirm the field's actual location
+Depending on the API surface in use inside the HSBC gateway, the field could live in different places:
+- **Native Gemini API** (`generateContent`): inside the `parts[]` array, sibling to `functionCall`, as `"thoughtSignature": "<string>"`.
+- **OpenAI-compatible endpoint** (`v1beta/openai/chat/completions`): nested non-standard, typically under `tool_calls[i].extra_content.google.thought_signature`, since OpenAI's schema has no native field for it.
+
+**Ask Copilot to add a debug step first:** log/dump the *raw, unparsed* JSON body of the turn-1 response (before any SDK/pydantic model parsing) and grep for `thought_signature` / `thoughtSignature`. This tells us definitively whether:
+- (a) the gateway is returning it and our code is dropping it → client-side fix, or
+- (b) the gateway itself is not returning it at all (as our earlier diagnostic on `gemini-3.5-flash` showed) → not client-fixable, need model swap or gateway-team escalation.
+
+### 3. Fix pattern if the field IS present but being dropped
+- Do not manually reconstruct the assistant message from typed SDK fields.
+- Instead, capture the **raw dict/JSON** of the assistant message (e.g. `response.model_dump()` in Python, or `response.json()` before SDK parsing) and append that whole object to the conversation history unmodified.
+- If using a framework/proxy internally (LangChain, LiteLLM, an internal gateway wrapper, etc.), check whether that layer has a message-normalization step that strips unrecognized fields — this needs an allowlist/passthrough exception for `thought_signature` / `extra_content.google.thought_signature`.
+- If going through a caching or logging layer that serializes messages to a DB/store between turns, confirm the schema there also preserves the field (not just the live in-memory object) — a common failure mode is round-tripping through storage that has a strict schema.
+
+### 4. Fix pattern if the field is NOT present in the gateway response at all
+This is a server-side/gateway issue, not something app code can fix. Give Copilot these options to implement as a fallback rather than trying harder client-side:
+- **Model fallback:** switch the multi-turn tool-calling path to `gemini-2.5-flash` or `gemini-3-pro-preview`, which are reported more consistent about returning the signature (2.5 also degrades gracefully rather than hard-failing if it's missing).
+- **Bypass sentinel (if supported by the specific gateway build):** some Gemini deployments accept a literal string `"skip_thought_signature_validator"` in place of a real signature to disable the validation check for that call. This needs confirming against whatever Gemini API version HSBC's gateway proxies — not guaranteed to be supported everywhere.
+- **Escalate to the internal gateway/platform team**, since if the raw response truly lacks the field, it means the gateway's upstream call to Google (or its own response transformation) is the point of loss, not the application code.
+
+### 5. Testing checklist for Copilot to implement
+- [ ] Single-turn tool call succeeds (baseline).
+- [ ] Two-turn tool call succeeds (turn 1 tool call → tool result → turn 2 follow-up).
+- [ ] Parallel/multiple tool calls in one turn — verified separately, since several public reports show Gemini 3.x models inconsistently emit signatures specifically for parallel calls even when it works for single calls.
+- [ ] Test against at least two models (e.g. `gemini-3.5-flash` vs `gemini-2.5-flash`) to isolate whether it's model-specific or systemic to the gateway.
+- [ ] Add a raw-response logging/assertion step so future regressions on this surface immediately in logs rather than as an opaque 400.
+
+---
+
+## Context to give Copilot verbatim (paste-ready)
+
+> We're calling Gemini models through an internal HSBC API gateway using an OpenAI-compatible client interface. Multi-turn tool/function calling fails with `400 Function call is missing a thought_signature in functionCall parts`. Gemini 3+ models require the `thought_signature` field returned in a function-call response to be echoed back unmodified in the next request's message history. Please: (1) add logging to dump the raw, unparsed JSON of the assistant's turn-1 response and check whether `thought_signature`/`thoughtSignature` is present anywhere in it; (2) if present, fix the message-history-building code so it preserves the raw response object instead of reconstructing a message from typed fields, and check for any serialization/caching layer in between that might strip unrecognized fields; (3) if absent from the raw response entirely, this is a gateway-side issue — add a fallback to switch the affected code path to `gemini-2.5-flash` and flag it for the platform/gateway team rather than attempting further client-side handling.
+
+Since your own diagnostic already showed the signature isn't in the raw turn-1 body for `gemini-3.5-flash` through your gateway, I'd lead with step (3) — get the model swap in as a working fallback first, then keep the logging in place to confirm if/when the gateway team fixes upstream.
